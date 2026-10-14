@@ -6,36 +6,13 @@ pub mod plan;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{MediaProbe, SlicePlan};
+use crate::proc::{no_window, tail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// stderr 只保留这么长，避免把整段日志灌进数据库和界面。
-const STDERR_KEEP: usize = 600;
-
 pub fn ms_to_secs(ms: i64) -> String {
     format!("{:.3}", ms as f64 / 1000.0)
-}
-
-fn tail(text: &str) -> String {
-    let t = text.trim();
-    if t.chars().count() <= STDERR_KEEP {
-        return t.to_string();
-    }
-    let skip = t.chars().count() - STDERR_KEEP;
-    format!("…{}", t.chars().skip(skip).collect::<String>())
-}
-
-#[cfg(windows)]
-fn no_window(cmd: &mut Command) -> &mut Command {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW)
-}
-
-#[cfg(not(windows))]
-fn no_window(cmd: &mut Command) -> &mut Command {
-    cmd
 }
 
 // ---------------- ffprobe ----------------

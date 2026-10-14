@@ -115,6 +115,17 @@ export interface ExportOutcome {
   log: string;
 }
 
+// ---------------- 剪映草稿 ----------------
+
+export interface DraftReport {
+  draftPath: string;
+  draftName: string;
+  clipCount: number;
+  cueCount: number;
+  durationMs: number;
+  warnings: string[];
+}
+
 export interface AppInfo {
   name: string;
   version: string;

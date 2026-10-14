@@ -8,12 +8,12 @@
 use crate::error::{AppError, AppResult};
 use crate::media::ms_to_secs;
 use crate::models::{AspectMode, ExportOptions, ExportOutcome};
+use crate::proc::{no_window, tail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const TARGET_W: u32 = 1080;
 pub const TARGET_H: u32 = 1920;
-const STDERR_KEEP: usize = 800;
 
 const PRESETS: [&str; 9] = [
     "ultrafast",
@@ -26,27 +26,6 @@ const PRESETS: [&str; 9] = [
     "slower",
     "veryslow",
 ];
-
-#[cfg(windows)]
-fn no_window(cmd: &mut Command) -> &mut Command {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW)
-}
-
-#[cfg(not(windows))]
-fn no_window(cmd: &mut Command) -> &mut Command {
-    cmd
-}
-
-fn tail(text: &str) -> String {
-    let t = text.trim();
-    if t.chars().count() <= STDERR_KEEP {
-        return t.to_string();
-    }
-    let skip = t.chars().count() - STDERR_KEEP;
-    format!("…{}", t.chars().skip(skip).collect::<String>())
-}
 
 /// 只接受白名单 preset，避免把用户输入直接拼进命令行。
 pub fn normalize_preset(raw: &str) -> String {

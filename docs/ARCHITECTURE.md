@@ -12,12 +12,27 @@
 │  Rust 后端（commands.rs = 唯一边界）           │
 │  ┌────────┬────────┬────────┬────────┐        │
 │  │ media  │  asr   │  db    │ tools  │        │
+│  │ export │  jy    │subtitle│ proc   │        │
 │  └────────┴────────┴────────┴────────┘        │
 └───────┬──────────────┬───────────────┬────────┘
         │              │               │
-   ffmpeg/ffprobe   python(ASR)     SQLite
-   子进程            子进程          本地文件
+   ffmpeg/ffprobe   python(ASR /     SQLite
+   子进程            剪映草稿)        本地文件
 ```
+
+各模块职责：
+
+| 模块 | 职责 |
+| --- | --- |
+| `media` | ffprobe 探测、切片计划（纯函数）与 ffmpeg 切片 |
+| `subtitle` | SRT 解析/写出、按区间投影（纯函数） |
+| `export` | 烧字幕、竖屏适配、区间导出；滤镜串构造（纯函数） |
+| `asr` | faster-whisper 子进程桥 |
+| `jy` | 剪映草稿：时间轴映射（纯函数）+ pyJianYingDraft 子进程桥 |
+| `proc` | Python 子进程公共层：编码、工作目录、超时、JSON 协议 |
+| `tools` | 外部工具定位与真实探测（PATH + 常见位置 + 手动指定） |
+| `db` | SQLite 与 `user_version` 迁移 |
+| `models` | 前后端共享的数据形状 |
 
 ## 设计约束
 
@@ -90,3 +105,27 @@ Python 在管道里的 stdout 编码跟随系统区域设置。中文 Windows �
 
 `vue-tsc --noEmit` 会报 `TS6310`。要么给被引用工程开启 `emitDeclarationOnly`，
 要么（更简单）直接不要那条 `references`。
+
+### 5. 子进程会继承宿主的 CWD，而 CWD 里的 `python3x.dll` 能直接搞死它
+
+Python 子进程默认继承宿主的工作目录，而 Python 的模块搜索会包含当前目录。
+如果宿主 CWD 里恰好躺着**另一个 Python 版本**的 `.pyd` / `python3x.dll`
+（典型场景：机器上装了另一个用 Python 打包成 exe 的商业软件，安装目录就在同一个盘），
+子进程 import 时会直接报：
+
+```
+ImportError: Module use of python38.dll conflicts with this version of Python
+```
+
+排查时极具迷惑性 —— 换个目录跑就正常了。
+
+解法：**永远不要让 Python 子进程用继承来的 CWD**。
+`proc::python_script_command` 统一把工作目录钉在脚本所在目录，
+`python_command`（内联 `-c` 探测）钉在系统临时目录。
+
+### 6. 给 `Command` 设了 `stdin(null)` 之后，桥就再也写不进去了
+
+`proc::python_command` 为了方便 `-c` 探测，把 stdin 接到了 null；
+而 worker 桥需要把请求写进子进程。覆盖顺序必须显式：
+`run_json_worker` 里先 `python_script_command(...)` 再 `.stdin(Stdio::piped())`。
+漏了这一步的症状是"无法打开 worker 的 stdin"，五个测试同时红。

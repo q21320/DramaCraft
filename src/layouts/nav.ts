@@ -41,6 +41,12 @@ export const navItems: NavItem[] = [
     subtitle: "烧字幕、转竖屏、导出成片",
   },
   {
+    key: "draft",
+    path: "/draft",
+    label: "剪映草稿",
+    subtitle: "把切片与字幕拼成剪映草稿，继续手工精修",
+  },
+  {
     key: "settings",
     path: "/settings",
     label: "设置",

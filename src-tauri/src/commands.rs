@@ -6,7 +6,7 @@ use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, AsrStatus, Cue, ExportOptions, ExportOutcome, Media, Project,
     Segment, SliceMode, SlicePlan, ToolPaths, ToolReport,
 };
-use crate::{asr, export, media, subtitle, tools, AppState};
+use crate::{asr, export, jy, media, subtitle, tools, AppState};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
@@ -357,9 +357,12 @@ pub fn export_srt(
 // ---------------- ASR ----------------
 
 /// worker 脚本位置：打包后在资源目录，开发时在 `src-tauri/resources`。
-fn worker_script(app: &tauri::AppHandle) -> PathBuf {
+fn worker_script(app: &tauri::AppHandle, file_name: &str) -> PathBuf {
     if let Ok(dir) = app.path().resource_dir() {
-        for candidate in [dir.join("resources").join("asr_worker.py"), dir.join("asr_worker.py")] {
+        for candidate in [
+            dir.join("resources").join(file_name),
+            dir.join(file_name),
+        ] {
             if candidate.is_file() {
                 return candidate;
             }
@@ -367,7 +370,7 @@ fn worker_script(app: &tauri::AppHandle) -> PathBuf {
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("resources")
-        .join("asr_worker.py")
+        .join(file_name)
 }
 
 /// 跑一次 ASR 并把结果整片覆盖到该素材的字幕上。长任务，走 blocking 线程池。
@@ -384,7 +387,7 @@ pub async fn asr_transcribe(
         let python = tools::require(&configured.python, "python")?;
         let conn = lock_db(&state)?;
         let target = db::get_media(&conn, media_id)?;
-        (python, worker_script(&app), target.path)
+        (python, worker_script(&app, "asr_worker.py"), target.path)
     };
 
     let model = if model.trim().is_empty() {
@@ -527,4 +530,89 @@ pub async fn export_video(
         );
     }
     Ok(outcome)
+}
+
+// ---------------- 剪映草稿 ----------------
+
+/// 把某个素材的切片（连同字幕）导出成一份剪映草稿。
+#[tauri::command]
+pub async fn export_draft(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    draft_root: String,
+    draft_name: String,
+    fps: u32,
+) -> AppResult<jy::DraftReport> {
+    let draft_root = draft_root.trim().to_string();
+    if draft_root.is_empty() {
+        return Err(AppError::Msg(
+            "请先选择剪映草稿根目录（剪映「全局设置 → 草稿位置」指向的那个目录）".into(),
+        ));
+    }
+
+    let (python, worker, clips, durations, cues_per_clip) = {
+        let configured = lock_tools(&state)?.clone();
+        let python = tools::require(&configured.python, "python")?;
+        let conn = lock_db(&state)?;
+
+        let segments: Vec<Segment> = db::list_segments(&conn, media_id)?
+            .into_iter()
+            .filter(|s| s.status == "ok" && !s.out_path.trim().is_empty())
+            .collect();
+        if segments.is_empty() {
+            return Err(AppError::Msg(
+                "这个素材还没有成功的切片，请先到「切片工作台」执行切片".into(),
+            ));
+        }
+
+        let all_cues = db::list_cues(&conn, media_id)?;
+        let mut durations = Vec::with_capacity(segments.len());
+        let mut cues_per_clip = Vec::with_capacity(segments.len());
+        let mut clips = Vec::with_capacity(segments.len());
+
+        for seg in &segments {
+            let duration = (seg.end_ms - seg.start_ms).max(0);
+            durations.push(duration);
+            // 整片字幕按切片区间裁剪平移，再交给 assemble_timeline 做顺序偏移
+            cues_per_clip.push(subtitle::project_range(
+                &all_cues,
+                seg.start_ms,
+                seg.end_ms,
+                200,
+            ));
+            clips.push(jy::DraftClip {
+                path: seg.out_path.clone(),
+                duration_ms: duration,
+            });
+        }
+
+        (
+            python,
+            worker_script(&app, "jy_worker.py"),
+            clips,
+            durations,
+            cues_per_clip,
+        )
+    };
+
+    let cues = jy::assemble_timeline(&durations, &cues_per_clip);
+    let request = jy::DraftRequest {
+        draft_root,
+        draft_name: jy::safe_draft_name(&draft_name),
+        width: jy::DEFAULT_WIDTH,
+        height: jy::DEFAULT_HEIGHT,
+        fps: if fps == 0 { jy::DEFAULT_FPS } else { fps },
+        clips,
+        cues,
+        font_size: 8.0,
+    };
+
+    let python_task = python.clone();
+    let worker_task = worker.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        jy::export_draft(&python_task, &worker_task, &request, jy::default_timeout())
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("草稿线程异常终止：{e}")))?
 }

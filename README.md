@@ -17,6 +17,7 @@
 | 存储 | SQLite（rusqlite，bundled） |
 | 媒体 | FFmpeg / FFprobe（外部可执行文件，用户可指定路径） |
 | 字幕 | faster-whisper（外部 Python 运行时，可选） |
+| 剪映草稿 | pyJianYingDraft（Apache-2.0，外部 Python 运行时，可选） |
 
 ## 当前进度
 
@@ -29,8 +30,8 @@
 | ASR 字幕轴（faster-whisper 子进程） | ✅ 已实现（需自备 Python + faster-whisper） |
 | 字幕编辑 / SRT 导入导出 | ✅ 已实现 |
 | 成片导出（烧字幕 / 竖屏 9:16 / 区间） | ✅ 已实现 |
+| 剪映草稿导出 | ✅ 已实现（需自备 Python + pyJianYingDraft） |
 | 片头片尾拼接 | ⬜ 计划中 |
-| 剪映草稿导出 | ⬜ 计划中 |
 | 多平台发布 | ⬜ 计划中 |
 | 视频去重 | ⬜ 计划中 |
 
@@ -43,6 +44,13 @@ npm install
 npm run tauri:dev      # 开发模式（Vite + Rust 后端）
 npm run build          # 仅前端构建 + 类型检查
 npm run tauri:build    # 打包（Windows: NSIS / MSI）
+```
+
+可选：想在本机验证剪映草稿链路，可以建一个项目内虚拟环境装依赖（`.venv/` 已在 .gitignore 中）：
+
+```bash
+python -m venv .venv
+.venv/Scripts/pip install pyJianYingDraft
 ```
 
 Rust 侧单元测试：
@@ -66,8 +74,9 @@ cd src-tauri; cargo test end_to_end -- --nocapture
 
 | 项目 | 结果 |
 | --- | --- |
-| Rust 单元测试 | 57 项通过（切片计划边界、SRT 解析与投影、滤镜构造与转义、DB 迁移与级联、子进程协议与超时、编码健壮性） |
-| 端到端冒烟 | 通过（真实 ffmpeg：12 秒素材切片；6 秒素材流拷贝 + 竖屏 1080×1920 烧字幕导出） |
+| Rust 单元测试 | 67 项通过（切片计划边界、SRT 解析与投影、滤镜构造与转义、草稿时间轴映射、DB 迁移与级联、子进程协议/超时/编码） |
+| 端到端（真实 ffmpeg） | 通过：12 秒素材切片；6 秒素材流拷贝 + 竖屏 1080×1920 烧字幕导出 |
+| 端到端（真实 pyJianYingDraft） | 通过：两个切片 + 两条字幕 → 草稿目录生成，内容含中文文本，总时长 4000ms |
 | 前端类型检查 + 构建 | 通过（`vue-tsc --noEmit` + `vite build`） |
 
 ## 首次使用
@@ -78,6 +87,22 @@ cd src-tauri; cargo test end_to_end -- --nocapture
 3. 进入 **切片工作台**，选择切分方式，生成计划 → 执行切片。
 4. 进入 **字幕**，用 ASR 生成字幕轴，或导入现成 SRT 后逐条校对。
 5. 进入 **导出**，选择画幅（原画幅 / 竖屏模糊 / 竖屏裁切）与是否烧字幕，导出成片。
+6. 进入 **剪映草稿**，选择剪映的草稿目录，一键把切片与字幕拼成一份剪映草稿。
+
+### 想导出剪映草稿
+
+同样用自备的 Python：
+
+```bash
+pip install pyJianYingDraft
+```
+
+草稿目录填剪映「全局设置 → 草稿位置」指向的那个目录。生成后打开剪映即可看到，
+可以继续手工加转场、滤镜、封面，再导出。
+
+> 草稿格式是剪映的私有格式且随版本变化，所以本项目**不自己维护格式模板**，
+> 而是复用专门跟这个格式的开源库（Apache-2.0）。我们只负责把项目数据映射成草稿结构，
+> 这部分是纯逻辑，有完整单元测试。
 
 ### 想用 ASR 自动生成字幕
 

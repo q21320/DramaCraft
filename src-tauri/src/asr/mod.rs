@@ -8,43 +8,20 @@
 //! ## 协议
 //!
 //! 子进程读 **stdin 一行 JSON**（`AsrRequest`），写 **stdout 一行 JSON**（`AsrResponse`）。
-//! 成功失败都必须写应答，不把 traceback 直接抛给宿主；宿主只认 stdout 里最后一个
-//! 以 `{` 开头的行，其余（含进度日志）忽略。
+//! 编码、工作目录与超时这三件事统一由 [`crate::proc`] 处理。
 
 use crate::error::{AppError, AppResult};
 use crate::models::{AsrRequest, AsrResponse, AsrStatus, Cue};
-use std::io::{Read, Write};
+use crate::proc;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 pub const DEFAULT_MODEL: &str = "small";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 1800;
-const STDERR_KEEP: usize = 600;
 
 pub fn default_timeout() -> Duration {
     Duration::from_secs(DEFAULT_TIMEOUT_SECS)
-}
-
-fn tail(text: &str) -> String {
-    let t = text.trim();
-    if t.chars().count() <= STDERR_KEEP {
-        return t.to_string();
-    }
-    let skip = t.chars().count() - STDERR_KEEP;
-    format!("…{}", t.chars().skip(skip).collect::<String>())
-}
-
-#[cfg(windows)]
-fn no_window(cmd: &mut Command) -> &mut Command {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW)
-}
-
-#[cfg(not(windows))]
-fn no_window(cmd: &mut Command) -> &mut Command {
-    cmd
 }
 
 /// 检查指定 Python 是否具备 faster-whisper。
@@ -68,7 +45,10 @@ pub fn status(python: &str) -> AsrStatus {
     }
 
     let probe = "import faster_whisper, sys; print(faster_whisper.__version__)";
-    match no_window(Command::new(exe).arg("-c").arg(probe)).output() {
+    let mut cmd: Command = proc::python_command(exe);
+    cmd.arg("-c").arg(probe);
+
+    match proc::no_window(&mut cmd).output() {
         Ok(out) if out.status.success() => {
             let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
             AsrStatus {
@@ -97,108 +77,9 @@ pub fn transcribe(
     req: &AsrRequest,
     timeout: Duration,
 ) -> AppResult<AsrResponse> {
-    if !python.is_file() {
-        return Err(AppError::ToolMissing("python".into()));
-    }
-    if !worker.is_file() {
-        return Err(AppError::Msg(format!(
-            "找不到 ASR worker 脚本：{}",
-            worker.display()
-        )));
-    }
-
-    let payload = serde_json::to_string(req)?;
-    let mut child = no_window(
-        Command::new(python)
-            .arg(worker)
-            // 中文 Windows 上 Python 默认用 GBK 写管道，这里强制 UTF-8，
-            // 否则识别出来的中文字幕会变成乱码（甚至整段丢失）。
-            .env("PYTHONUTF8", "1")
-            .env("PYTHONIOENCODING", "utf-8")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    )
-    .spawn()
-    .map_err(|e| AppError::Process(format!("无法启动 Python 子进程：{e}")))?;
-
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| AppError::Process("无法打开 worker 的 stdin".into()))?;
-        stdin.write_all(payload.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        // stdin 在此 drop，worker 读到 EOF 后开始干活
-    }
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::Process("无法打开 worker 的 stdout".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::Process("无法打开 worker 的 stderr".into()))?;
-    let out_reader = std::thread::spawn(move || read_all(stdout));
-    let err_reader = std::thread::spawn(move || read_all(stderr));
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(AppError::Process(format!(
-                        "ASR 超时（超过 {} 秒），已终止子进程",
-                        timeout.as_secs()
-                    )));
-                }
-                std::thread::sleep(Duration::from_millis(150));
-            }
-            Err(e) => return Err(AppError::Process(format!("等待 ASR 子进程失败：{e}"))),
-        }
-    };
-
-    let stdout_text = out_reader.join().unwrap_or_default();
-    let stderr_text = err_reader.join().unwrap_or_default();
-
-    // worker 约定：无论成功失败都吐一行 JSON
-    let line = stdout_text
-        .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with('{'));
-    let Some(line) = line else {
-        return Err(AppError::Process(format!(
-            "ASR worker 没有返回结果（退出码 {:?}）：{}",
-            status.code(),
-            tail(&stderr_text)
-        )));
-    };
-
-    let parsed: AsrResponse = serde_json::from_str(line.trim()).map_err(|e| {
-        AppError::Process(format!("ASR 输出无法解析：{e}；原始输出：{}", tail(line)))
-    })?;
-
-    if !parsed.ok {
-        let reason = if parsed.error.trim().is_empty() {
-            "ASR 失败（worker 未给出原因）".to_string()
-        } else {
-            parsed.error.clone()
-        };
-        return Err(AppError::Process(reason));
-    }
-    Ok(parsed)
-}
-
-fn read_all<R: Read>(mut reader: R) -> String {
-    // 按字节读再宽松解码：万一子进程还是吐了非 UTF-8（比如用户手改过 worker），
-    // 也要拿到能看的内容，而不是因为解码失败把整段输出丢掉。
-    let mut buf = Vec::new();
-    let _ = reader.read_to_end(&mut buf);
-    String::from_utf8_lossy(&buf).to_string()
+    let value = proc::run_json_worker(python, worker, req, timeout)?;
+    serde_json::from_value(value)
+        .map_err(|e| AppError::Process(format!("ASR 应答结构不符合约定：{e}")))
 }
 
 /// worker 的段落 → 字幕条目。纯函数，便于测试。
@@ -237,6 +118,7 @@ pub fn response_to_cues(resp: &AsrResponse, media_id: i64) -> Vec<Cue> {
 mod tests {
     use super::*;
     use crate::models::AsrSegment;
+    use std::time::Instant;
 
     fn seg(start: f64, end: f64, text: &str) -> AsrSegment {
         AsrSegment {
@@ -254,6 +136,17 @@ mod tests {
             duration: 12.0,
             model: "tiny".into(),
             segments,
+        }
+    }
+
+    fn req() -> AsrRequest {
+        AsrRequest {
+            audio: "E:/fake.wav".into(),
+            model: "tiny".into(),
+            language: "zh".into(),
+            model_dir: String::new(),
+            device: "cpu".into(),
+            compute_type: "int8".into(),
         }
     }
 
@@ -287,17 +180,9 @@ mod tests {
         assert_eq!(cues[1].media_id, 7);
     }
 
-    /// 子进程输出不是 UTF-8 时也要能拿到内容，而不是整段丢掉。
-    /// （真实事故：中文 Windows 上 Python 用 GBK 写管道，read_to_string 直接失败。）
     #[test]
-    fn read_all_survives_invalid_utf8() {
-        let bytes: Vec<u8> = vec![0xff, 0xfe, b'{', b'"', b'k', b'"', b':', b'1', b'}'];
-        let text = read_all(std::io::Cursor::new(bytes));
-        assert!(text.contains("{\"k\":1}"), "实际：{text}");
-    }
-
-    #[test]
-    fn drops_blank_text_and_fixes_inverted_and_negative_ranges() {        let cues = response_to_cues(
+    fn drops_blank_text_and_fixes_inverted_and_negative_ranges() {
+        let cues = response_to_cues(
             &resp(vec![
                 seg(1.0, 2.0, "   "),
                 seg(5.0, 3.0, "倒置"),
@@ -311,7 +196,7 @@ mod tests {
     }
 
     /// 用一个假 worker 打通「写 stdin → 读 stdout → 解析」整条管道。
-    /// 需要一台有 python 的机器；找不到就跳过，不让测试套件变红。
+    /// 找不到 python 就跳过，不让测试套件变红。
     fn any_python() -> Option<std::path::PathBuf> {
         if let Ok(p) = std::env::var("DRAMADIST_TEST_PYTHON") {
             let path = std::path::PathBuf::from(p);
@@ -349,19 +234,11 @@ sys.stdout.write(json.dumps({
 sys.stdout.flush()
 "#,
         );
-        let req = AsrRequest {
-            audio: "E:/fake.wav".into(),
-            model: "tiny".into(),
-            language: "zh".into(),
-            model_dir: String::new(),
-            device: "cpu".into(),
-            compute_type: "int8".into(),
-        };
-        let out = transcribe(&python, &worker, &req, Duration::from_secs(30)).unwrap();
+        let out = transcribe(&python, &worker, &req(), Duration::from_secs(30)).unwrap();
         assert_eq!(out.model, "tiny");
         assert_eq!(out.segments.len(), 1);
         let cues = response_to_cues(&out, 3);
-        assert_eq!(cues[0].text, "你好");
+        assert_eq!(cues[0].text, "你好", "中文必须原样往返（编码回归）");
     }
 
     #[test]
@@ -379,15 +256,7 @@ sys.stdout.write(json.dumps({"ok": False, "error": "未安装 faster-whisper"}) 
 sys.stdout.flush()
 "#,
         );
-        let req = AsrRequest {
-            audio: "E:/fake.wav".into(),
-            model: "tiny".into(),
-            language: "zh".into(),
-            model_dir: String::new(),
-            device: "cpu".into(),
-            compute_type: "int8".into(),
-        };
-        let err = transcribe(&python, &worker, &req, Duration::from_secs(30))
+        let err = transcribe(&python, &worker, &req(), Duration::from_secs(30))
             .unwrap_err()
             .to_string();
         assert!(err.contains("faster-whisper"), "实际：{err}");
@@ -400,16 +269,8 @@ sys.stdout.flush()
             return;
         };
         let worker = write_stub("stub_hang.py", "import time\ntime.sleep(60)\n");
-        let req = AsrRequest {
-            audio: "E:/fake.wav".into(),
-            model: "tiny".into(),
-            language: "zh".into(),
-            model_dir: String::new(),
-            device: "cpu".into(),
-            compute_type: "int8".into(),
-        };
         let started = Instant::now();
-        let err = transcribe(&python, &worker, &req, Duration::from_secs(2))
+        let err = transcribe(&python, &worker, &req(), Duration::from_secs(2))
             .unwrap_err()
             .to_string();
         assert!(err.contains("超时"), "实际：{err}");

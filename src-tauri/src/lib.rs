@@ -8,8 +8,10 @@ mod commands;
 mod db;
 mod error;
 mod export;
+mod jy;
 mod media;
 mod models;
+mod proc;
 mod subtitle;
 mod tools;
 
@@ -76,6 +78,7 @@ pub fn run() {
             commands::export_srt,
             commands::asr_transcribe,
             commands::export_video,
+            commands::export_draft,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

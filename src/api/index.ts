@@ -4,6 +4,7 @@ import type {
   AsrOutcome,
   AsrStatus,
   Cue,
+  DraftReport,
   ExportOptions,
   ExportOutcome,
   Media,
@@ -71,4 +72,8 @@ export const api = {
 
   // 导出
   exportVideo: (opts: ExportOptions) => call<ExportOutcome>("export_video", { opts }),
+
+  // 剪映草稿
+  exportDraft: (mediaId: number, draftRoot: string, draftName: string, fps: number) =>
+    call<DraftReport>("export_draft", { mediaId, draftRoot, draftName, fps }),
 };

@@ -1,0 +1,249 @@
+//! Python 子进程桥的公共实现。
+//!
+//! 三件事必须一起做，每一件都是踩过坑才加上的：
+//!
+//! 1. **强制 UTF-8**：中文 Windows 上 Python 往管道写 stdout 用的是 GBK，
+//!    宿主按 UTF-8 读会解码失败、整段输出丢失（退出码还是 0，极难查）。
+//! 2. **指定干净的工作目录**：子进程默认继承宿主的 CWD。如果 CWD 里恰好有
+//!    别的 Python 版本的 `.pyd` / `python3x.dll`（比如同一个盘上装了另一个
+//!    打包成 exe 的 Python 程序），子进程 import 会直接报
+//!    "Module use of python38.dll conflicts with this version of Python"。
+//! 3. **超时终止**：模型或第三方库卡死时，不能把界面一起拖住。
+
+use crate::error::{AppError, AppResult};
+use serde::Serialize;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+const STDERR_KEEP: usize = 800;
+
+pub fn tail(text: &str) -> String {
+    let t = text.trim();
+    if t.chars().count() <= STDERR_KEEP {
+        return t.to_string();
+    }
+    let skip = t.chars().count() - STDERR_KEEP;
+    format!("…{}", t.chars().skip(skip).collect::<String>())
+}
+
+#[cfg(windows)]
+pub fn no_window(cmd: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[cfg(not(windows))]
+pub fn no_window(cmd: &mut Command) -> &mut Command {
+    cmd
+}
+
+/// 把工作目录钉在一个干净的地方：优先脚本所在目录，否则用临时目录。
+fn pin_cwd(cmd: &mut Command, preferred: Option<&Path>) {
+    match preferred {
+        Some(dir) if dir.is_dir() => {
+            cmd.current_dir(dir);
+        }
+        _ => {
+            cmd.current_dir(std::env::temp_dir());
+        }
+    }
+}
+
+/// `python -c ...` 这类内联探测：UTF-8 环境 + 临时目录作为 CWD。
+pub fn python_command(python: &Path) -> Command {
+    let mut cmd = Command::new(python);
+    cmd.env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    pin_cwd(&mut cmd, None);
+    cmd
+}
+
+/// 跑一个脚本：UTF-8 环境 + 以脚本所在目录为 CWD。
+pub fn python_script_command(python: &Path, script: &Path) -> Command {
+    let mut cmd = python_command(python);
+    cmd.arg(script);
+    pin_cwd(&mut cmd, script.parent());
+    cmd
+}
+
+/// 按字节读再宽松解码：即使对面吐了非 UTF-8，也要拿到能看的内容。
+pub fn read_all<R: Read>(mut reader: R) -> String {
+    let mut buf = Vec::new();
+    let _ = reader.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+/// 一次「一行 JSON 进、一行 JSON 出」的子进程调用。
+///
+/// 返回完整应答对象；`ok == false` 时转成可读错误。超时会终止子进程。
+pub fn run_json_worker(
+    python: &Path,
+    script: &Path,
+    payload: &impl Serialize,
+    timeout: Duration,
+) -> AppResult<serde_json::Value> {
+    if !python.is_file() {
+        return Err(AppError::ToolMissing("python".into()));
+    }
+    if !script.is_file() {
+        return Err(AppError::Msg(format!(
+            "找不到 worker 脚本：{}",
+            script.display()
+        )));
+    }
+
+    let line = serde_json::to_string(payload)?;
+    let mut spawn_cmd = python_script_command(python, script);
+    // 我们需要把请求写进子进程；python_command 默认把 stdin 接到 null，这里覆盖回来。
+    spawn_cmd.stdin(Stdio::piped());
+
+    let mut child = no_window(&mut spawn_cmd)
+        .spawn()
+        .map_err(|e| AppError::Process(format!("无法启动 Python 子进程：{e}")))?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AppError::Process("无法打开 worker 的 stdin".into()))?;
+        stdin.write_all(line.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        // stdin 在这里 drop，worker 读到 EOF 后开始干活
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::Process("无法打开 worker 的 stdout".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::Process("无法打开 worker 的 stderr".into()))?;
+    let out_reader = std::thread::spawn(move || read_all(stdout));
+    let err_reader = std::thread::spawn(move || read_all(stderr));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(AppError::Process(format!(
+                        "子进程超时（超过 {} 秒），已终止",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Err(e) => return Err(AppError::Process(format!("等待子进程失败：{e}"))),
+        }
+    };
+
+    let stdout_text = out_reader.join().unwrap_or_default();
+    let stderr_text = err_reader.join().unwrap_or_default();
+
+    // worker 约定：无论成功失败都吐一行 JSON；日志行一律忽略
+    let json_line = stdout_text
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'));
+    let Some(json_line) = json_line else {
+        return Err(AppError::Process(format!(
+            "worker 没有返回结果（退出码 {:?}）：{}",
+            status.code(),
+            tail(&stderr_text)
+        )));
+    };
+
+    let value: serde_json::Value = serde_json::from_str(json_line.trim()).map_err(|e| {
+        AppError::Process(format!("worker 输出无法解析：{e}；原始输出：{}", tail(json_line)))
+    })?;
+
+    let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !ok {
+        let reason = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return Err(AppError::Process(if reason.is_empty() {
+            "worker 报告失败但没有给出原因".to_string()
+        } else {
+            reason
+        }));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_all_survives_invalid_utf8() {
+        // 真实事故：对面用 GBK 写，宿主按 UTF-8 读会整段丢掉
+        let bytes: Vec<u8> = vec![0xff, 0xfe, b'{', b'"', b'k', b'"', b':', b'1', b'}'];
+        let text = read_all(std::io::Cursor::new(bytes));
+        assert!(text.contains("{\"k\":1}"), "实际：{text}");
+    }
+
+    #[test]
+    fn tail_keeps_the_end_and_truncates_huge_input() {
+        let text = "x".repeat(2_000);
+        let t = tail(&text);
+        assert!(t.starts_with('…'));
+        assert!(t.chars().count() <= STDERR_KEEP + 1);
+        assert_eq!(tail("  hi  "), "hi");
+    }
+
+    #[test]
+    fn script_command_pins_cwd_to_script_directory() {
+        // 这条是防回归：CWD 里混进别的 Python 版本的 .pyd 会让子进程 import 崩
+        let script = std::env::temp_dir().join("dramadist_proc_test").join("w.py");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "print('x')").unwrap();
+        let cmd = python_script_command(Path::new("python.exe"), &script);
+        assert_eq!(cmd.get_current_dir(), script.parent());
+    }
+
+    #[test]
+    fn missing_script_is_reported_before_spawning() {
+        // 用一个存在的假 python，专门测"脚本缺失"这条分支（检查顺序是 python → 脚本）
+        let dir = std::env::temp_dir().join("dramadist_proc_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake_python = dir.join("fake_python.exe");
+        std::fs::write(&fake_python, b"not a real executable").unwrap();
+
+        let err = run_json_worker(
+            &fake_python,
+            Path::new("Z:/nope/worker.py"),
+            &serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("找不到 worker 脚本"), "实际：{err}");
+    }
+
+    #[test]
+    fn missing_python_is_reported_too() {
+        let err = run_json_worker(
+            Path::new("Z:/nope/python.exe"),
+            Path::new("Z:/nope/worker.py"),
+            &serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("python"), "实际：{err}");
+    }
+}
