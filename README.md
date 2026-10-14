@@ -50,6 +50,24 @@ cd src-tauri
 cargo test
 ```
 
+**端到端冒烟测试**（需要本机有 ffmpeg；默认跳过，不设环境变量不会失败）：
+
+```powershell
+$env:DRAMADIST_TEST_FFMPEG  = "C:\ffmpeg\bin\ffmpeg.exe"
+$env:DRAMADIST_TEST_FFPROBE = "C:\ffmpeg\bin\ffprobe.exe"
+cd src-tauri; cargo test end_to_end -- --nocapture
+```
+
+它会自己生成一段 12 秒带音轨的测试素材，跑通「探测 → 计划 → 切片 → 校验产出 → 检查临时文件残留」全流程。
+
+### 当前测试状态
+
+| 项目 | 结果 |
+| --- | --- |
+| Rust 单元测试 | 27 项通过（切片计划边界、DB 往返与迁移、工具探测降级、错误路径） |
+| 端到端冒烟 | 通过（真实 ffmpeg 12 秒素材 → 3 片） |
+| 前端类型检查 + 构建 | 通过（`vue-tsc --noEmit` + `vite build`） |
+
 ## 首次使用
 
 1. 启动应用，进入 **设置**，指定 `ffmpeg.exe` 与 `ffprobe.exe` 的路径。

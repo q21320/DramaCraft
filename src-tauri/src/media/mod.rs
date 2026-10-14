@@ -318,4 +318,96 @@ mod tests {
         .to_string();
         assert!(err.contains("非法区间"), "实际：{err}");
     }
+
+    /// 端到端冒烟：需要真实 ffmpeg / ffprobe，默认跳过。
+    ///
+    /// 用法（PowerShell）：
+    /// ```text
+    /// $env:DRAMADIST_TEST_FFMPEG  = "C:\ffmpeg\bin\ffmpeg.exe"
+    /// $env:DRAMADIST_TEST_FFPROBE = "C:\ffmpeg\bin\ffprobe.exe"
+    /// cargo test end_to_end -- --nocapture
+    /// ```
+    /// 没装 ffmpeg 的机器上这条测试直接返回，不会把整个测试套件拖红。
+    #[test]
+    fn end_to_end_probe_and_slice_with_real_ffmpeg() {
+        let (Ok(ffmpeg), Ok(ffprobe)) = (
+            std::env::var("DRAMADIST_TEST_FFMPEG"),
+            std::env::var("DRAMADIST_TEST_FFPROBE"),
+        ) else {
+            eprintln!("跳过端到端测试：未设置 DRAMADIST_TEST_FFMPEG / DRAMADIST_TEST_FFPROBE");
+            return;
+        };
+        let ffmpeg = PathBuf::from(ffmpeg);
+        let ffprobe = PathBuf::from(ffprobe);
+
+        let dir = std::env::temp_dir().join("dramadist_e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1) 造一段 12 秒带音轨的测试素材
+        let input = dir.join("input.mp4");
+        let generated = no_window(
+            Command::new(&ffmpeg).args([
+                "-hide_banner",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=15",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440",
+                "-t",
+                "12",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ]),
+        )
+        .arg(&input)
+        .output()
+        .expect("无法启动 ffmpeg");
+        assert!(
+            generated.status.success(),
+            "生成测试素材失败：{}",
+            tail(&String::from_utf8_lossy(&generated.stderr))
+        );
+
+        // 2) 探测
+        let info = probe(&ffprobe, &input).expect("探测失败");
+        assert_eq!((info.width, info.height), (320, 240));
+        assert!(info.has_audio, "应当探测到音轨");
+        assert!(
+            (11_000..=13_400).contains(&info.duration_ms),
+            "时长异常：{}",
+            info.duration_ms
+        );
+
+        // 3) 计划 + 逐个切片
+        let plans = plan::plan_every_seconds(info.duration_ms, 4.0);
+        assert_eq!(plans.len(), 3, "12 秒按 4 秒切应得 3 片");
+        for p in &plans {
+            let out = dir.join(format!("{:03}.mp4", p.index));
+            let outcome = slice(&ffmpeg, &input, &out, p).expect("切片失败");
+            assert!(out.is_file(), "第 {} 片没有产出文件", p.index);
+            assert!(outcome.size_bytes > 0, "第 {} 片是空文件", p.index);
+        }
+
+        // 4) 不应留下任何 .part 临时文件
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".part."))
+            .count();
+        assert_eq!(leftovers, 0, "输出目录残留了临时文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
