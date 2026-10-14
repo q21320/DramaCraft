@@ -1,4 +1,4 @@
-//! SQLite 存取层。
+﻿//! SQLite 存取层。
 //!
 //! 迁移策略：只前进不回退，靠 `PRAGMA user_version` 判断。旧库能直接打开。
 
@@ -1019,6 +1019,9 @@ pub fn enqueue_job(
 }
 
 /// 入队，并可选地挂在某部剧下（流水线用）。
+///
+/// 入队前**先验一遍参数** —— 参数写错应当当场报，而不是排进队列、
+/// 跑到它的时候才炸（真实素材那轮 32 个切片任务就是这么全废的）。
 pub fn enqueue_job_for(
     conn: &Connection,
     media_id: Option<i64>,
@@ -1026,6 +1029,7 @@ pub fn enqueue_job_for(
     payload: &str,
     pipeline_drama_id: Option<i64>,
 ) -> AppResult<Job> {
+    crate::queue::validate_payload(kind, payload)?;
     let now = now();
     conn.execute(
         "INSERT INTO job(media_id, kind, payload, status, message, attempts, created_at, updated_at, pipeline_drama_id)
@@ -1511,11 +1515,11 @@ mod tests {
     #[test]
     fn jobs_are_first_in_first_out() {
         let conn = mem();
-        let a = enqueue_job(&conn, Some(1), "slice", r#"{"mediaId":1}"#).unwrap();
-        let b = enqueue_job(&conn, Some(2), "ocr", "{}").unwrap();
+        let a = enqueue_job(&conn, Some(1), "slice", OK_SLICE).unwrap();
+        let b = enqueue_job(&conn, Some(2), "ocr", OK_OCR).unwrap();
         assert_eq!(a.status, JOB_PENDING);
         assert_eq!(a.attempts, 0);
-        assert_eq!(a.payload, r#"{"mediaId":1}"#);
+        assert_eq!(a.payload, OK_SLICE);
 
         assert_eq!(next_pending_job(&conn).unwrap().unwrap().id, a.id);
 
@@ -1533,7 +1537,7 @@ mod tests {
     #[test]
     fn restart_returns_running_jobs_to_pending() {
         let conn = mem();
-        let job = enqueue_job(&conn, None, "export", "{}").unwrap();
+        let job = enqueue_job(&conn, None, "slice", OK_SLICE).unwrap();
         mark_job_running(&conn, job.id).unwrap();
 
         // 模拟进程被杀后重启
@@ -1549,9 +1553,9 @@ mod tests {
     #[test]
     fn finishing_jobs_and_counting() {
         let conn = mem();
-        let a = enqueue_job(&conn, None, "slice", "{}").unwrap();
-        let b = enqueue_job(&conn, None, "slice", "{}").unwrap();
-        enqueue_job(&conn, None, "slice", "{}").unwrap();
+        let a = enqueue_job(&conn, None, "slice", OK_SLICE).unwrap();
+        let b = enqueue_job(&conn, None, "slice", OK_SLICE).unwrap();
+        enqueue_job(&conn, None, "slice", OK_SLICE).unwrap();
 
         mark_job_running(&conn, a.id).unwrap();
         finish_job(&conn, a.id, JOB_DONE, "切了 10 片").unwrap();
@@ -1572,8 +1576,8 @@ mod tests {
     #[test]
     fn cancel_pending_leaves_running_alone() {
         let conn = mem();
-        let running = enqueue_job(&conn, None, "slice", "{}").unwrap();
-        let waiting = enqueue_job(&conn, None, "slice", "{}").unwrap();
+        let running = enqueue_job(&conn, None, "slice", OK_SLICE).unwrap();
+        let waiting = enqueue_job(&conn, None, "slice", OK_SLICE).unwrap();
         mark_job_running(&conn, running.id).unwrap();
 
         assert_eq!(cancel_pending_jobs(&conn).unwrap(), 1);
@@ -1584,7 +1588,7 @@ mod tests {
     #[test]
     fn running_job_cannot_be_deleted() {
         let conn = mem();
-        let job = enqueue_job(&conn, None, "slice", "{}").unwrap();
+        let job = enqueue_job(&conn, None, "slice", OK_SLICE).unwrap();
         mark_job_running(&conn, job.id).unwrap();
         delete_job(&conn, job.id).unwrap();
         assert!(get_job(&conn, job.id).is_ok(), "正在跑的任务不该被删掉");
@@ -1597,8 +1601,8 @@ mod tests {
     #[test]
     fn listing_puts_running_first() {
         let conn = mem();
-        let a = enqueue_job(&conn, None, "slice", "{}").unwrap();
-        let b = enqueue_job(&conn, None, "slice", "{}").unwrap();
+        let a = enqueue_job(&conn, None, "slice", OK_SLICE).unwrap();
+        let b = enqueue_job(&conn, None, "slice", OK_SLICE).unwrap();
         mark_job_running(&conn, b.id).unwrap();
         let list = list_jobs(&conn, 10).unwrap();
         assert_eq!(list[0].id, b.id, "正在跑的排最前");
@@ -1661,6 +1665,13 @@ mod tests {
         assert_eq!(all[0].account, "", "新列默认空，可由上层归一到默认账号");
     }
 
+    /// 一个能通过校验的最小 payload。
+    ///
+    /// 入队时会验参数（这是有意的），所以测试里不能再用 `"{}"` 这种假数据 ——
+    /// 那种写法以前能过，现在会被当场拦下。这里给的是真形状。
+    const OK_SLICE: &str =
+        r#"{"mediaId":1,"mode":{"mode":"equalParts","parts":3},"outDir":"E:/o"}"#;
+    const OK_OCR: &str = r#"{"mediaId":2}"#;
     fn asset(kind: &str, name: &str, path: &str, bytes: i64) -> Asset {
         Asset {
             id: 0,

@@ -1,4 +1,4 @@
-﻿//! 流水线：把「一个源目录」变成「一批做完的剧」。
+//! 流水线：把「一个源目录」变成「一批做完的剧」。
 //!
 //! ## 为什么要有这一层
 //!
@@ -346,7 +346,11 @@ pub fn stage_payload(
     let value = match stage {
         "slice" => serde_json::json!({
             "mediaId": media_id,
-            "mode": { "mode": "fixedDuration", "seconds": slice_ms as f64 / 1000.0 },
+            // 形状要对：`mode` 这一层装的是 SliceMode，而 SliceMode 自己是
+            // 内部标签枚举（tag = "mode"），所以会出现两层 mode。
+            // 变体名是 everySeconds。写错不会当场报，而是排进队列、
+            // 跑到它的时候才炸 —— 真实素材那轮就是这么栽的。
+            "mode": { "mode": "everySeconds", "seconds": slice_ms as f64 / 1000.0 },
             "outDir": out_dir.join("切片").to_string_lossy(),
             // 切出来要能直接上传：源素材常是 HEVC，而平台要 H.264
             "compatible": true,
@@ -915,6 +919,43 @@ mod tests {
         // 一部剧一个工程，素材不混在一起
         let projects = crate::db::list_projects(&conn).unwrap();
         assert_eq!(projects.len(), 2);
+    }
+
+    #[test]
+    fn every_stage_payload_actually_parses() {
+        // 这条测试是为了防住一类坑：payload 的**字段名或枚举变体写错**，
+        // 编译期查不出来，入队也不报，要跑到那个任务才炸。
+        // 真实素材那轮：切片方式写成 fixedDuration（枚举里是 everySeconds），
+        // 32 个切片任务全废，还连累了后面的画面处理。
+        let mut checked = 0;
+        for (stage, _, _, _) in STAGES {
+            let payload = stage_payload(stage, 7, Path::new("E:/out"), 40_000, "small")
+                .unwrap_or_else(|e| panic!("{stage} 生成参数失败：{e}"));
+            let Some(payload) = payload else {
+                continue; // 这一步没配就不排任务，正常
+            };
+            let kind = stage_to_job_kind(stage);
+            crate::queue::validate_payload(kind, &payload)
+                .unwrap_or_else(|e| panic!("步骤 {stage}（队列类型 {kind}）的参数过不了校验：{e}"));
+            checked += 1;
+        }
+        assert!(checked >= 5, "步骤表里应当有至少 5 步能生成参数，实际 {checked}");
+    }
+
+    #[test]
+    fn wrong_slice_mode_is_rejected_at_enqueue_time() {
+        // 反例：把切片方式写成不存在的变体，必须当场被拦下
+        let bad = serde_json::json!({
+            "mediaId": 1,
+            "mode": { "mode": "fixedDuration", "seconds": 40.0 },
+            "outDir": "E:/out",
+        })
+        .to_string();
+        let err = crate::queue::validate_payload("slice", &bad)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("参数不对"), "{err}");
+        assert!(err.contains("everySeconds"), "错误里要提示正确写法：{err}");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-﻿//! 任务队列：把长任务排成一队顺序跑，可暂停、可停止、**重启后能接着跑**。
+//! 任务队列：把长任务排成一队顺序跑，可暂停、可停止、**重启后能接着跑**。
 //!
 //! ## 为什么需要它
 //!
@@ -123,6 +123,35 @@ struct VerifyPayload {
 struct CloudPayload {
     media_id: i64,
     overwrite: Option<bool>,
+}
+
+/// 校验一份 payload 能不能被解析成对应类型的参数。
+///
+/// **在入队时就调用，而不是等到跑的时候** —— 参数写错了应该当场报，
+/// 而不是排一堆注定失败的任务。真实素材那轮就是这么栽的：
+/// 流水线把切片方式写成了 `fixedDuration`（枚举里没有这个变体），
+/// 32 个切片任务全排在队列里，跑一个败一个，还连累了后面的画面处理。
+pub fn validate_payload(kind: &str, payload: &str) -> AppResult<()> {
+    fn check<T: for<'de> Deserialize<'de>>(kind: &str, payload: &str) -> AppResult<()> {
+        serde_json::from_str::<T>(payload).map(|_| ()).map_err(|e| {
+            AppError::Msg(format!(
+                "{kind} 任务的参数不对：{e}。原始参数：{}",
+                crate::proc::tail(payload)
+            ))
+        })
+    }
+    match kind {
+        "slice" => check::<SlicePayload>(kind, payload),
+        "transform" => check::<TransformPayload>(kind, payload),
+        "ocr" => check::<OcrPayload>(kind, payload),
+        "asr" => check::<AsrPayload>(kind, payload),
+        "cloud" => check::<CloudPayload>(kind, payload),
+        "export" => check::<ExportOptions>(kind, payload),
+        "draft" => check::<DraftPayload>(kind, payload),
+        "publish" => check::<PublishPayload>(kind, payload),
+        "verify" => check::<VerifyPayload>(kind, payload),
+        other => Err(AppError::Msg(format!("不认识的任务类型：{other}"))),
+    }
 }
 
 fn parse_payload<T: for<'de> Deserialize<'de>>(job: &Job) -> AppResult<T> {
@@ -353,17 +382,33 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             // 流水线任务：把进度写回它所属的那部剧。
             // 失败时整部剧标失败 —— 一步没成，后面的步骤继续跑没有意义。
             if let Some(drama_id) = job.pipeline_drama_id {
-                let (status, message) = match &outcome {
-                    Ok(summary) => ("running", summary.clone()),
-                    Err(e) => ("failed", e.to_string()),
-                };
-                db::update_pipeline_drama(
-                    &conn,
-                    drama_id,
-                    &job.kind,
-                    status,
-                    &format!("{}：{}", kind_label(&job.kind), crate::proc::tail(&message)),
-                )?;
+                match &outcome {
+                    Ok(summary) => db::update_pipeline_drama(
+                        &conn,
+                        drama_id,
+                        &job.kind,
+                        "running",
+                        &format!("{}：{}", kind_label(&job.kind), crate::proc::tail(summary)),
+                    )?,
+                    Err(e) => {
+                        db::update_pipeline_drama(
+                            &conn,
+                            drama_id,
+                            &job.kind,
+                            "failed",
+                            &format!("{}：{}", kind_label(&job.kind), crate::proc::tail(&e.to_string())),
+                        )?;
+                        // 这一步没成，这部剧后面的步骤就不该再跑 ——
+                        // 界面上写着「其余步骤不再继续」，代码就得真做。
+                        let cancelled = db::cancel_jobs_of_drama(&conn, drama_id)?;
+                        if cancelled > 0 {
+                            eprintln!(
+                                "DramaDist: 剧 #{drama_id} 的 {} 失败，已撤掉它剩下的 {cancelled} 个任务",
+                                kind_label(&job.kind)
+                            );
+                        }
+                    }
+                }
             }
         }
 

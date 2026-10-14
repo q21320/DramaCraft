@@ -1,4 +1,4 @@
-//! DramaDist —— 短剧切片分发工作台。
+﻿//! DramaDist —— 短剧切片分发工作台。
 //!
 //! 分层：`commands`（前后端边界）→ `db` / `media` / `asr` / `tools`（能力）→ `models`（数据结构）。
 //! 重活一律走子进程，主进程只负责编排、落库、上报进度。
@@ -32,6 +32,23 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
+
+/// 去掉 Windows 的扩展长度路径前缀 `\\?\`。
+///
+/// Tauri 的 `resource_dir()` 在 Windows 上会返回带这个前缀的路径。
+/// Python 自己能处理（worker 脚本找得到），但**ctranslate2 是 C++ 的，
+/// 不认这个前缀** —— 直接把带前缀的模型目录传给它，会报
+/// `Unable to open file 'model.bin'`。
+fn strip_extended_prefix(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy().to_string();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
+}
 
 pub struct AppState {
     pub db: Mutex<Connection>,
@@ -78,6 +95,7 @@ pub fn run() {
 
             let bundled_dirs: Vec<PathBuf> = bundled
                 .map(|root| {
+                    let root = strip_extended_prefix(root);
                     [tools::BUNDLED_DIR, tools::ASR_RUNTIME_DIR]
                         .iter()
                         .map(|sub| root.join(sub))
@@ -264,4 +282,35 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extended_length_prefix_is_stripped() {
+        // Tauri 的 resource_dir() 在 Windows 上返回带 \\?\ 的路径。
+        // ctranslate2 打不开这种路径 —— 真实素材上撞到过：
+        //   RuntimeError: Unable to open file 'model.bin'
+        assert_eq!(
+            strip_extended_prefix(PathBuf::from(r"\\?\E:\a\b\models\small")),
+            PathBuf::from(r"E:\a\b\models\small")
+        );
+        // UNC 要还原成 \\server\share，不能变成 server\share
+        assert_eq!(
+            strip_extended_prefix(PathBuf::from(r"\\?\UNC\server\share\x")),
+            PathBuf::from(r"\\server\share\x")
+        );
+        // 本来就没前缀的不动
+        assert_eq!(
+            strip_extended_prefix(PathBuf::from(r"E:\a\b")),
+            PathBuf::from(r"E:\a\b")
+        );
+        // 相对路径也不动
+        assert_eq!(
+            strip_extended_prefix(PathBuf::from("models/small")),
+            PathBuf::from("models/small")
+        );
+    }
 }

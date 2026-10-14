@@ -123,19 +123,36 @@ def main() -> int:
         model_name = str(req.get("model") or "small").strip() or "small"
 
         device = str(req.get("device") or "auto").strip().lower() or "auto"
-        if device == "auto":
-            device = "cuda" if cuda_available() else "cpu"
-
         compute_type = str(req.get("compute_type") or "").strip()
-        if not compute_type:
-            compute_type = "float16" if device == "cuda" else "int8"
 
-        kwargs = {"device": device, "compute_type": compute_type}
+        kwargs = {}
         model_dir = str(req.get("model_dir") or "").strip()
         if model_dir:
             kwargs["download_root"] = model_dir
 
-        model = WhisperModel(model_name, **kwargs)
+        want_cuda = device in ("auto", "cuda")
+
+        def build(dev: str, ctype: str):
+            return WhisperModel(model_name, device=dev, compute_type=ctype, **kwargs)
+
+        model = None
+        if want_cuda:
+            # 「有显卡」不等于「能在上面跑」。ctranslate2 跑 CUDA 需要
+            # cuBLAS 与 cuDNN，而运行时里没有打包这些库 —— 只按
+            # get_cuda_device_count() 判断，在这台机器上会直接报
+            # `Library cublas64_12.dll is not found`。
+            # 所以要**真的试着建一次**，失败就退回 CPU，而不是整个任务失败。
+            try:
+                model = build("cuda", compute_type or "float16")
+            except Exception as exc:
+                if device == "cuda":
+                    # 用户明确要求 GPU，那就如实报错，不要偷偷换掉
+                    raise
+                print(f"[asr] CUDA 不可用（{type(exc).__name__}: {exc}），改用 CPU", file=sys.stderr)
+                model = None
+
+        if model is None:
+            model = build("cpu", compute_type or "int8")
 
         language = str(req.get("language") or "zh").strip()
         if language in ("", "auto"):
