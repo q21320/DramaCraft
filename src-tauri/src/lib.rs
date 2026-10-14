@@ -54,12 +54,19 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             // 内置二进制：安装后在资源目录下，开发时在源码的 resources/bin 下。
             // 登记之后 tools::resolve 就会优先用它 —— 用户不必自己装 ffmpeg。
+            // 两个候选都试：打包器可能保留 `resources/` 这一层，也可能不保留。
             let bundled = app
                 .path()
                 .resource_dir()
                 .ok()
-                .map(|dir| dir.join("resources").join(tools::BUNDLED_DIR))
-                .filter(|dir| dir.is_dir())
+                .and_then(|dir| {
+                    [
+                        dir.join("resources").join(tools::BUNDLED_DIR),
+                        dir.join(tools::BUNDLED_DIR),
+                    ]
+                    .into_iter()
+                    .find(|candidate| candidate.is_dir())
+                })
                 .or_else(|| {
                     let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .join("resources")
