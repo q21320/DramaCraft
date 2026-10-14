@@ -1,4 +1,4 @@
-# 获取 ASR 运行时并放进内置目录
+﻿# 获取 ASR 运行时并放进内置目录
 #
 # 用法：
 #   pwsh -File scripts/fetch-asr-runtime.ps1 -Source "E:\chaoren\asr_runtime"

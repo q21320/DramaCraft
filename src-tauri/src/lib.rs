@@ -186,6 +186,7 @@ pub fn run() {
             commands::detect_tools,
             commands::set_tools,
             commands::asr_status,
+            commands::asr_models,
             commands::create_project,
             commands::list_projects,
             commands::delete_project,

@@ -41,6 +41,43 @@ EXIT_NO_DEPENDENCY = 3
 EXIT_FAILED = 4
 
 
+# ---------------- 中文后处理 ----------------
+
+# Whisper 对中文有个老毛病：同一段话，有时出简体，有时出繁体，
+# 而且标点用的是半角逗号。实测同一句「第三集，林小雨…」，
+# tiny 出简体但错字多，small 内容几乎全对却整句繁体。
+# 所以这里统一转成简体，并把半角标点换成中文全角。
+try:
+    from opencc import OpenCC
+
+    _T2S = OpenCC("t2s")
+except Exception:  # 没装也不该让整个识别失败
+    _T2S = None
+
+# 只动这几个：句点不碰，免得把 "3.5" 这种小数改成 "3。5"
+_PUNCT = {",": "，", "?": "？", "!": "！", ":": "：", ";": "；"}
+
+
+def _has_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def normalize_chinese(text: str) -> str:
+    """繁体转简体 + 标点全角化。非中文内容原样返回。"""
+    if not text or not _has_cjk(text):
+        return text
+    if _T2S is not None:
+        try:
+            text = _T2S.convert(text)
+        except Exception:
+            pass
+    out = "".join(_PUNCT.get(ch, ch) for ch in text)
+    # 结尾的句点按中文习惯改成句号
+    if out.endswith(".") and _has_cjk(out[:-1]):
+        out = out[:-1] + "。"
+    return out
+
+
 def emit(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
@@ -112,10 +149,14 @@ def main() -> int:
         )
 
         collected = []
+        simplify = req.get("simplified")
+        simplify = True if simplify is None else bool(simplify)
         for seg in segments:
             text = (seg.text or "").strip()
             if not text:
                 continue
+            if simplify:
+                text = normalize_chinese(text)
             collected.append(
                 {"start": float(seg.start), "end": float(seg.end), "text": text}
             )

@@ -51,12 +51,20 @@ const mediaOptions = computed(() =>
   })),
 );
 
-const modelOptions = [
-  { label: "tiny（最快，草稿用）", value: "tiny" },
-  { label: "base", value: "base" },
-  { label: "small（推荐）", value: "small" },
-  { label: "medium（更准更慢）", value: "medium" },
-];
+const bundledModels = ref<string[]>([]);
+const modelOptions = computed(() =>
+  [
+    { label: "tiny（最快，草稿用）", value: "tiny" },
+    { label: "base", value: "base" },
+    { label: "small（推荐）", value: "small" },
+    { label: "medium（更准更慢）", value: "medium" },
+  ].map((o) => ({
+    ...o,
+    label: bundledModels.value.includes(o.value)
+      ? `${o.label} · 已内置`
+      : `${o.label} · 需联网下载`,
+  })),
+);
 
 const languageOptions = [
   { label: "中文", value: "zh" },
@@ -301,6 +309,14 @@ watch(mediaId, () => {
 });
 
 onMounted(() => {
+  void api
+    .asrModels()
+    .then((list) => {
+      bundledModels.value = list;
+    })
+    .catch(() => {
+      bundledModels.value = [];
+    });
   if (store.media.length > 0) mediaId.value = store.media[0].id;
   else void load();
 });
@@ -373,6 +389,17 @@ onMounted(() => {
         </n-checkbox>
         <span class="dd-muted">本地 ASR 与云端转写共用这一项；不勾选时已有字幕的素材会被拒绝</span>
       </div>
+
+      <n-alert
+        v-if="store.asr?.available && bundledModels.length > 0"
+        type="info"
+        style="margin-top: 10px"
+        title="关于模型规格"
+      >
+        本地已内置 {{ bundledModels.join(" / ") }}。选「需联网下载」的规格时，程序会去
+        HuggingFace 取模型 —— 在部分网络下这会超时，建议先用已内置的。
+        识别结果会自动繁转简、标点转全角。
+      </n-alert>
 
       <n-alert
         v-if="store.asr && !store.asr.available"

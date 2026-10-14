@@ -101,6 +101,7 @@ export const api = {
   exportSrt: (mediaId: number, path: string) => call<number>("export_srt", { mediaId, path }),
   asrTranscribe: (mediaId: number, model: string, language: string, overwrite: boolean) =>
     call<AsrOutcome>("asr_transcribe", { mediaId, model, language, overwrite }),
+  asrModels: () => call<string[]>("asr_models"),
   recognizeHardSubtitles: (mediaId: number, options: OcrOptions, overwrite: boolean) =>
     call<OcrReport>("recognize_hard_subtitles", { mediaId, options, overwrite }),
 

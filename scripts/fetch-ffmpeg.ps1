@@ -1,4 +1,4 @@
-# 获取 FFmpeg 并放进内置目录
+﻿# 获取 FFmpeg 并放进内置目录
 #
 # 用法：
 #   pwsh -File scripts/fetch-ffmpeg.ps1              # 默认下载 gyan.dev 的 release-essentials

@@ -1594,6 +1594,15 @@ pub async fn proof_render(
         .map_err(|e| AppError::Msg(format!("渲染线程异常终止：{e}")))?
 }
 
+/// 本地已经内置了哪些模型规格。
+///
+/// 界面据此标注「已内置 / 需联网下载」—— 让用户选一个要下载的规格、
+/// 而网络又连不上（HuggingFace 在这类网络下常常超时），是最糟的体验。
+#[tauri::command]
+pub fn asr_models() -> AppResult<Vec<String>> {
+    Ok(asr::bundled_model_sizes())
+}
+
 // ---------------- 云端字幕（用户自备 Key） ----------------
 
 #[tauri::command]
