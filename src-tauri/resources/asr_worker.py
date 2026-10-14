@@ -136,14 +136,13 @@ def main() -> int:
             return WhisperModel(model_name, device=dev, compute_type=ctype, **kwargs)
 
         model = None
+        used_cuda = False
         if want_cuda:
-            # 「有显卡」不等于「能在上面跑」。ctranslate2 跑 CUDA 需要
-            # cuBLAS 与 cuDNN，而运行时里没有打包这些库 —— 只按
-            # get_cuda_device_count() 判断，在这台机器上会直接报
-            # `Library cublas64_12.dll is not found`。
-            # 所以要**真的试着建一次**，失败就退回 CPU，而不是整个任务失败。
+            # 「有显卡」不等于「能在上面跑」。先按 CUDA 建一次看看 ——
+            # 注意构造成功**不代表** CUDA 可用（库是惰性加载的，见下面的推理兜底）。
             try:
                 model = build("cuda", compute_type or "float16")
+                used_cuda = True
             except Exception as exc:
                 if device == "cuda":
                     # 用户明确要求 GPU，那就如实报错，不要偷偷换掉
@@ -158,12 +157,39 @@ def main() -> int:
         if language in ("", "auto"):
             language = None
 
-        segments, info = model.transcribe(
-            audio,
-            language=language,
-            vad_filter=True,
-            beam_size=5,
-        )
+        def run_inference(m):
+            """跑一次识别并把结果全部取出。
+
+            必须在这里就把生成器消费掉 —— `transcribe()` 返回的是**惰性生成器**，
+            CUDA 库也是惰性加载的。两个「惰性」叠在一起的结果是：
+            构造模型时一切正常，错到 `for seg in segments` 才炸。
+            """
+            segs, inf = m.transcribe(
+                audio,
+                language=language,
+                vad_filter=True,
+                beam_size=5,
+            )
+            return list(segs), inf
+
+        try:
+            segments, info = run_inference(model)
+        except Exception as exc:
+            # 「有显卡」不等于「能在上面跑」：ctranslate2 需要 cuBLAS 与 cuDNN，
+            # 而运行时里没有打包这些库，报的是
+            # `Library cublas64_12.dll is not found or cannot be loaded`。
+            #
+            # 这个错**只在第一次推理时**才浮出来（构造模型时不会），
+            # 所以只能在这里兜。用户显式指定 cuda 时如实报错，不偷偷换掉。
+            if not used_cuda or device == "cuda":
+                raise
+            print(
+                f"[asr] CUDA 推理失败（{type(exc).__name__}: {exc}），改用 CPU 重跑一次",
+                file=sys.stderr,
+            )
+            model = build("cpu", "int8")
+            used_cuda = False
+            segments, info = run_inference(model)
 
         collected = []
         simplify = req.get("simplified")

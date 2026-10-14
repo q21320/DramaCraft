@@ -145,6 +145,34 @@ async function cancelRun(id: number) {
 const kindLabel = (key: string) => stages.value.find((s) => s.key === key)?.label ?? key;
 
 let unlisten: UnlistenFn | null = null;
+let timer: number | null = null;
+
+/**
+ * 轮询兜底。
+ *
+ * 只靠 `queue:progress` 事件是不够的 —— 事件丢一次、或者组件挂载晚于
+ * 第一条事件，界面就会一直停在初始状态（用户就遇到过：数据库里明明
+ * 已经在切片了，界面还显示「待跑·未开始」）。
+ * 这个页面本来就是「看着它跑」的，定时刷新才是该有的行为。
+ */
+function startPolling() {
+  stopPolling();
+  // 没有正在跑的流水线时慢一点，有的话快一点
+  const busy = runs.value.some((r) => r.status === "running");
+  timer = window.setInterval(() => {
+    void refreshRuns().then(() => {
+      const stillBusy = runs.value.some((r) => r.status === "running");
+      if (stillBusy !== busy) startPolling(); // 忙闲切换时调整频率
+    });
+  }, busy ? 2000 : 8000);
+}
+
+function stopPolling() {
+  if (timer !== null) {
+    window.clearInterval(timer);
+    timer = null;
+  }
+}
 
 onMounted(async () => {
   try {
@@ -154,6 +182,7 @@ onMounted(async () => {
     message.error((e as Error).message);
   }
   await refreshRuns();
+  startPolling();
   unlisten = await listen("queue:progress", () => {
     void refreshRuns();
   });
@@ -161,6 +190,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unlisten?.();
+  stopPolling();
 });
 </script>
 

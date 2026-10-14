@@ -14,21 +14,41 @@ import {
   NText,
   type MenuOption,
 } from "naive-ui";
-import { navByPath, navItems } from "./nav";
+import { navByPath, navGroups, primaryNav } from "./nav";
 import { useAppStore } from "@/stores/app";
 
 const route = useRoute();
 const router = useRouter();
 const store = useAppStore();
 
-const current = computed(() => navByPath(route.path) ?? navItems[0]);
+const current = computed(() => navByPath(route.path) ?? primaryNav);
 
-const menuOptions = computed<MenuOption[]>(() =>
-  navItems.map((item) => ({
-    key: item.path,
-    label: () => h(RouterLink, { to: item.path }, { default: () => item.label }),
+/**
+ * 菜单：流水线单独摆最上面，其余按用途分组、默认收起。
+ *
+ * 用户说过「看着好乱，能不能只保留流水线」—— 那就让第一眼只有一个动作。
+ * 分组用 `children`（可折叠），而不是 `type: 'group'`（常驻展开）。
+ */
+const menuOptions = computed<MenuOption[]>(() => [
+  {
+    key: primaryNav.path,
+    label: () => h(RouterLink, { to: primaryNav.path }, { default: () => primaryNav.label }),
+  },
+  ...navGroups.map((group) => ({
+    key: `group:${group.key}`,
+    label: group.title,
+    children: group.items.map((item) => ({
+      key: item.path,
+      label: () => h(RouterLink, { to: item.path }, { default: () => item.label }),
+    })),
   })),
-);
+]);
+
+/** 只展开「当前页所在」的那一组，其余保持收起 */
+const expandedKeys = computed(() => {
+  const group = navGroups.find((g) => g.items.some((i) => i.path === route.path));
+  return group ? [`group:${group.key}`] : [];
+});
 
 const projectOptions = computed(() =>
   store.projects.map((p) => ({ label: p.name, value: p.id })),
@@ -49,7 +69,12 @@ const toolWarning = computed(() => {
         <div class="dd-brand-title">DramaDist</div>
         <div class="dd-brand-sub">短剧切片分发工作台</div>
       </div>
-      <n-menu :value="current.path" :options="menuOptions" />
+      <n-menu
+        :value="current.path"
+        :options="menuOptions"
+        :default-expanded-keys="expandedKeys"
+        :accordion="true"
+      />
     </n-layout-sider>
 
     <n-layout>
