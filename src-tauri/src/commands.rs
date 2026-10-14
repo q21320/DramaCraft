@@ -4,9 +4,9 @@ use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, AsrStatus, Cue, ExportOptions, ExportOutcome, Media, Project,
-    Segment, SliceMode, SlicePlan, ToolPaths, ToolReport,
+    Segment, SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport,
 };
-use crate::{asr, export, jy, media, subtitle, tools, AppState};
+use crate::{asr, export, jy, media, subtitle, tools, transform, AppState};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
@@ -615,4 +615,179 @@ pub async fn export_draft(
     })
     .await
     .map_err(|e| AppError::Msg(format!("草稿线程异常终止：{e}")))?
+}
+
+// ---------------- 画面处理（差异化） ----------------
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformPreview {
+    pub video_filter: String,
+    pub audio_filter: String,
+    /// 按序号生成的三组样例参数，让用户先看清"这一档会怎么处理"
+    pub samples: Vec<TransformOptions>,
+}
+
+/// 只算不跑：返回将要使用的滤镜串与样例参数。
+///
+/// 传入 `width`/`height`（素材探测结果）时会给出精确像素的滤镜，
+/// 与真正执行时的完全一致。
+#[tauri::command]
+pub fn transform_preview(
+    options: Option<TransformOptions>,
+    intensity: String,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> AppResult<TransformPreview> {
+    let level = transform::Intensity::parse(&intensity);
+    let target = match (width, height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    };
+    match options {
+        Some(raw) => {
+            let normalized = transform::normalize(&raw);
+            Ok(TransformPreview {
+                video_filter: transform::build_video_filter(&normalized, target),
+                audio_filter: transform::build_audio_filter(&normalized),
+                samples: vec![normalized],
+            })
+        }
+        None => {
+            let samples: Vec<TransformOptions> = (0..3)
+                .map(|i| transform::normalize(&transform::preset_for(level, i)))
+                .collect();
+            let first = samples[0].clone();
+            Ok(TransformPreview {
+                video_filter: transform::build_video_filter(&first, target),
+                audio_filter: transform::build_audio_filter(&first),
+                samples,
+            })
+        }
+    }
+}
+
+/// 批量处理某个素材的全部成功切片。产出与原件同目录的 `xxx_t.mp4`，并更新记录指向它。
+#[tauri::command]
+pub async fn transform_segments(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    intensity: String,
+    options: Option<TransformOptions>,
+) -> AppResult<TransformReport> {
+    let (ffmpeg, segments, target) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let conn = lock_db(&state)?;
+        let media = db::get_media(&conn, media_id)?;
+        let segments: Vec<Segment> = db::list_segments(&conn, media_id)?
+            .into_iter()
+            .filter(|s| s.status == "ok" && !s.out_path.trim().is_empty())
+            .collect();
+        if segments.is_empty() {
+            return Err(AppError::Msg(
+                "这个素材还没有成功的切片，请先到「切片工作台」执行切片".into(),
+            ));
+        }
+        // 切片是流拷贝出来的，尺寸与素材一致；有了它就能做精确缩放而不是相对缩放
+        let target = if media.width > 0 && media.height > 0 {
+            Some((media.width as u32, media.height as u32))
+        } else {
+            None
+        };
+        (ffmpeg, segments, target)
+    };
+
+    let level = transform::Intensity::parse(&intensity);
+    let total = segments.len() as i64;
+
+    // 给了 options 就所有片段用同一组；否则按序号生成确定性预设，每片各不相同
+    let plan: Vec<(i64, String, String, TransformOptions)> = segments
+        .iter()
+        .enumerate()
+        .map(|(index, seg)| {
+            let opts = match &options {
+                Some(raw) => transform::normalize(raw),
+                None => transform::preset_for(level, index),
+            };
+            let input = PathBuf::from(&seg.out_path);
+            let out = transform::processed_path(&input);
+            (
+                seg.id,
+                seg.out_path.clone(),
+                out.to_string_lossy().to_string(),
+                opts,
+            )
+        })
+        .collect();
+
+    let ffmpeg_task = ffmpeg.clone();
+    let results = tauri::async_runtime::spawn_blocking(move || {
+        let mut acc: Vec<(i64, String, i64, String)> = Vec::with_capacity(plan.len());
+        for (id, input, out, opts) in plan {
+            match transform::apply(
+                &ffmpeg_task,
+                Path::new(&input),
+                Path::new(&out),
+                &opts,
+                target,
+            ) {
+                Ok(size) => acc.push((id, out, size, String::new())),
+                Err(e) => acc.push((id, out, 0, e.to_string())),
+            }
+        }
+        acc
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("画面处理线程异常终止：{e}")))?;
+
+    let mut processed = 0i64;
+    let mut failed = 0i64;
+    let mut errors: Vec<String> = Vec::new();
+    {
+        let conn = lock_db(&state)?;
+        for (id, out, size, message) in &results {
+            if message.is_empty() && *size > 0 {
+                db::update_segment_output(&conn, *id, out, *size)?;
+                processed += 1;
+            } else {
+                failed += 1;
+                if errors.len() < 10 {
+                    let reason = if message.is_empty() {
+                        "没有产出文件"
+                    } else {
+                        message.as_str()
+                    };
+                    errors.push(format!("片段 {id}：{reason}"));
+                }
+            }
+        }
+    }
+
+    let conn = lock_db(&state)?;
+    Ok(TransformReport {
+        total,
+        processed,
+        failed,
+        errors,
+        segments: db::list_segments(&conn, media_id)?,
+    })
+}
+
+/// 还原成处理前的文件。
+#[tauri::command]
+pub fn revert_segments(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+) -> AppResult<TransformReport> {
+    let conn = lock_db(&state)?;
+    let reverted = db::revert_segments(&conn, media_id)?;
+    let segments = db::list_segments(&conn, media_id)?;
+    Ok(TransformReport {
+        total: segments.len() as i64,
+        processed: reverted,
+        failed: 0,
+        errors: Vec::new(),
+        segments,
+    })
 }

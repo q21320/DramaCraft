@@ -15,6 +15,9 @@ import type {
   SrtImportOutcome,
   ToolPaths,
   ToolReport,
+  TransformOptions,
+  TransformPreview,
+  TransformReport,
 } from "@/types";
 
 /**
@@ -76,4 +79,21 @@ export const api = {
   // 剪映草稿
   exportDraft: (mediaId: number, draftRoot: string, draftName: string, fps: number) =>
     call<DraftReport>("export_draft", { mediaId, draftRoot, draftName, fps }),
+
+  // 画面处理
+  transformPreview: (
+    options: TransformOptions | null,
+    intensity: string,
+    width?: number,
+    height?: number,
+  ) =>
+    call<TransformPreview>("transform_preview", {
+      options,
+      intensity,
+      width: width ?? null,
+      height: height ?? null,
+    }),
+  transformSegments: (mediaId: number, intensity: string, options: TransformOptions | null) =>
+    call<TransformReport>("transform_segments", { mediaId, intensity, options }),
+  revertSegments: (mediaId: number) => call<TransformReport>("revert_segments", { mediaId }),
 };

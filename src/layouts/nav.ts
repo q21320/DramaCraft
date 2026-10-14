@@ -47,6 +47,12 @@ export const navItems: NavItem[] = [
     subtitle: "把切片与字幕拼成剪映草稿，继续手工精修",
   },
   {
+    key: "transform",
+    path: "/transform",
+    label: "画面处理",
+    subtitle: "镜像/裁切/调色/变速，让每个片段彼此不同",
+  },
+  {
     key: "settings",
     path: "/settings",
     label: "设置",

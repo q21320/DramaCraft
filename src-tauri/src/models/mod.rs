@@ -81,6 +81,66 @@ pub struct Segment {
     pub size_bytes: i64,
     pub status: String,
     pub message: String,
+    /// 画面处理前的原始文件路径；为空表示还没处理过。用于「还原」。
+    #[serde(default)]
+    pub original_path: String,
+}
+
+// ---------------- 画面处理（差异化） ----------------
+
+/// 画面处理选项。每个开关独立，全部处于默认值时表示不做任何处理。
+///
+/// 越界数值会在 [`crate::transform::normalize`] 里被夹到安全范围，
+/// 不会把用户输入原样拼进命令行。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformOptions {
+    /// 水平镜像
+    pub mirror: bool,
+    /// 四边各裁掉的比例（0.00 ~ 0.10），裁完再放大回原尺寸
+    pub crop_ratio: f64,
+    /// 整体缩放（0.96 ~ 1.04）
+    pub scale_ratio: f64,
+    /// 亮度增量（-0.05 ~ 0.05）
+    pub brightness: f64,
+    /// 对比度（0.95 ~ 1.05）
+    pub contrast: f64,
+    /// 饱和度（0.95 ~ 1.05）
+    pub saturation: f64,
+    /// 噪点强度（0 ~ 10）
+    pub noise: u32,
+    /// 播放速度（0.90 ~ 1.10）
+    pub speed: f64,
+    /// 音量（0.80 ~ 1.20）
+    pub volume: f64,
+}
+
+impl Default for TransformOptions {
+    /// 中性值：什么都不改。注意不能 derive —— `f64::default()` 是 0.0，
+    /// 而对比度/饱和度的中性值是 1.0，用派生默认值会把画面压成全黑。
+    fn default() -> Self {
+        Self {
+            mirror: false,
+            crop_ratio: 0.0,
+            scale_ratio: 1.0,
+            brightness: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            noise: 0,
+            speed: 1.0,
+            volume: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformReport {
+    pub total: i64,
+    pub processed: i64,
+    pub failed: i64,
+    pub errors: Vec<String>,
+    pub segments: Vec<Segment>,
 }
 
 // ---------------- 字幕 ----------------
@@ -95,12 +155,6 @@ pub struct Cue {
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
-}
-
-impl Cue {
-    pub fn duration_ms(&self) -> i64 {
-        self.end_ms - self.start_ms
-    }
 }
 
 // ---------------- 外部工具 ----------------

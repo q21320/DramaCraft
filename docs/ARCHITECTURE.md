@@ -13,6 +13,7 @@
 │  ┌────────┬────────┬────────┬────────┐        │
 │  │ media  │  asr   │  db    │ tools  │        │
 │  │ export │  jy    │subtitle│ proc   │        │
+│  │transform│       │        │        │        │
 │  └────────┴────────┴────────┴────────┘        │
 └───────┬──────────────┬───────────────┬────────┘
         │              │               │
@@ -29,6 +30,7 @@
 | `export` | 烧字幕、竖屏适配、区间导出；滤镜串构造（纯函数） |
 | `asr` | faster-whisper 子进程桥 |
 | `jy` | 剪映草稿：时间轴映射（纯函数）+ pyJianYingDraft 子进程桥 |
+| `transform` | 画面处理：滤镜构造（纯函数）、确定性档位预设、批量执行与还原 |
 | `proc` | Python 子进程公共层：编码、工作目录、超时、JSON 协议 |
 | `tools` | 外部工具定位与真实探测（PATH + 常见位置 + 手动指定） |
 | `db` | SQLite 与 `user_version` 迁移 |
@@ -129,3 +131,23 @@ ImportError: Module use of python38.dll conflicts with this version of Python
 而 worker 桥需要把请求写进子进程。覆盖顺序必须显式：
 `run_json_worker` 里先 `python_script_command(...)` 再 `.stdin(Stdio::piped())`。
 漏了这一步的症状是"无法打开 worker 的 stdin"，五个测试同时红。
+
+### 7. 相对表达式缩放会一次一次把画面啃小
+
+裁切后要放大回原尺寸，最自然的写法是相对表达式：
+
+```
+crop=trunc(iw*0.94/2)*2:trunc(ih*0.94/2)*2,scale=trunc(iw/0.94/2)*2:trunc(ih/0.94/2)*2
+```
+
+但 320 → 300（裁切取整）→ 318（放大取整），**每次处理掉 2 像素**，反复处理会越缩越小。
+
+正确做法：命令层已经知道素材的确切宽高（ffprobe 探测结果），
+直接传进去做**精确像素缩放**：`crop=300:226,scale=320:240`。
+只有在拿不到源尺寸时才退回相对表达式（`build_video_filter(raw, None)`）。
+
+### 8. `#[derive(Default)]` 对画面参数是陷阱
+
+`f64::default()` 是 `0.0`，而对比度、饱和度、缩放、速度的中性值都是 `1.0`。
+如果给 `TransformOptions` 派生 `Default`，默认值会把画面压成全黑、速度归零。
+必须手写 `impl Default`。

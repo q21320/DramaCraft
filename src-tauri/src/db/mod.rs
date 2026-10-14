@@ -63,8 +63,13 @@ CREATE TABLE IF NOT EXISTS cue (
 CREATE INDEX IF NOT EXISTS idx_cue_media ON cue(media_id, start_ms);
 "#;
 
-/// 当前 schema 版本。加表时递增，并在 `migrate` 里补一段。
-pub const SCHEMA_VERSION: i64 = 2;
+/// v3：记录画面处理前的原始文件，让「还原」成为可能。
+const SCHEMA_V3: &str = r#"
+ALTER TABLE segment ADD COLUMN original_path TEXT NOT NULL DEFAULT '';
+"#;
+
+/// 当前 schema 版本。加表/加列时递增，并在 `migrate` 里补一段。
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
@@ -85,6 +90,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     }
     if version < 2 {
         conn.execute_batch(SCHEMA_V2)?;
+    }
+    if version < 3 {
+        conn.execute_batch(SCHEMA_V3)?;
     }
     if version < SCHEMA_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -261,7 +269,8 @@ pub fn insert_segment(
 
 pub fn list_segments(conn: &Connection, media_id: i64) -> AppResult<Vec<Segment>> {
     let mut stmt = conn.prepare(
-        "SELECT id, media_id, index_no, start_ms, end_ms, out_path, size_bytes, status, message
+        "SELECT id, media_id, index_no, start_ms, end_ms, out_path, size_bytes, status, message,
+                original_path
          FROM segment WHERE media_id = ?1 ORDER BY index_no ASC",
     )?;
     let rows = stmt.query_map(params![media_id], |row| {
@@ -275,6 +284,7 @@ pub fn list_segments(conn: &Connection, media_id: i64) -> AppResult<Vec<Segment>
             size_bytes: row.get(6)?,
             status: row.get(7)?,
             message: row.get(8)?,
+            original_path: row.get(9)?,
         })
     })?;
     let mut out = Vec::new();
@@ -282,6 +292,56 @@ pub fn list_segments(conn: &Connection, media_id: i64) -> AppResult<Vec<Segment>
         out.push(item?);
     }
     Ok(out)
+}
+
+/// 画面处理后更新片段指向的文件。
+///
+/// `original_path` 只在**第一次**处理时写入：重复处理不会把中间产物当成"原始文件"。
+pub fn update_segment_output(
+    conn: &Connection,
+    id: i64,
+    out_path: &str,
+    size_bytes: i64,
+) -> AppResult<()> {
+    let changed = conn.execute(
+        "UPDATE segment
+            SET original_path = CASE WHEN original_path = '' THEN out_path ELSE original_path END,
+                out_path = ?2,
+                size_bytes = ?3
+          WHERE id = ?1",
+        params![id, out_path, size_bytes],
+    )?;
+    if changed == 0 {
+        return Err(crate::error::AppError::Msg(format!("片段 {id} 不存在")));
+    }
+    Ok(())
+}
+
+/// 还原成处理前的文件（单个片段）。
+///
+/// 当前批量入口走 [`revert_segments`]，这个单条版本保留给后续按片段操作使用。
+#[allow(dead_code)]
+pub fn revert_segment(conn: &Connection, id: i64) -> AppResult<()> {
+    let changed = conn.execute(
+        "UPDATE segment
+            SET out_path = original_path, original_path = ''
+          WHERE id = ?1 AND original_path <> ''",
+        params![id],
+    )?;
+    if changed == 0 {
+        return Ok(()); // 没处理过的片段，还原是空操作
+    }
+    Ok(())
+}
+
+pub fn revert_segments(conn: &Connection, media_id: i64) -> AppResult<i64> {
+    let changed = conn.execute(
+        "UPDATE segment
+            SET out_path = original_path, original_path = ''
+          WHERE media_id = ?1 AND original_path <> ''",
+        params![media_id],
+    )?;
+    Ok(changed as i64)
 }
 
 // ---------- cue（字幕） ----------
@@ -308,6 +368,8 @@ pub fn list_cues(conn: &Connection, media_id: i64) -> AppResult<Vec<Cue>> {
     Ok(out)
 }
 
+/// 只数条数，比拉全量轻。当前前端走 `list_cues`，保留给后续统计与测试使用。
+#[allow(dead_code)]
 pub fn cue_count(conn: &Connection, media_id: i64) -> AppResult<i64> {
     let count = conn.query_row(
         "SELECT COUNT(*) FROM cue WHERE media_id = ?1",
@@ -340,16 +402,14 @@ pub fn replace_cues(conn: &mut Connection, media_id: i64, cues: &[Cue]) -> AppRe
     Ok(cues.len() as i64)
 }
 
+/// 改单条字幕文本。当前前端保存时整体覆盖（`replace_cues`），
+/// 这个单条版本保留给后续「就地编辑单条」的交互。
+#[allow(dead_code)]
 pub fn update_cue_text(conn: &Connection, id: i64, text: &str) -> AppResult<()> {
     let changed = conn.execute("UPDATE cue SET text = ?2 WHERE id = ?1", params![id, text])?;
     if changed == 0 {
         return Err(crate::error::AppError::Msg(format!("字幕 {id} 不存在")));
     }
-    Ok(())
-}
-
-pub fn delete_cue(conn: &Connection, id: i64) -> AppResult<()> {
-    conn.execute("DELETE FROM cue WHERE id = ?1", params![id])?;
     Ok(())
 }
 
@@ -504,5 +564,66 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         assert_eq!(list_projects(&conn).unwrap()[0].name, "旧项目");
         assert_eq!(cue_count(&conn, 1).unwrap(), 0, "新表应当可用");
+    }
+
+    #[test]
+    fn v2_database_gains_original_path_without_losing_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+
+        let p = create_project(&conn, "旧库", "").unwrap();
+        let m = add_media(&conn, p.id, "E:/a.mp4", "a.mp4", &MediaProbe::default()).unwrap();
+        insert_segment(&conn, m.id, 1, 0, 1_000, "E:/out/001.mp4", 10, "ok", "").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let segs = list_segments(&conn, m.id).unwrap();
+        assert_eq!(segs.len(), 1, "旧数据必须保留");
+        assert_eq!(segs[0].original_path, "", "新列应有默认值");
+    }
+
+    #[test]
+    fn transform_updates_output_and_remembers_original_only_once() {
+        let conn = mem();
+        let p = create_project(&conn, "p", "").unwrap();
+        let m = add_media(&conn, p.id, "E:/a.mp4", "a.mp4", &MediaProbe::default()).unwrap();
+        let id = insert_segment(&conn, m.id, 1, 0, 1_000, "E:/out/001.mp4", 10, "ok", "").unwrap();
+
+        // 第一次处理：记住原始文件
+        update_segment_output(&conn, id, "E:/out/001_t.mp4", 20).unwrap();
+        let seg = &list_segments(&conn, m.id).unwrap()[0];
+        assert_eq!(seg.out_path, "E:/out/001_t.mp4");
+        assert_eq!(seg.original_path, "E:/out/001.mp4");
+        assert_eq!(seg.size_bytes, 20);
+
+        // 第二次处理：original_path 不能被中间产物覆盖
+        update_segment_output(&conn, id, "E:/out/001_t.mp4", 30).unwrap();
+        let seg = &list_segments(&conn, m.id).unwrap()[0];
+        assert_eq!(seg.original_path, "E:/out/001.mp4");
+        assert_eq!(seg.size_bytes, 30);
+
+        // 还原
+        assert_eq!(revert_segments(&conn, m.id).unwrap(), 1);
+        let seg = &list_segments(&conn, m.id).unwrap()[0];
+        assert_eq!(seg.out_path, "E:/out/001.mp4");
+        assert_eq!(seg.original_path, "");
+        // 再还原是空操作，不该报错
+        assert_eq!(revert_segments(&conn, m.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn updating_missing_segment_is_an_error_not_a_silent_noop() {
+        let conn = mem();
+        let err = update_segment_output(&conn, 99_999, "E:/x.mp4", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不存在"), "实际：{err}");
     }
 }

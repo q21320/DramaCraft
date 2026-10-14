@@ -7,6 +7,7 @@ const routes: RouteRecordRaw[] = [
   { path: "/subtitle", name: "subtitle", component: () => import("@/views/SubtitlePage.vue") },
   { path: "/export", name: "export", component: () => import("@/views/ExportPage.vue") },
   { path: "/draft", name: "draft", component: () => import("@/views/DraftPage.vue") },
+  { path: "/transform", name: "transform", component: () => import("@/views/TransformPage.vue") },
   { path: "/settings", name: "settings", component: () => import("@/views/SettingsPage.vue") },
   { path: "/:pathMatch(.*)*", redirect: "/" },
 ];

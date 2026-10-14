@@ -41,6 +41,8 @@ export interface Segment {
   sizeBytes: number;
   status: string;
   message: string;
+  /** 画面处理前的原始文件；为空表示没处理过 */
+  originalPath: string;
 }
 
 export interface ToolPaths {
@@ -124,6 +126,34 @@ export interface DraftReport {
   cueCount: number;
   durationMs: number;
   warnings: string[];
+}
+
+// ---------------- 画面处理（差异化） ----------------
+
+export interface TransformOptions {
+  mirror: boolean;
+  cropRatio: number;
+  scaleRatio: number;
+  brightness: number;
+  contrast: number;
+  saturation: number;
+  noise: number;
+  speed: number;
+  volume: number;
+}
+
+export interface TransformPreview {
+  videoFilter: string;
+  audioFilter: string;
+  samples: TransformOptions[];
+}
+
+export interface TransformReport {
+  total: number;
+  processed: number;
+  failed: number;
+  errors: string[];
+  segments: Segment[];
 }
 
 export interface AppInfo {

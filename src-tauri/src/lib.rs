@@ -14,6 +14,7 @@ mod models;
 mod proc;
 mod subtitle;
 mod tools;
+mod transform;
 
 use models::ToolPaths;
 use rusqlite::Connection;
@@ -79,6 +80,9 @@ pub fn run() {
             commands::asr_transcribe,
             commands::export_video,
             commands::export_draft,
+            commands::transform_preview,
+            commands::transform_segments,
+            commands::revert_segments,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
