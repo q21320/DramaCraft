@@ -156,6 +156,50 @@ export interface TransformReport {
   segments: Segment[];
 }
 
+// ---------------- 发布 ----------------
+
+export interface PlatformOption {
+  key: string;
+  label: string;
+  /** 该平台是否已有公开发布接口 */
+  hasPublicApi: boolean;
+  note: string;
+}
+
+export interface PublishPlan {
+  id: number;
+  mediaId: number;
+  platform: string;
+  title: string;
+  description: string;
+  tags: string;
+  coverPath: string;
+  /** draft | ready | published | failed */
+  status: string;
+  note: string;
+  updatedAt: string;
+}
+
+export interface PublishClipEntry {
+  indexNo: number;
+  file: string;
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+  subtitle: string;
+  suggestedTitle: string;
+}
+
+export interface PublishPackageReport {
+  outDir: string;
+  clipCount: number;
+  subtitleCount: number;
+  coverPath: string;
+  metadataPath: string;
+  readmePath: string;
+  warnings: string[];
+}
+
 export interface AppInfo {
   name: string;
   version: string;

@@ -53,6 +53,12 @@ export const navItems: NavItem[] = [
     subtitle: "镜像/裁切/调色/变速，让每个片段彼此不同",
   },
   {
+    key: "publish",
+    path: "/publish",
+    label: "发布",
+    subtitle: "整理发布包（视频/封面/字幕/标题标签）并记录发布台账",
+  },
+  {
     key: "settings",
     path: "/settings",
     label: "设置",

@@ -12,6 +12,7 @@ mod jy;
 mod media;
 mod models;
 mod proc;
+mod publish;
 mod subtitle;
 mod tools;
 mod transform;
@@ -83,6 +84,11 @@ pub fn run() {
             commands::transform_preview,
             commands::transform_segments,
             commands::revert_segments,
+            commands::list_platforms,
+            commands::list_publish_plans,
+            commands::save_publish_plan,
+            commands::mark_publish_status,
+            commands::export_publish_package,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

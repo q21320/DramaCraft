@@ -13,7 +13,7 @@
 │  ┌────────┬────────┬────────┬────────┐        │
 │  │ media  │  asr   │  db    │ tools  │        │
 │  │ export │  jy    │subtitle│ proc   │        │
-│  │transform│       │        │        │        │
+│  │transform│ publish│       │        │        │
 │  └────────┴────────┴────────┴────────┘        │
 └───────┬──────────────┬───────────────┬────────┘
         │              │               │
@@ -31,6 +31,7 @@
 | `asr` | faster-whisper 子进程桥 |
 | `jy` | 剪映草稿：时间轴映射（纯函数）+ pyJianYingDraft 子进程桥 |
 | `transform` | 画面处理：滤镜构造（纯函数）、确定性档位预设、批量执行与还原 |
+| `publish` | 发布：平台清单、标签解析、发布包写出（纯逻辑 + 文件整理） |
 | `proc` | Python 子进程公共层：编码、工作目录、超时、JSON 协议 |
 | `tools` | 外部工具定位与真实探测（PATH + 常见位置 + 手动指定） |
 | `db` | SQLite 与 `user_version` 迁移 |
@@ -55,6 +56,7 @@
 | `media` | 导入的源素材 | `project_id`, `path`, `duration_ms`, `width`, `height`, `has_audio` |
 | `segment` | 切片结果 | `media_id`, `index_no`, `start_ms`, `end_ms`, `out_path`, `status` |
 | `cue` | 字幕条目（v2 新增） | `media_id`, `index_no`, `start_ms`, `end_ms`, `text` |
+| `publish_plan` | 发布台账（v4 新增） | `media_id`, `platform`, `title`, `status`；`(media_id, platform)` 唯一 |
 | `setting` | 键值配置 | `key`, `value`（工具路径等） |
 
 迁移靠 `PRAGMA user_version` 只前进不回退：v1 建的库打开后会自动补上 `cue` 表，旧数据不动。
@@ -74,6 +76,16 @@
 - 后端统一返回 `Result<T, AppError>`；`AppError` 序列化为 `{ code, message }`。
 - 子进程失败时保留 **stderr 片段**（截断到合理长度）写进 `task.log`，便于用户自查。
 - 所有文件写入使用"临时文件 + 原子重命名"，避免半成品污染输出目录。
+
+## 边界：哪些事这个项目**故意不做**
+
+1. **不绕过任何授权与登录校验**。这是产品边界，不是技术边界。
+2. **不伪造平台接口调用**。视频号没有公开发布 API、开放平台需要企业资质，
+   所以发布链路只做「整理发布包 + 本地台账」，并在界面和 README.txt 里写明
+   「没有向任何平台发送任何内容」，而不是做一个看起来能发、实际发不出去的按钮。
+3. **不内置来源不明的二进制**。FFmpeg、模型、第三方库都由用户自行安装或指定，
+   许可证合规由使用者负责。
+4. **不复制第三方软件的代码、素材、文案、数据表**。本项目是独立实现。
 
 ## 踩过的坑（都是真事故，别重犯）
 

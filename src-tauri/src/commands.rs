@@ -3,10 +3,11 @@
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AppInfo, AsrOutcome, AsrRequest, AsrStatus, Cue, ExportOptions, ExportOutcome, Media, Project,
-    Segment, SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport,
+    AppInfo, AsrOutcome, AsrRequest, AsrStatus, Cue, ExportOptions, ExportOutcome, Media,
+    PlatformOption, Project, PublishClipEntry, PublishPackageReport, PublishPlan, Segment,
+    SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport,
 };
-use crate::{asr, export, jy, media, subtitle, tools, transform, AppState};
+use crate::{asr, export, jy, media, publish, subtitle, tools, transform, AppState};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
@@ -790,4 +791,196 @@ pub fn revert_segments(
         errors: Vec::new(),
         segments,
     })
+}
+
+// ---------------- 发布 ----------------
+
+#[tauri::command]
+pub fn list_platforms() -> AppResult<Vec<PlatformOption>> {
+    Ok(publish::platform_options())
+}
+
+#[tauri::command]
+pub fn list_publish_plans(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+) -> AppResult<Vec<PublishPlan>> {
+    let conn = lock_db(&state)?;
+    db::list_publish_plans(&conn, media_id)
+}
+
+#[tauri::command]
+pub fn save_publish_plan(
+    state: tauri::State<'_, AppState>,
+    plan: PublishPlan,
+) -> AppResult<PublishPlan> {
+    let platform = plan.platform.trim().to_string();
+    if !publish::is_known_platform(&platform) {
+        return Err(AppError::Msg(format!("不支持的平台：{platform}")));
+    }
+    let title = plan.title.trim().to_string();
+    if title.is_empty() {
+        return Err(AppError::Msg("标题不能为空".into()));
+    }
+    let normalized = PublishPlan {
+        id: plan.id,
+        media_id: plan.media_id,
+        platform,
+        title,
+        description: plan.description.trim().to_string(),
+        tags: plan.tags.trim().to_string(),
+        cover_path: plan.cover_path.trim().to_string(),
+        status: publish::normalize_status(&plan.status),
+        note: plan.note.trim().to_string(),
+        updated_at: String::new(),
+    };
+    let conn = lock_db(&state)?;
+    db::upsert_publish_plan(&conn, &normalized)
+}
+
+/// 标记某个平台发没发出去。这是本地台账，不联网。
+#[tauri::command]
+pub fn mark_publish_status(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    platform: String,
+    status: String,
+    note: String,
+) -> AppResult<PublishPlan> {
+    let platform = platform.trim().to_string();
+    let status = publish::normalize_status(&status);
+    let conn = lock_db(&state)?;
+    db::set_publish_status(&conn, media_id, &platform, &status, note.trim())?;
+    db::get_publish_plan(&conn, media_id, &platform)?
+        .ok_or_else(|| AppError::Msg("读取发布设置失败".into()))
+}
+
+/// 导出发布包：视频、字幕、封面、元数据、说明文件按平台整理成一个目录。
+///
+/// **只写本地文件，不向任何平台发送内容。**
+#[tauri::command]
+pub async fn export_publish_package(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    platform: String,
+    out_root: String,
+) -> AppResult<PublishPackageReport> {
+    let platform = platform.trim().to_string();
+    if !publish::is_known_platform(&platform) {
+        return Err(AppError::Msg(format!("不支持的平台：{platform}")));
+    }
+    let out_root_path = PathBuf::from(out_root.trim());
+    if out_root_path.as_os_str().is_empty() {
+        return Err(AppError::Msg("请先选择发布包输出目录".into()));
+    }
+
+    let (ffmpeg, meta, custom_cover, package_clips) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let conn = lock_db(&state)?;
+
+        let media = db::get_media(&conn, media_id)?;
+        let stored = db::get_publish_plan(&conn, media_id, &platform)?;
+
+        // 还没填设置也能出包：标题用素材名兜底，其余留空
+        let fallback_title = media
+            .name
+            .rsplit_once('.')
+            .map(|(stem, _)| stem.to_string())
+            .unwrap_or_else(|| media.name.clone());
+        let effective = PublishPlan {
+            id: stored.as_ref().map(|p| p.id).unwrap_or(0),
+            media_id,
+            platform: platform.clone(),
+            title: stored
+                .as_ref()
+                .map(|p| p.title.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .unwrap_or(fallback_title),
+            description: stored
+                .as_ref()
+                .map(|p| p.description.clone())
+                .unwrap_or_default(),
+            tags: stored.as_ref().map(|p| p.tags.clone()).unwrap_or_default(),
+            cover_path: stored
+                .as_ref()
+                .map(|p| p.cover_path.trim().to_string())
+                .unwrap_or_default(),
+            status: stored
+                .as_ref()
+                .map(|p| p.status.clone())
+                .unwrap_or_else(|| publish::STATUS_DRAFT.to_string()),
+            note: String::new(),
+            updated_at: String::new(),
+        };
+
+        let segments: Vec<Segment> = db::list_segments(&conn, media_id)?
+            .into_iter()
+            .filter(|s| s.status == "ok" && !s.out_path.trim().is_empty())
+            .collect();
+        if segments.is_empty() {
+            return Err(AppError::Msg(
+                "这个素材还没有成功的切片，请先到「切片工作台」执行切片".into(),
+            ));
+        }
+
+        let all_cues = db::list_cues(&conn, media_id)?;
+        let total = segments.len() as i64;
+
+        let mut entries: Vec<PublishClipEntry> = Vec::with_capacity(segments.len());
+        let mut package_clips: Vec<publish::PackageClip> = Vec::with_capacity(segments.len());
+
+        for (offset, seg) in segments.iter().enumerate() {
+            let index_no = offset as i64 + 1;
+            let cues = subtitle::project_range(&all_cues, seg.start_ms, seg.end_ms, 200);
+            let srt = if cues.is_empty() {
+                None
+            } else {
+                Some(subtitle::to_srt(&cues))
+            };
+            let subtitle_text = cues
+                .iter()
+                .map(|c| c.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            entries.push(PublishClipEntry {
+                index_no,
+                file: format!("{index_no:03}.mp4"),
+                start_ms: seg.start_ms,
+                end_ms: seg.end_ms,
+                duration_ms: (seg.end_ms - seg.start_ms).max(0),
+                subtitle: subtitle_text,
+                suggested_title: publish::suggested_title(&effective.title, index_no, total),
+            });
+            package_clips.push(publish::PackageClip {
+                index_no,
+                source: PathBuf::from(&seg.out_path),
+                srt,
+            });
+        }
+
+        let meta =
+            publish::build_metadata(&effective, &media.name, media.width, media.height, entries);
+        let cover = PathBuf::from(effective.cover_path.trim());
+        let custom_cover = if cover.as_os_str().is_empty() {
+            None
+        } else {
+            Some(cover)
+        };
+
+        (ffmpeg, meta, custom_cover, package_clips)
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        publish::write_package(
+            &ffmpeg,
+            &out_root_path,
+            &meta,
+            &package_clips,
+            custom_cover.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("打包线程异常终止：{e}")))?
 }

@@ -7,8 +7,8 @@ import os
 import sqlite3
 import sys
 
-EXPECTED_VERSION = 3
-EXPECTED_TABLES = {"project", "media", "segment", "cue", "setting"}
+EXPECTED_VERSION = 4
+EXPECTED_TABLES = {"project", "media", "segment", "cue", "setting", "publish_plan"}
 EXPECTED_SEGMENT_COLUMNS = {
     "id",
     "media_id",

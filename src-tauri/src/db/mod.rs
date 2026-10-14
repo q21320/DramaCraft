@@ -3,7 +3,7 @@
 //! 迁移策略：只前进不回退，靠 `PRAGMA user_version` 判断。旧库能直接打开。
 
 use crate::error::AppResult;
-use crate::models::{Cue, Media, MediaProbe, Project, Segment};
+use crate::models::{Cue, Media, MediaProbe, Project, PublishPlan, Segment};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
@@ -68,8 +68,26 @@ const SCHEMA_V3: &str = r#"
 ALTER TABLE segment ADD COLUMN original_path TEXT NOT NULL DEFAULT '';
 "#;
 
+/// v4：发布台账。每个素材在每个平台一条记录。
+const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS publish_plan (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_id    INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+    platform    TEXT    NOT NULL,
+    title       TEXT    NOT NULL DEFAULT '',
+    description TEXT    NOT NULL DEFAULT '',
+    tags        TEXT    NOT NULL DEFAULT '',
+    cover_path  TEXT    NOT NULL DEFAULT '',
+    status      TEXT    NOT NULL DEFAULT 'draft',
+    note        TEXT    NOT NULL DEFAULT '',
+    updated_at  TEXT    NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_plan_media_platform
+    ON publish_plan(media_id, platform);
+"#;
+
 /// 当前 schema 版本。加表/加列时递增，并在 `migrate` 里补一段。
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
@@ -93,6 +111,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     }
     if version < 3 {
         conn.execute_batch(SCHEMA_V3)?;
+    }
+    if version < 4 {
+        conn.execute_batch(SCHEMA_V4)?;
     }
     if version < SCHEMA_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -413,6 +434,105 @@ pub fn update_cue_text(conn: &Connection, id: i64, text: &str) -> AppResult<()> 
     Ok(())
 }
 
+// ---------- publish_plan（发布台账） ----------
+
+fn row_to_publish_plan(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublishPlan> {
+    Ok(PublishPlan {
+        id: row.get(0)?,
+        media_id: row.get(1)?,
+        platform: row.get(2)?,
+        title: row.get(3)?,
+        description: row.get(4)?,
+        tags: row.get(5)?,
+        cover_path: row.get(6)?,
+        status: row.get(7)?,
+        note: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+const PUBLISH_PLAN_COLUMNS: &str = "id, media_id, platform, title, description, tags, \
+                                    cover_path, status, note, updated_at";
+
+pub fn list_publish_plans(conn: &Connection, media_id: i64) -> AppResult<Vec<PublishPlan>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PUBLISH_PLAN_COLUMNS} FROM publish_plan WHERE media_id = ?1 ORDER BY platform ASC"
+    ))?;
+    let rows = stmt.query_map(params![media_id], row_to_publish_plan)?;
+    let mut out = Vec::new();
+    for item in rows {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
+pub fn get_publish_plan(
+    conn: &Connection,
+    media_id: i64,
+    platform: &str,
+) -> AppResult<Option<PublishPlan>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PUBLISH_PLAN_COLUMNS} FROM publish_plan WHERE media_id = ?1 AND platform = ?2"
+    ))?;
+    let mut rows = stmt.query(params![media_id, platform])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row_to_publish_plan(row)?)),
+        None => Ok(None),
+    }
+}
+
+/// 保存发布设置（同一素材同一平台只有一条，存在则整体更新）。
+pub fn upsert_publish_plan(conn: &Connection, plan: &PublishPlan) -> AppResult<PublishPlan> {
+    let updated_at = now();
+    conn.execute(
+        "INSERT INTO publish_plan(media_id, platform, title, description, tags, cover_path, status, note, updated_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(media_id, platform) DO UPDATE SET
+             title       = excluded.title,
+             description = excluded.description,
+             tags        = excluded.tags,
+             cover_path  = excluded.cover_path,
+             status      = excluded.status,
+             note        = excluded.note,
+             updated_at  = excluded.updated_at",
+        params![
+            plan.media_id,
+            plan.platform,
+            plan.title,
+            plan.description,
+            plan.tags,
+            plan.cover_path,
+            plan.status,
+            plan.note,
+            updated_at
+        ],
+    )?;
+    get_publish_plan(conn, plan.media_id, &plan.platform)?
+        .ok_or_else(|| crate::error::AppError::Msg("保存发布设置失败：写回后读不到".into()))
+}
+
+/// 只改状态与备注，用于「标记为已发布 / 失败」。
+pub fn set_publish_status(
+    conn: &Connection,
+    media_id: i64,
+    platform: &str,
+    status: &str,
+    note: &str,
+) -> AppResult<()> {
+    let updated_at = now();
+    let changed = conn.execute(
+        "UPDATE publish_plan SET status = ?3, note = ?4, updated_at = ?5
+          WHERE media_id = ?1 AND platform = ?2",
+        params![media_id, platform, status, note, updated_at],
+    )?;
+    if changed == 0 {
+        return Err(crate::error::AppError::Msg(
+            "该平台还没有发布设置，请先填写并保存".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,5 +745,84 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("不存在"), "实际：{err}");
+    }
+
+    fn plan(media_id: i64, platform: &str, title: &str) -> PublishPlan {
+        PublishPlan {
+            id: 0,
+            media_id,
+            platform: platform.to_string(),
+            title: title.to_string(),
+            description: "简介".into(),
+            tags: "短剧,推荐".into(),
+            cover_path: String::new(),
+            status: "draft".into(),
+            note: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn publish_plan_upserts_per_platform_and_cascades() {
+        let conn = mem();
+        let p = create_project(&conn, "p", "").unwrap();
+        let m = add_media(&conn, p.id, "E:/a.mp4", "a.mp4", &MediaProbe::default()).unwrap();
+
+        // 首次插入
+        let saved = upsert_publish_plan(&conn, &plan(m.id, "douyin", "第一版")).unwrap();
+        assert!(saved.id > 0);
+        assert!(!saved.updated_at.is_empty());
+
+        // 同平台再存是更新，不是新增
+        let saved = upsert_publish_plan(&conn, &plan(m.id, "douyin", "改过的标题")).unwrap();
+        assert_eq!(saved.title, "改过的标题");
+        assert_eq!(list_publish_plans(&conn, m.id).unwrap().len(), 1);
+
+        // 另一个平台是另一条
+        upsert_publish_plan(&conn, &plan(m.id, "wechat_channels", "视频号版")).unwrap();
+        assert_eq!(list_publish_plans(&conn, m.id).unwrap().len(), 2);
+
+        // 删素材连带删台账
+        remove_media(&conn, m.id).unwrap();
+        assert_eq!(list_publish_plans(&conn, m.id).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn publish_status_can_be_marked_and_missing_plan_is_an_error() {
+        let conn = mem();
+        let p = create_project(&conn, "p", "").unwrap();
+        let m = add_media(&conn, p.id, "E:/a.mp4", "a.mp4", &MediaProbe::default()).unwrap();
+
+        let err = set_publish_status(&conn, m.id, "douyin", "published", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("还没有发布设置"), "实际：{err}");
+
+        upsert_publish_plan(&conn, &plan(m.id, "douyin", "t")).unwrap();
+        set_publish_status(&conn, m.id, "douyin", "published", "已投 3 条").unwrap();
+        let stored = get_publish_plan(&conn, m.id, "douyin").unwrap().unwrap();
+        assert_eq!(stored.status, "published");
+        assert_eq!(stored.note, "已投 3 条");
+        assert_eq!(stored.title, "t", "改状态不应动标题");
+    }
+
+    #[test]
+    fn v3_database_gains_publish_plan_without_losing_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        create_project(&conn, "旧工程", "").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(list_projects(&conn).unwrap()[0].name, "旧工程");
+        assert_eq!(list_publish_plans(&conn, 1).unwrap().len(), 0, "新表可用");
     }
 }

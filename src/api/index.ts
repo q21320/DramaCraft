@@ -8,7 +8,10 @@ import type {
   ExportOptions,
   ExportOutcome,
   Media,
+  PlatformOption,
   Project,
+  PublishPackageReport,
+  PublishPlan,
   Segment,
   SliceMode,
   SlicePlan,
@@ -96,4 +99,13 @@ export const api = {
   transformSegments: (mediaId: number, intensity: string, options: TransformOptions | null) =>
     call<TransformReport>("transform_segments", { mediaId, intensity, options }),
   revertSegments: (mediaId: number) => call<TransformReport>("revert_segments", { mediaId }),
+
+  // 发布
+  listPlatforms: () => call<PlatformOption[]>("list_platforms"),
+  listPublishPlans: (mediaId: number) => call<PublishPlan[]>("list_publish_plans", { mediaId }),
+  savePublishPlan: (plan: PublishPlan) => call<PublishPlan>("save_publish_plan", { plan }),
+  markPublishStatus: (mediaId: number, platform: string, status: string, note: string) =>
+    call<PublishPlan>("mark_publish_status", { mediaId, platform, status, note }),
+  exportPublishPackage: (mediaId: number, platform: string, outRoot: string) =>
+    call<PublishPackageReport>("export_publish_package", { mediaId, platform, outRoot }),
 };

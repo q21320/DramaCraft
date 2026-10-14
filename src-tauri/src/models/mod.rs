@@ -143,6 +143,80 @@ pub struct TransformReport {
     pub segments: Vec<Segment>,
 }
 
+// ---------------- 发布 ----------------
+
+/// 一个素材在某个平台上的发布设置与状态（本地台账，不上传任何东西）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishPlan {
+    pub id: i64,
+    pub media_id: i64,
+    pub platform: String,
+    pub title: String,
+    pub description: String,
+    /// 标签，逗号分隔的原始文本
+    pub tags: String,
+    /// 自定义封面图；留空则导出时从视频抽帧
+    pub cover_path: String,
+    /// draft | ready | published | failed
+    pub status: String,
+    pub note: String,
+    pub updated_at: String,
+}
+
+/// 发布包里的一条片段
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishClipEntry {
+    pub index_no: i64,
+    pub file: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub duration_ms: i64,
+    /// 该片段的字幕全文（便于直接复制去当简介）
+    pub subtitle: String,
+    pub suggested_title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishMetadata {
+    pub platform: String,
+    pub platform_label: String,
+    pub media_name: String,
+    pub title: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub cover: String,
+    pub width: i64,
+    pub height: i64,
+    pub total_duration_ms: i64,
+    pub exported_at: String,
+    pub clips: Vec<PublishClipEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishPackageReport {
+    pub out_dir: String,
+    pub clip_count: i64,
+    pub subtitle_count: i64,
+    pub cover_path: String,
+    pub metadata_path: String,
+    pub readme_path: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformOption {
+    pub key: String,
+    pub label: String,
+    /// 该平台是否已有公开的发布接口（用于界面上的诚实提示）
+    pub has_public_api: bool,
+    pub note: String,
+}
+
 // ---------------- 字幕 ----------------
 
 /// 一条字幕。`id` 为 0 表示尚未落库；文本可含换行（SRT 的多行）。
