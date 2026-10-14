@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   NAlert,
@@ -6,15 +6,17 @@ import {
   NCheckbox,
   NInput,
   NInputNumber,
+  NModal,
   NSelect,
   NSpace,
   NTag,
   useMessage,
 } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/api";
-import type { PipelineRun, PipelineStageOption, SourceScan } from "@/types";
+import type { OutputEpisode, PipelineRun, PipelineStageOption, SourceScan } from "@/types";
 
 const message = useMessage();
 
@@ -30,7 +32,54 @@ const starting = ref(false);
 const runs = ref<PipelineRun[]>([]);
 const activeRunId = ref<number | null>(null);
 
+/** 产出：集 → 切片 */
+const outputs = ref<OutputEpisode[]>([]);
+const outputsLoading = ref(false);
+/** 展开的集（看它的切片列表） */
+const openEpisodes = ref<number[]>([]);
+/** 正在内嵌播放的那一片 */
+const playing = ref<{ path: string; title: string; cues: string[] } | null>(null);
+
 const activeRun = computed(() => runs.value.find((r) => r.id === activeRunId.value) ?? null);
+
+const totalSlices = computed(() =>
+  outputs.value.reduce((n, e) => n + e.slices.length, 0),
+);
+
+function humanSize(bytes: number): string {
+  if (bytes <= 0) return "—";
+  const mb = bytes / 1024 / 1024;
+  return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
+}
+
+function humanTime(ms: number): string {
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/** 本地文件要经 asset 协议才能给 webview 播放 */
+function fileUrl(path: string): string {
+  try {
+    return convertFileSrc(path);
+  } catch {
+    return path;
+  }
+}
+
+async function loadOutputs(runId: number | null) {
+  if (runId === null) {
+    outputs.value = [];
+    return;
+  }
+  outputsLoading.value = true;
+  try {
+    outputs.value = await api.pipelineOutputs(runId);
+  } catch (e) {
+    message.error((e as Error).message);
+  } finally {
+    outputsLoading.value = false;
+  }
+}
 
 const statusLabels: Record<string, string> = {
   pending: "待跑",
@@ -61,6 +110,38 @@ async function refreshRuns() {
     if (activeRunId.value === null && runs.value.length > 0) {
       activeRunId.value = runs.value[0].id;
     }
+    // 顺带刷产出 —— 这样切片一出来就能看见，不用等整条流水线跑完
+    await loadOutputs(activeRunId.value);
+  } catch (e) {
+    message.error((e as Error).message);
+  }
+}
+
+function toggleEpisode(mediaId: number) {
+  openEpisodes.value = openEpisodes.value.includes(mediaId)
+    ? openEpisodes.value.filter((id) => id !== mediaId)
+    : [...openEpisodes.value, mediaId];
+}
+
+async function play(slice: { path: string; indexNo: number }, episodeName: string, cues: string[]) {
+  playing.value = {
+    path: slice.path,
+    title: `${episodeName} · 第 ${slice.indexNo} 片`,
+    cues,
+  };
+}
+
+async function openExternal(path: string) {
+  try {
+    await api.openInPlayer(path);
+  } catch (e) {
+    message.error((e as Error).message);
+  }
+}
+
+async function reveal(path: string) {
+  try {
+    await api.revealInExplorer(path);
   } catch (e) {
     message.error((e as Error).message);
   }
@@ -361,4 +442,139 @@ onUnmounted(() => {
       详细的任务列表在「任务队列」页。
     </n-alert>
   </div>
+
+  <!-- 产出：跑出来什么，当场就能看 -->
+  <div v-if="activeRun" class="dd-card">
+    <div class="dd-row" style="justify-content: space-between; margin-bottom: 4px">
+      <div class="dd-card-title">产出 · 运行 #{{ activeRun.id }}</div>
+      <n-space :size="8">
+        <n-tag size="small" :bordered="false">{{ outputs.length }} 集</n-tag>
+        <n-tag size="small" :bordered="false" type="success">{{ totalSlices }} 片</n-tag>
+        <n-button size="tiny" :loading="outputsLoading" @click="loadOutputs(activeRunId)">
+          刷新
+        </n-button>
+      </n-space>
+    </div>
+    <div class="dd-card-desc">
+      跑的过程中会自己更新，切出来的片一出现就能点开看。
+    </div>
+
+    <div v-if="outputs.length === 0" class="dd-empty">
+      还没有产出。开始流水线后会实时出现在这里。
+    </div>
+
+    <n-space v-else vertical :size="6">
+      <div v-for="ep in outputs" :key="ep.mediaId" class="dd-ep">
+        <div class="dd-row dd-ep-head" @click="toggleEpisode(ep.mediaId)">
+          <span class="dd-ep-toggle">{{ openEpisodes.includes(ep.mediaId) ? "▾" : "▸" }}</span>
+          <span class="dd-ep-name">{{ ep.name }}</span>
+          <n-tag size="tiny" :bordered="false">{{ ep.slices.length }} 片</n-tag>
+          <span class="dd-muted">{{ humanTime(ep.durationMs) }} · {{ ep.width }}×{{ ep.height }}</span>
+        </div>
+
+        <div v-if="openEpisodes.includes(ep.mediaId)" class="dd-slices">
+          <div v-if="ep.slices.length === 0" class="dd-muted" style="padding: 4px 10px">
+            这一集还没有切片
+          </div>
+          <div v-for="s in ep.slices" :key="s.segmentId" class="dd-slice">
+            <div class="dd-row" style="gap: 8px; flex-wrap: wrap">
+              <b style="width: 62px">第 {{ s.indexNo }} 片</b>
+              <span class="dd-muted" style="width: 92px">
+                {{ humanTime(s.endMs - s.startMs) }}
+              </span>
+              <span class="dd-muted" style="width: 76px">{{ humanSize(s.sizeBytes) }}</span>
+              <n-tag
+                size="tiny"
+                :type="s.status === 'ok' ? 'success' : 'error'"
+                :bordered="false"
+              >
+                {{ s.status === "ok" ? "成功" : s.status }}
+              </n-tag>
+              <n-button size="tiny" type="primary" ghost @click="play(s, ep.name, s.cues)">
+                播放
+              </n-button>
+              <n-button size="tiny" @click="openExternal(s.path)">系统播放器</n-button>
+              <n-button size="tiny" quaternary @click="reveal(s.path)">打开文件夹</n-button>
+            </div>
+            <div v-if="s.cues.length > 0" class="dd-cues">
+              {{ s.cues.join(" ") }}
+            </div>
+            <div v-else class="dd-cues dd-muted">（这一段没有字幕）</div>
+          </div>
+        </div>
+      </div>
+    </n-space>
+  </div>
+
+  <!-- 内嵌播放器：快速过一眼用 -->
+  <n-modal
+    v-if="playing"
+    :show="true"
+    preset="card"
+    style="width: 720px"
+    :title="playing.title"
+    @close="playing = null"
+  >
+    <video
+      :src="fileUrl(playing.path)"
+      controls
+      autoplay
+      style="width: 100%; max-height: 60vh; background: #000"
+    />
+    <div v-if="playing.cues.length > 0" style="margin-top: 10px">
+      <div class="dd-muted" style="margin-bottom: 4px">这一段的字幕</div>
+      <div class="dd-wrap">{{ playing.cues.join(" ") }}</div>
+    </div>
+    <template #footer>
+      <n-space justify="end">
+        <n-button size="small" @click="openExternal(playing.path)">用系统播放器打开</n-button>
+        <n-button size="small" @click="reveal(playing.path)">打开文件夹</n-button>
+      </n-space>
+    </template>
+  </n-modal>
 </template>
+
+<style scoped>
+.dd-ep {
+  border: 1px solid rgba(128, 128, 128, 0.22);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.dd-ep-head {
+  gap: 10px;
+  padding: 7px 10px;
+  cursor: pointer;
+  align-items: center;
+}
+.dd-ep-head:hover {
+  background: rgba(128, 128, 128, 0.09);
+}
+.dd-ep-toggle {
+  width: 12px;
+  opacity: 0.6;
+}
+.dd-ep-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dd-slices {
+  border-top: 1px solid rgba(128, 128, 128, 0.16);
+  padding: 6px 0;
+}
+.dd-slice {
+  padding: 6px 10px;
+}
+.dd-slice + .dd-slice {
+  border-top: 1px dashed rgba(128, 128, 128, 0.16);
+}
+.dd-cues {
+  margin-top: 4px;
+  margin-left: 70px;
+  font-size: 12px;
+  opacity: 0.8;
+  line-height: 1.5;
+}
+</style>

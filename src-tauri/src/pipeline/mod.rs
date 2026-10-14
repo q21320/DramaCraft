@@ -964,6 +964,18 @@ mod tests {
         // 一部剧一个工程，素材不混在一起
         let projects = crate::db::list_projects(&conn).unwrap();
         assert_eq!(projects.len(), 2);
+
+        // 产出查询：链路是 pipeline_drama.src_dir ↔ project.root_dir ↔ media
+        // —— 这个 join 不直观，所以用测试锁住它
+        let outputs = crate::db::run_outputs(&conn, outcome.run_id).unwrap();
+        assert_eq!(outputs.len(), 3, "三集应当各有一行");
+        assert!(
+            outputs.iter().all(|e| e.name.ends_with(".mp4")),
+            "每行应当是一集：{:?}",
+            outputs.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        // 这时候还没切片，所以每集的 slices 是空的，但行必须在
+        assert!(outputs.iter().all(|e| e.slices.is_empty()));
     }
 
     #[test]

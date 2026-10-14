@@ -130,6 +130,31 @@ export interface PipelineRun {
   dramas: PipelineDrama[];
 }
 
+/** 流水线跑出来的一个切片 */
+export interface OutputSlice {
+  segmentId: number;
+  indexNo: number;
+  /** 当前文件（画面处理后指向处理版） */
+  path: string;
+  sizeBytes: number;
+  startMs: number;
+  endMs: number;
+  status: string;
+  message: string;
+  /** 这一段里的字幕文本 */
+  cues: string[];
+}
+
+/** 一部剧的产出：一集一行，下面挂着它的切片 */
+export interface OutputEpisode {
+  mediaId: number;
+  name: string;
+  durationMs: number;
+  width: number;
+  height: number;
+  slices: OutputSlice[];
+}
+
 // ---------------- 用户自备素材库 ----------------
 
 /** 素材库里的一条素材。全部由用户导入，程序不内置任何第三方素材。 */

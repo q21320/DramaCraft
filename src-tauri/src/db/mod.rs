@@ -4,8 +4,8 @@
 
 use crate::error::AppResult;
 use crate::models::{
-    Asset, AssetSummary, Cue, Job, JobCounts, Media, MediaProbe, PipelineDrama, PipelineRun,
-    Project, PublishAccount, PublishPlan, Segment,
+    Asset, AssetSummary, Cue, Job, JobCounts, Media, MediaProbe, OutputEpisode, OutputSlice,
+    PipelineDrama, PipelineRun, Project, PublishAccount, PublishPlan, Segment,
 };
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -841,6 +841,104 @@ pub fn refresh_pipeline_run_status(conn: &Connection) -> AppResult<i64> {
         updated += 1;
     }
     Ok(updated)
+}
+
+/// 一次流水线跑出来的东西，按「集 → 切片」组织，每片带上它的字幕。
+///
+/// 链路是：pipeline_drama.src_dir ↔ project.root_dir ↔ media.project_id ↔ segment.media_id
+/// —— 没有在 pipeline_drama 上存 project_id，但 src_dir 就是当初建工程时
+/// 用的那个目录，等价且不用加列。
+pub fn run_outputs(conn: &Connection, run_id: i64) -> AppResult<Vec<OutputEpisode>> {
+    let dramas = list_pipeline_dramas(conn, run_id)?;
+    let mut out = Vec::new();
+
+    for drama in dramas {
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.name, m.duration_ms, m.width, m.height
+               FROM media m
+               JOIN project p ON p.id = m.project_id
+              WHERE p.root_dir = ?1
+              ORDER BY m.id ASC",
+        )?;
+        let medias: Vec<(i64, String, i64, i64, i64)> = stmt
+            .query_map(params![drama.src_dir], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        for (media_id, name, duration_ms, width, height) in medias {
+            let mut seg_stmt = conn.prepare(
+                "SELECT id, index_no, COALESCE(NULLIF(original_path,''), out_path), size_bytes,
+                        start_ms, end_ms, status, message, out_path
+                   FROM segment WHERE media_id = ?1 ORDER BY index_no ASC",
+            )?;
+            let segs: Vec<(i64, i64, String, i64, i64, i64, String, String, String)> = seg_stmt
+                .query_map(params![media_id], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(seg_stmt);
+
+            let mut slices = Vec::new();
+            for (id, index_no, path, size, start_ms, end_ms, status, message, out_path) in segs {
+                // 这一段的字幕
+                let mut cue_stmt = conn.prepare(
+                    "SELECT text FROM cue WHERE media_id = ?1 AND start_ms >= ?2 AND start_ms < ?3
+                      ORDER BY start_ms ASC",
+                )?;
+                let cues: Vec<String> = cue_stmt
+                    .query_map(params![media_id, start_ms, end_ms], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(cue_stmt);
+
+                // 处理后优先给处理版；处理版没了就退回原片
+                let shown = if !out_path.is_empty() && std::path::Path::new(&out_path).is_file() {
+                    out_path
+                } else {
+                    path
+                };
+
+                slices.push(OutputSlice {
+                    segment_id: id,
+                    index_no,
+                    path: shown,
+                    size_bytes: size,
+                    start_ms,
+                    end_ms,
+                    status,
+                    message,
+                    cues,
+                });
+            }
+
+            out.push(OutputEpisode {
+                media_id,
+                name,
+                duration_ms,
+                width,
+                height,
+                slices,
+            });
+        }
+    }
+    Ok(out)
 }
 
 // ---------- asset（用户自备素材库） ----------

@@ -73,6 +73,56 @@ pub fn python_script_command(python: &Path, script: &Path) -> Command {
 }
 
 /// 按字节读再宽松解码：即使对面吐了非 UTF-8，也要拿到能看的内容。
+/// 用系统默认程序打开一个文件。
+///
+/// 应用内的播放器适合快速过一眼；要看细节、拖时间轴，还是系统播放器顺手。
+pub fn open_with_system(path: &Path) -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        // 注意 cmd /c start 的第一个参数是窗口标题 —— 传空串占位，
+        // 否则带引号的路径会被当成标题，什么都不会打开。
+        let mut cmd = Command::new("cmd");
+        no_window(&mut cmd);
+        cmd.args(["/C", "start", ""]).arg(path);
+        cmd.spawn()
+            .map_err(|e| AppError::Msg(format!("打不开文件：{e}")))?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        Command::new(opener)
+            .arg(path)
+            .spawn()
+            .map_err(|e| AppError::Msg(format!("打不开文件：{e}")))?;
+        Ok(())
+    }
+}
+
+/// 在资源管理器里定位并选中这个文件。
+pub fn reveal_in_explorer(path: &Path) -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        // /select, 后面紧跟路径，中间不能有空格
+        let mut cmd = Command::new("explorer");
+        no_window(&mut cmd);
+        cmd.arg(format!("/select,{}", path.to_string_lossy()));
+        // explorer 选中成功也常返回非 0，所以不看退出码
+        cmd.spawn()
+            .map_err(|e| AppError::Msg(format!("打不开资源管理器：{e}")))?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let parent = path.parent().unwrap_or(path);
+        Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| AppError::Msg(format!("打不开文件管理器：{e}")))?;
+        Ok(())
+    }
+}
+
 pub fn read_all<R: Read>(mut reader: R) -> String {
     let mut buf = Vec::new();
     let _ = reader.read_to_end(&mut buf);

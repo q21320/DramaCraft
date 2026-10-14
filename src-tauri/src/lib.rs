@@ -1,4 +1,4 @@
-﻿//! DramaDist —— 短剧切片分发工作台。
+//! DramaDist —— 短剧切片分发工作台。
 //!
 //! 分层：`commands`（前后端边界）→ `db` / `media` / `asr` / `tools`（能力）→ `models`（数据结构）。
 //! 重活一律走子进程，主进程只负责编排、落库、上报进度。
@@ -279,6 +279,9 @@ pub fn run() {
             commands::pipeline_list,
             commands::pipeline_get,
             commands::pipeline_cancel,
+            commands::pipeline_outputs,
+            commands::open_in_player,
+            commands::reveal_in_explorer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

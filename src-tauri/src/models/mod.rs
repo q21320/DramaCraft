@@ -286,6 +286,36 @@ pub struct PipelineStage {
     pub detail: String,
 }
 
+/// 流水线跑出来的一个切片。用于「看效果」——产出必须能当场看，
+/// 否则用户只能自己去资源管理器里翻。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputSlice {
+    pub segment_id: i64,
+    pub index_no: i64,
+    /// 当前文件（画面处理后指向处理版）
+    pub path: String,
+    pub size_bytes: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub status: String,
+    pub message: String,
+    /// 这一段里的字幕文本，按时间排好
+    pub cues: Vec<String>,
+}
+
+/// 一部剧的产出（一集一行，下面挂着它的切片）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputEpisode {
+    pub media_id: i64,
+    pub name: String,
+    pub duration_ms: i64,
+    pub width: i64,
+    pub height: i64,
+    pub slices: Vec<OutputSlice>,
+}
+
 /// 起一条流水线之后拿到的结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

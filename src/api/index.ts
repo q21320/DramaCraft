@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
   AsrOutcome,
@@ -27,6 +27,7 @@ import type {
   PlatformOption,
   Project,
   PipelineRun,
+  OutputEpisode,
   PipelineStageOption,
   ProofLayout,
   ProofPreview,
@@ -272,4 +273,10 @@ export const api = {
   pipelineList: (limit?: number) => call<PipelineRun[]>("pipeline_list", { limit: limit ?? 20 }),
   pipelineGet: (id: number) => call<PipelineRun | null>("pipeline_get", { id }),
   pipelineCancel: (id: number) => call<number>("pipeline_cancel", { id }),
+  /** 一次流水线跑出来了什么（产出必须能当场看） */
+  pipelineOutputs: (runId: number) => call<OutputEpisode[]>("pipeline_outputs", { runId }),
+  /** 用系统默认播放器打开 */
+  openInPlayer: (path: string) => call<void>("open_in_player", { path }),
+  /** 在资源管理器里定位 */
+  revealInExplorer: (path: string) => call<void>("reveal_in_explorer", { path }),
 };

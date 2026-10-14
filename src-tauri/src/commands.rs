@@ -10,11 +10,11 @@ use crate::models::{
     PipelineStage, PlatformOption, Project,
     ProofLayout, ProofPreview, ProofRenderReport, PublishAccount, PublishClipEntry,
     PublishPackageReport, PublishPlan, QueueState, ResplitReport, RuntimeStatus, Segment,
-    SeriesGroup, SliceMode, SlicePlan, SourceScan, ToolPaths, ToolReport,
+    OutputEpisode, SeriesGroup, SliceMode, SlicePlan, SourceScan, ToolPaths, ToolReport,
     TransformOptions, TransformReport, VerifyItem, VerifyReport,
 };
 use crate::{
-    asr, asset, cloud, docx, export, jy, media, ocr, pipeline, proof, publish, queue, series,
+    asr, asset, cloud, docx, export, jy, media, ocr, pipeline, proc, proof, publish, queue, series,
     subtitle, tools, transform, verify, AppState,
 };
 use std::collections::HashMap;
@@ -1836,6 +1836,39 @@ pub fn pipeline_list(state: tauri::State<'_, AppState>, limit: Option<i64>) -> A
 pub fn pipeline_get(state: tauri::State<'_, AppState>, id: i64) -> AppResult<Option<PipelineRun>> {
     let conn = lock_db(&state)?;
     db::get_pipeline_run(&conn, id)
+}
+
+/// 一次流水线跑出来了什么 —— 供「看效果」用。
+///
+/// 产出必须能当场看：光把文件写到磁盘上，用户还得自己去资源管理器里翻，
+/// 那和没做完差不多。
+#[tauri::command]
+pub fn pipeline_outputs(
+    state: tauri::State<'_, AppState>,
+    run_id: i64,
+) -> AppResult<Vec<OutputEpisode>> {
+    let conn = lock_db(&state)?;
+    db::run_outputs(&conn, run_id)
+}
+
+/// 用系统默认播放器打开这个文件。
+#[tauri::command]
+pub fn open_in_player(path: String) -> AppResult<()> {
+    let p = PathBuf::from(path.trim());
+    if !p.is_file() {
+        return Err(AppError::Msg(format!("文件不在了：{}", p.to_string_lossy())));
+    }
+    proc::open_with_system(&p)
+}
+
+/// 在资源管理器里定位这个文件（选中它）。
+#[tauri::command]
+pub fn reveal_in_explorer(path: String) -> AppResult<()> {
+    let p = PathBuf::from(path.trim());
+    if !p.exists() {
+        return Err(AppError::Msg(format!("文件不在了：{}", p.to_string_lossy())));
+    }
+    proc::reveal_in_explorer(&p)
 }
 
 /// 取消一条流水线：把它所有还没跑的任务撤掉。

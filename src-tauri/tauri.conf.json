@@ -28,13 +28,7 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$APPDATA/**",
-          "$APPLOCALDATA/**",
-          "$HOME/**",
-          "$VIDEO/**",
-          "$DOWNLOAD/**",
-          "$DESKTOP/**",
-          "$DOCUMENT/**"
+          "**"
         ]
       }
     }
