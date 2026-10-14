@@ -59,6 +59,12 @@ export const navItems: NavItem[] = [
     subtitle: "整理发布包（视频/封面/字幕/标题标签）并记录发布台账",
   },
   {
+    key: "series",
+    path: "/series",
+    label: "剧目与集",
+    subtitle: "按文件名重组剧目；用片头指纹检测集边界并按集重切",
+  },
+  {
     key: "settings",
     path: "/settings",
     label: "设置",

@@ -4,6 +4,8 @@ import type {
   AsrOutcome,
   Cue,
   DraftReport,
+  EpisodeBoundary,
+  EpisodeDetection,
   ExportOptions,
   ExportOutcome,
   Media,
@@ -13,8 +15,10 @@ import type {
   Project,
   PublishPackageReport,
   PublishPlan,
+  ResplitReport,
   RuntimeStatus,
   Segment,
+  SeriesGroup,
   SliceMode,
   SlicePlan,
   SrtImportOutcome,
@@ -118,4 +122,27 @@ export const api = {
   // 去重效果验证
   verifyTransform: (mediaId: number, samples?: number) =>
     call<VerifyReport>("verify_transform", { mediaId, samples: samples ?? null }),
+
+  // 剧目与集
+  scanSeriesDir: (dir: string) => call<SeriesGroup[]>("scan_series_dir", { dir }),
+  clusterSeriesByIntro: (files: string[], introSeconds?: number, tolerance?: number) =>
+    call<SeriesGroup[]>("cluster_series_by_intro", {
+      files,
+      introSeconds: introSeconds ?? null,
+      tolerance: tolerance ?? null,
+    }),
+  detectEpisodes: (
+    mediaId: number,
+    sampleFps?: number,
+    introSeconds?: number,
+    tolerance?: number,
+  ) =>
+    call<EpisodeDetection>("detect_episodes", {
+      mediaId,
+      sampleFps: sampleFps ?? null,
+      introSeconds: introSeconds ?? null,
+      tolerance: tolerance ?? null,
+    }),
+  resplitEpisodes: (mediaId: number, boundaries: EpisodeBoundary[], outDir: string) =>
+    call<ResplitReport>("resplit_episodes", { mediaId, boundaries, outDir }),
 };

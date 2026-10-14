@@ -3,12 +3,15 @@
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AppInfo, AsrOutcome, AsrRequest, Cue, ExportOptions, ExportOutcome, Media, OcrFrame,
-    OcrOptions, OcrReport, PlatformOption, Project, PublishClipEntry, PublishPackageReport,
-    PublishPlan, RuntimeStatus, Segment, SliceMode, SlicePlan, ToolPaths, ToolReport,
-    TransformOptions, TransformReport, VerifyItem, VerifyReport,
+    AppInfo, AsrOutcome, AsrRequest, Cue, EpisodeBoundary, EpisodeDetection, ExportOptions,
+    ExportOutcome, Media, OcrFrame, OcrOptions, OcrReport, PlatformOption, Project,
+    PublishClipEntry, PublishPackageReport, PublishPlan, ResplitReport, RuntimeStatus, Segment,
+    SeriesGroup, SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport,
+    VerifyItem, VerifyReport,
 };
-use crate::{asr, export, jy, media, ocr, publish, subtitle, tools, transform, verify, AppState};
+use crate::{
+    asr, export, jy, media, ocr, publish, series, subtitle, tools, transform, verify, AppState,
+};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
@@ -914,6 +917,232 @@ pub async fn recognize_hard_subtitles(
         engine,
         duration_ms: media_duration,
         warnings,
+    })
+}
+
+// ---------------- 剧目与集 ----------------
+
+/// 扫描目录，按文件名把素材分成「剧目 → 集」。
+#[tauri::command]
+pub fn scan_series_dir(dir: String) -> AppResult<Vec<SeriesGroup>> {
+    let trimmed = dir.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Msg("请先选择要扫描的目录".into()));
+    }
+    let files = series::list_video_files(Path::new(trimmed))?;
+    Ok(series::group_files(&files))
+}
+
+/// 文件名实在没规律时，用**片头指纹**把同一部剧的素材聚到一起。
+///
+/// 原理：同一部剧的片头画面是一样的，dHash 指纹能把它们找回来。
+/// 读不出来的文件会被跳过，不影响其余文件。
+#[tauri::command]
+pub async fn cluster_series_by_intro(
+    state: tauri::State<'_, AppState>,
+    files: Vec<String>,
+    intro_seconds: Option<f64>,
+    tolerance: Option<u32>,
+) -> AppResult<Vec<SeriesGroup>> {
+    if files.is_empty() {
+        return Err(AppError::Msg("没有要聚类的文件".into()));
+    }
+    let (ffmpeg, ffprobe) = {
+        let configured = lock_tools(&state)?.clone();
+        (
+            tools::require(&configured.ffmpeg, "ffmpeg")?,
+            tools::require(&configured.ffprobe, "ffprobe")?,
+        )
+    };
+    let intro_ms = (intro_seconds.unwrap_or(3.0).clamp(0.5, 60.0) * 1000.0).round() as i64;
+    let tolerance = tolerance.unwrap_or(10).min(32);
+
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<Vec<SeriesGroup>> {
+        let mut usable: Vec<String> = Vec::new();
+        let mut fingerprints: Vec<Vec<u64>> = Vec::new();
+
+        for path in &files {
+            let file = PathBuf::from(path);
+            if !file.is_file() {
+                continue;
+            }
+            let Ok(probe) = media::probe(&ffprobe, &file) else {
+                continue;
+            };
+            if probe.duration_ms <= 0 {
+                continue;
+            }
+            if let Ok(fingerprint) =
+                series::intro_fingerprint(&ffmpeg, &file, probe.duration_ms, intro_ms, 2.0)
+            {
+                if !fingerprint.is_empty() {
+                    usable.push(path.clone());
+                    fingerprints.push(fingerprint);
+                }
+            }
+        }
+
+        if usable.is_empty() {
+            return Err(AppError::Msg(
+                "这些文件一个都没读出来，确认它们是不是有效的视频文件".into(),
+            ));
+        }
+
+        let clusters = series::cluster_by_fingerprint(&fingerprints, tolerance);
+        let mut groups: Vec<SeriesGroup> = Vec::new();
+
+        for (i, members) in clusters.iter().enumerate() {
+            let paths: Vec<String> = members.iter().map(|k| usable[*k].clone()).collect();
+            let mut entries = series::files_to_entries(&paths);
+            series::sort_episode_entries(&mut entries);
+
+            // 组名优先用文件名解析出的剧目名（若全组一致），否则用序号
+            let mut names: Vec<String> = entries.iter().map(|e| e.series.clone()).collect();
+            names.sort();
+            names.dedup();
+            let label = if names.len() == 1 && !names[0].is_empty() && names[0] != "未命名" {
+                format!("{}（按片头聚类）", names[0])
+            } else {
+                format!("未命名分组 {}", i + 1)
+            };
+
+            groups.push(SeriesGroup {
+                series: label,
+                episodes: entries,
+            });
+        }
+
+        groups.sort_by(|a, b| {
+            b.episodes
+                .len()
+                .cmp(&a.episodes.len())
+                .then_with(|| a.series.cmp(&b.series))
+        });
+        Ok(groups)
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("聚类线程异常终止：{e}")))?
+}
+
+/// 用片头指纹在全片里找每一集的起点。
+///
+/// 思路：把开头一段（默认 3 秒）当片头模板，在全片采样里找它每次出现的位置 ——
+/// 那就是每集的开头。不依赖任何外部信息，只依赖"同一部剧片头一样"这个事实。
+#[tauri::command]
+pub async fn detect_episodes(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    sample_fps: Option<f64>,
+    intro_seconds: Option<f64>,
+    tolerance: Option<u32>,
+) -> AppResult<EpisodeDetection> {
+    let (ffmpeg, input, duration_ms) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let conn = lock_db(&state)?;
+        let target = db::get_media(&conn, media_id)?;
+        (ffmpeg, target.path, target.duration_ms)
+    };
+    if duration_ms <= 0 {
+        return Err(AppError::Msg(
+            "这个素材的时长是 0，先到「素材库」重新导入一次让它被正确探测".into(),
+        ));
+    }
+
+    let fps = sample_fps.unwrap_or(2.0).clamp(0.2, 10.0);
+    let intro_ms = (intro_seconds.unwrap_or(3.0).clamp(0.5, 60.0) * 1000.0).round() as i64;
+    let tolerance = tolerance.unwrap_or(6).min(24);
+
+    let outcome = tauri::async_runtime::spawn_blocking(
+        move || -> AppResult<(Vec<(i64, u64)>, Vec<u64>)> {
+            let samples =
+                series::sample_timeline(&ffmpeg, Path::new(&input), duration_ms, fps, 20_000)?;
+            let template = series::intro_template(&samples, intro_ms);
+            Ok((samples, template))
+        },
+    )
+    .await
+    .map_err(|e| AppError::Msg(format!("采样线程异常终止：{e}")))??;
+
+    let (samples, template) = outcome;
+    let mut warnings: Vec<String> = Vec::new();
+    if template.len() < 3 {
+        warnings.push(
+            "片头模板太短（不足 3 帧），结果可能不稳。把「片头时长」调大或提高「采样频率」再试。"
+                .into(),
+        );
+    }
+
+    // 两集之间不可能太近：按素材长度取一个下界
+    let min_gap = (duration_ms / 100).clamp(3_000, 120_000);
+    let hits = series::find_intro_positions(&samples, &template, tolerance, min_gap);
+    let boundaries = series::boundaries_from_hits(&hits, duration_ms, template.len());
+
+    if boundaries.len() <= 1 {
+        warnings.push(
+            "只找到一处片头。可能这段素材本来就只有一集，或者片头不够明显 —— 可以调大「容忍度」、调小「片头时长」再试。"
+                .into(),
+        );
+    }
+    if boundaries.len() > 200 {
+        warnings.push(format!(
+            "找到 {} 处片头，数量偏多，多半是容忍度太宽，建议调小。",
+            boundaries.len()
+        ));
+    }
+    warnings.push(
+        "边界由画面指纹推断，误差通常在半个采样间隔内；切之前请先看一眼下面的边界列表。".into(),
+    );
+
+    Ok(EpisodeDetection {
+        boundaries,
+        sampled_frames: samples.len() as i64,
+        template_frames: template.len() as i64,
+        total_duration_ms: duration_ms,
+        warnings,
+    })
+}
+
+/// 按集边界切分原片，每集一个文件。
+#[tauri::command]
+pub async fn resplit_episodes(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    boundaries: Vec<EpisodeBoundary>,
+    out_dir: String,
+) -> AppResult<ResplitReport> {
+    if boundaries.is_empty() {
+        return Err(AppError::Msg("没有集边界可切，请先执行「检测集边界」".into()));
+    }
+    let out_root = PathBuf::from(out_dir.trim());
+    if out_root.as_os_str().is_empty() {
+        return Err(AppError::Msg("请先选择输出目录".into()));
+    }
+
+    let (ffmpeg, input) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let conn = lock_db(&state)?;
+        let target = db::get_media(&conn, media_id)?;
+        (ffmpeg, target.path)
+    };
+
+    let total_duration_ms: i64 = boundaries.iter().map(|b| b.duration_ms.max(0)).sum();
+    let out_root_task = out_root.clone();
+    let files = tauri::async_runtime::spawn_blocking(move || {
+        series::resplit_by_episodes(&ffmpeg, Path::new(&input), &boundaries, &out_root_task)
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("切分线程异常终止：{e}")))??;
+
+    Ok(ResplitReport {
+        episode_count: files.len() as i64,
+        out_dir: out_root.to_string_lossy().to_string(),
+        files: files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect(),
+        total_duration_ms,
     })
 }
 

@@ -14,6 +14,7 @@ mod models;
 mod ocr;
 mod proc;
 mod publish;
+mod series;
 mod subtitle;
 mod tools;
 mod transform;
@@ -94,6 +95,10 @@ pub fn run() {
             commands::verify_transform,
             commands::ocr_status,
             commands::recognize_hard_subtitles,
+            commands::scan_series_dir,
+            commands::cluster_series_by_intro,
+            commands::detect_episodes,
+            commands::resplit_episodes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -66,6 +66,46 @@ export interface RuntimeStatus {
   detail: string;
 }
 
+// ---------------- 剧目与集 ----------------
+
+export interface SeriesFile {
+  path: string;
+  fileName: string;
+  /** 解析出的剧目名 */
+  series: string;
+  /** 解析出的集号；认不出为 null */
+  episode: number | null;
+}
+
+export interface SeriesGroup {
+  series: string;
+  episodes: SeriesFile[];
+}
+
+export interface EpisodeBoundary {
+  indexNo: number;
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+  /** high / low */
+  confidence: string;
+}
+
+export interface EpisodeDetection {
+  boundaries: EpisodeBoundary[];
+  sampledFrames: number;
+  templateFrames: number;
+  totalDurationMs: number;
+  warnings: string[];
+}
+
+export interface ResplitReport {
+  episodeCount: number;
+  outDir: string;
+  files: string[];
+  totalDurationMs: number;
+}
+
 // ---------------- OCR 硬字幕识别 ----------------
 
 export interface OcrOptions {

@@ -217,6 +217,58 @@ pub struct PlatformOption {
     pub note: String,
 }
 
+// ---------------- 剧目与集 ----------------
+
+/// 从文件名解析出来的一条素材
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesFile {
+    pub path: String,
+    pub file_name: String,
+    /// 解析出的剧目名（认不出时是去掉扩展名的原名）
+    pub series: String,
+    /// 解析出的集号；认不出为 null
+    pub episode: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesGroup {
+    pub series: String,
+    pub episodes: Vec<SeriesFile>,
+}
+
+/// 一集的边界
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpisodeBoundary {
+    pub index_no: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub duration_ms: i64,
+    /// high / low：片头模板太短时只给 low
+    pub confidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpisodeDetection {
+    pub boundaries: Vec<EpisodeBoundary>,
+    pub sampled_frames: i64,
+    pub template_frames: i64,
+    pub total_duration_ms: i64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResplitReport {
+    pub episode_count: i64,
+    pub out_dir: String,
+    pub files: Vec<String>,
+    pub total_duration_ms: i64,
+}
+
 // ---------------- OCR 硬字幕识别 ----------------
 
 /// 逐帧 OCR 结果。
