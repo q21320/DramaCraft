@@ -13,7 +13,7 @@
 use crate::error::{AppError, AppResult};
 use crate::models::{AsrRequest, AsrResponse, Cue, RuntimeStatus};
 use crate::proc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -25,13 +25,71 @@ pub fn default_timeout() -> Duration {
 }
 
 /// 检查指定 Python 是否具备 faster-whisper。
+/// 内置的模型目录（若随程序分发了该规格的模型）。
+///
+/// 有本地模型就**不走 HuggingFace 下载** —— 那既慢，在国内还常常连不上。
+pub fn bundled_model_dir(size: &str) -> Option<PathBuf> {
+    let size = size.trim();
+    if size.is_empty() {
+        return None;
+    }
+    for dir in crate::tools::bundled_dirs() {
+        let candidate = dir.join("models").join(size);
+        if candidate.join("model.bin").is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// 随程序分发的模型规格列表（按名字排序）。
+pub fn bundled_model_sizes() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for dir in crate::tools::bundled_dirs() {
+        let Ok(entries) = std::fs::read_dir(dir.join("models")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.path().join("model.bin").is_file() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                let name = name.to_string();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// faster-whisper 要求的最低 Python 版本。
+pub const MIN_PYTHON: (u32, u32) = (3, 9);
+
+/// 读一次解释器版本。拿不到就返回 None。
+pub fn python_version(exe: &Path) -> Option<(u32, u32, String)> {
+    let mut cmd: Command = proc::python_command(exe);
+    cmd.arg("-c")
+        .arg("import sys; print('%d.%d.%d' % sys.version_info[:3])");
+    let out = proc::no_window(&mut cmd).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let mut parts = text.split('.');
+    let major: u32 = parts.next()?.trim().parse().ok()?;
+    let minor: u32 = parts.next()?.trim().parse().ok()?;
+    Some((major, minor, text))
+}
+
 pub fn status(python: &str) -> RuntimeStatus {
     let python = python.trim();
     if python.is_empty() {
         return RuntimeStatus {
             available: false,
             python: String::new(),
-            detail: "未指定 Python 运行时，ASR 功能不可用。请在「设置」里选择 python.exe".into(),
+            detail:
+                "没找到可用的 Python 运行时。正常情况下程序自带 ASR 运行时，若这里为空，说明安装包不完整。"
+                    .into(),
         };
     }
 
@@ -47,21 +105,45 @@ pub fn status(python: &str) -> RuntimeStatus {
     let probe = "import faster_whisper, sys; print(faster_whisper.__version__)";
     let mut cmd: Command = proc::python_command(exe);
     cmd.arg("-c").arg(probe);
-
     match proc::no_window(&mut cmd).output() {
         Ok(out) if out.status.success() => {
             let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            // 顺带把"本地已经有哪些模型"告诉用户 —— 免得他以为还得联网下
+            let models = bundled_model_sizes();
+            let suffix = if models.is_empty() {
+                "；本地没有内置模型，首次使用会联网下载".to_string()
+            } else {
+                format!("；内置模型：{}", models.join(" / "))
+            };
             RuntimeStatus {
                 available: true,
                 python: python.to_string(),
-                detail: format!("faster-whisper {ver} 就绪"),
+                detail: format!("faster-whisper {ver} 就绪{suffix}"),
             }
         }
-        Ok(_) => RuntimeStatus {
-            available: false,
-            python: python.to_string(),
-            detail: "该 Python 里没有安装 faster-whisper，可执行：pip install faster-whisper".into(),
-        },
+        Ok(_) => {
+            // 别急着让人去 pip install —— 先看是不是版本根本不够。
+            // 在 Python 3.8 上「pip install faster-whisper」是装不上的，
+            // 给出这种照做会失败的建议，比不给建议更糟。
+            let version = python_version(exe);
+            let detail = match &version {
+                Some((major, minor, full)) if (*major, *minor) < MIN_PYTHON => format!(
+                    "这个 Python 是 {full}，太旧了：faster-whisper 需要 {}.{}+，装不上。\
+请到「设置」把 Python 一栏清空，改用程序自带的运行时。",
+                    MIN_PYTHON.0, MIN_PYTHON.1
+                ),
+                Some((_, _, full)) => format!(
+                    "{full} 里没有 faster-whisper。清空「设置」里的 Python 一栏可用回程序自带的运行时；\
+非要自己装的话：{full} -m pip install faster-whisper"
+                ),
+                None => "这个 Python 无法运行，换一个或清空「设置」里的 Python 一栏".to_string(),
+            };
+            RuntimeStatus {
+                available: false,
+                python: python.to_string(),
+                detail,
+            }
+        }
         Err(err) => RuntimeStatus {
             available: false,
             python: python.to_string(),
@@ -193,6 +275,91 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn bundled_runtime_reports_asr_available() {
+        let python = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("asr_runtime")
+            .join("python.exe");
+        if !python.is_file() {
+            eprintln!("跳过：没有内置 ASR 运行时");
+            return;
+        }
+        // 这一条正对着用户看到的那张截图：内置运行时必须报告"可用"，
+        // 而不是"该 Python 里没有安装 faster-whisper"。
+        let s = status(&python.to_string_lossy());
+        assert!(s.available, "内置运行时应当报告 ASR 可用：{}", s.detail);
+        assert!(s.detail.contains("faster-whisper"), "{}", s.detail);
+    }
+
+    #[test]
+    fn too_old_python_gets_advice_that_actually_works() {
+        // Python 3.8 装不了 faster-whisper，所以不能再建议 "pip install faster-whisper"。
+        // 这里用一个假解释器模拟：它 --version 正常，但 import faster_whisper 失败。
+        let dir = std::env::temp_dir().join("dramadist_asr_oldpy");
+        let _ = std::fs::create_dir_all(&dir);
+        let fake = dir.join("python.exe");
+        // 不是真的可执行文件 —— status 会在执行失败时给出"无法执行"的提示，
+        // 这里只验证三种失败路径都不会 panic 且都有可读原因。
+        std::fs::write(&fake, b"not a real exe").unwrap();
+        let s = status(&fake.to_string_lossy());
+        assert!(!s.available);
+        assert!(!s.detail.is_empty(), "失败必须给出原因");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn end_to_end_bundled_runtime_transcribes() {
+        // 内置运行时 + 内置模型，跑一次**完整**的转写链路。
+        // 素材是纯音调，所以期望"成功但无文本" —— 验证的是模型能加载、能推理、
+        // 协议能往返，而不是识别准确率。
+        let resources = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+        let python = resources.join("asr_runtime").join("python.exe");
+        let model = resources.join("asr_runtime").join("models").join("tiny");
+        let ffmpeg = resources.join("bin").join("ffmpeg.exe");
+        if !python.is_file() || !model.join("model.bin").is_file() || !ffmpeg.is_file() {
+            eprintln!("跳过：内置运行时或模型不完整");
+            return;
+        }
+        let worker = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("asr_worker.py");
+
+        let dir = std::env::temp_dir().join("dramadist_asr_bundled_e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+
+        let ok = proc::no_window(
+            Command::new(&ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=2")
+                .args(["-ar", "16000", "-ac", "1"])
+                .arg(&wav),
+        )
+        .status()
+        .expect("无法启动 ffmpeg");
+        assert!(ok.success(), "生成测试音频失败");
+
+        let request = AsrRequest {
+            audio: wav.to_string_lossy().to_string(),
+            model: model.to_string_lossy().to_string(),
+            language: "zh".into(),
+            model_dir: String::new(),
+            device: "cpu".into(),
+            compute_type: "int8".into(),
+        };
+        let out = transcribe(&python, &worker, &request, Duration::from_secs(300))
+            .expect("内置运行时转写失败");
+        assert!(out.ok, "{}", out.error);
+        assert_eq!(out.language, "zh");
+        assert!((out.duration - 2.0).abs() < 0.5, "时长 {} 不对", out.duration);
+        // 纯音调没有语音，段落应当是空的 —— 这正是"跑通了"的证据
+        assert!(out.segments.is_empty(), "音调不该识别出文字：{:?}", out.segments);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

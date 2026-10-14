@@ -432,6 +432,12 @@ pub async fn asr_transcribe(
         language.trim().to_string()
     };
 
+    // 随程序分发了这个规格的模型就直接用本地路径 —— 不走网络下载
+    let model = match asr::bundled_model_dir(&model) {
+        Some(dir) => dir.to_string_lossy().to_string(),
+        None => model,
+    };
+
     let request = AsrRequest {
         audio,
         model: model.clone(),

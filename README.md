@@ -1,4 +1,4 @@
-﻿# DramaDist · 短剧切片分发工作台
+# DramaDist · 短剧切片分发工作台
 
 一款**纯本地**的短剧素材处理与分发桌面应用：把一部长剧素材自动切成可发布的短片段，
 生成字幕轴，导出成片，后续接入剪映草稿与多平台发布。
@@ -16,7 +16,7 @@
 | 状态 | Pinia |
 | 存储 | SQLite（rusqlite，bundled） |
 | 媒体 | FFmpeg / FFprobe（**已随程序内置**，也可在设置里换成你自己的） |
-| 字幕 | faster-whisper（语音转字幕）、rapidocr_onnxruntime（硬字幕 OCR），均为外部 Python 运行时 |
+| 字幕 | **ASR 运行时已内置**（嵌入式 Python 3.13 + faster-whisper + tiny 模型）；硬字幕 OCR 用外部 Python |
 | 剪映草稿 | pyJianYingDraft（Apache-2.0，外部 Python 运行时，可选） |
 
 ## 当前进度
@@ -27,7 +27,7 @@
 | FFprobe 媒体探测 | ✅ 已实现 |
 | 切片计划（按时长 / 等分 / 手动） | ✅ 已实现 |
 | FFmpeg 切片执行（流拷贝 + 回退转码） | ✅ 已实现 |
-| ASR 字幕轴（faster-whisper 子进程） | ✅ 已实现（需自备 Python + faster-whisper） |
+| ASR 字幕轴（faster-whisper 子进程） | ✅ 已实现（**运行时与 tiny 模型已内置**，装上即用） |
 | 字幕编辑 / SRT 导入导出 | ✅ 已实现 |
 | 硬字幕识别（OCR） | ✅ 已实现（需自备 Python + rapidocr_onnxruntime） |
 | 云端字幕（用户自备 Key） | ✅ 已实现（OpenAI 兼容接口，本地 mock 端到端验证） |
@@ -98,11 +98,12 @@ cd src-tauri; cargo test end_to_end -- --nocapture
 
 | 项目 | 结果 |
 | --- | --- |
-| Rust 单元测试 | 265 项通过（切片计划边界、SRT 解析与投影、滤镜构造与转义、画面处理参数与边界、感知哈希与相似度、OCR 文本归一化与逐帧合并、文件名集号解析与剧目分组、片头定位与指纹聚类、草稿时间轴映射、发布包与多账号台账、云端适配器配置与错误映射、证明材料排版（中文折行禁则/缩字号/溢出判定）、docx 写出（CRC32/ZIP 结构/XML 转义与非法字符/表格补齐与列宽归一）、`.cube` 结构校验与混音/调色链构造、任务队列状态机与断点恢复、DB 迁移与级联、子进程协议/超时/编码） |
+| Rust 单元测试 | 269 项通过（切片计划边界、SRT 解析与投影、滤镜构造与转义、画面处理参数与边界、感知哈希与相似度、OCR 文本归一化与逐帧合并、文件名集号解析与剧目分组、片头定位与指纹聚类、草稿时间轴映射、发布包与多账号台账、云端适配器配置与错误映射、证明材料排版（中文折行禁则/缩字号/溢出判定）、docx 写出（CRC32/ZIP 结构/XML 转义与非法字符/表格补齐与列宽归一）、`.cube` 结构校验与混音/调色链构造、任务队列状态机与断点恢复、DB 迁移与级联、子进程协议/超时/编码） |
 | 端到端（真实 ffmpeg） | 通过：切片；竖屏烧字幕导出 1080×1920；画面处理；发布包生成（按平台/账号分层）；相似度验证；OCR 读取硬字幕；三集连播素材的集边界检测与按集切分；证明图渲染（再用 OCR 把渲染上去的字读回来做闭环验证）；配 BGM（校验成片时长贴着素材而非 BGM）；套 LUT（**用感知哈希确认画面真的变了**） |
 | 端到端（真实 HTTP + 本地 mock 服务） | 通过：multipart 上传、Bearer 鉴权头、请求字段齐全、音频字节数、响应解析成字幕；以及「没配 Key 时一个字节都不发」 |
 | 独立实现校验（docx） | 通过：自己写的 docx 交给 **Python 的 zipfile + ElementTree** 打开并读出正文；再用官方检查器（python-docx + lxml）判定 `pass`；最后用 LibreOffice 渲染成图，`missingFonts` 为空、排版正确 |
-| 运行时迁移 | 通过：真实库逐级升到 v6；**断点续跑实测**：塞入假 `running` 任务 → 重启应用 → 自动退回 `pending` |
+| 运行时迁移 | 通过：真实库逐级升到 v7；**断点续跑实测**：塞入假 `running` 任务 → 重启应用 → 自动退回 `pending`；**零配置实测**：清空设置表后启动，ffmpeg / ffprobe / python 均解析到内置目录 |
+| 内置运行时端到端 | 通过：用内置的 Python + faster-whisper + tiny 模型跑完整转写链路；内置运行时被识别为「内置」且报告 ASR 可用 |
 | 端到端（真实 pyJianYingDraft） | 通过：两个切片 + 两条字幕 → 草稿目录生成，内容含中文文本，总时长 4000ms |
 | 运行时迁移 | 通过：真实库 v2→v3→v4 逐级自动升级，旧数据不丢 |
 | 前端类型检查 + 构建 | 通过（`vue-tsc --noEmit` + `vite build`） |
@@ -136,7 +137,21 @@ pwsh -File scripts/fetch-ffmpeg.ps1                    # 从官方构建下载
 pwsh -File scripts/fetch-ffmpeg.ps1 -Source E:\ffmpeg\bin   # 或从本地已有的复制
 ```
 
-### 想用本地 ASR / OCR / 剪映草稿
+### 关于内置的 ASR 运行时
+
+`src-tauri/resources/asr_runtime/`（327 MB）里是完整的语音转字幕运行时：
+嵌入式 Python 3.13 + faster-whisper 1.2.1 + ctranslate2 + onnxruntime + Whisper tiny 模型。
+**不需要你装 Python，也不需要 pip install 任何东西。**
+
+- 全部组件都是宽松许可（PSF / MIT / BSD / Apache-2.0），分发本软件**不因此产生开源义务**
+- 模型只有 tiny（最小最快，准确率一般）。想换更大的规格，把模型目录放到
+  `models\<规格名>\` 下，程序启动时会自动列出来
+- 二进制不进版本库，clone 后用 `scripts/fetch-asr-runtime.ps1` 获取
+
+> 为什么脚本是「从本地复制」而不是「下载」：这套东西国内下不全 ——
+> Python 嵌入式包和 PyPI 都通，但模型所在的 HuggingFace 与 hf-mirror 实测均超时。
+
+### 想用硬字幕 OCR / 剪映草稿
 
 ### 想导出剪映草稿
 

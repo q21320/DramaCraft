@@ -52,34 +52,46 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
-            // 内置二进制：安装后在资源目录下，开发时在源码的 resources/bin 下。
-            // 登记之后 tools::resolve 就会优先用它 —— 用户不必自己装 ffmpeg。
+            // 内置运行时：安装后在资源目录下，开发时在源码的 resources/ 下。
+            // 登记之后 tools::resolve 就会优先用它 —— 用户不必自己装 ffmpeg 或 Python。
             // 两个候选都试：打包器可能保留 `resources/` 这一层，也可能不保留。
             let bundled = app
                 .path()
                 .resource_dir()
                 .ok()
-                .and_then(|dir| {
+                .map(|dir| {
                     [
-                        dir.join("resources").join(tools::BUNDLED_DIR),
-                        dir.join(tools::BUNDLED_DIR),
+                        dir.join("resources"),
+                        dir.clone(),
                     ]
-                    .into_iter()
-                    .find(|candidate| candidate.is_dir())
+                })
+                .and_then(|roots| {
+                    roots
+                        .into_iter()
+                        .find(|root| root.join(tools::BUNDLED_DIR).is_dir())
                 })
                 .or_else(|| {
-                    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("resources")
-                        .join(tools::BUNDLED_DIR);
+                    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
                     dev.is_dir().then_some(dev)
                 });
-            if let Some(dir) = &bundled {
-                eprintln!("DramaDist: 使用内置工具目录 {}", dir.display());
+
+            let bundled_dirs: Vec<PathBuf> = bundled
+                .map(|root| {
+                    [tools::BUNDLED_DIR, tools::ASR_RUNTIME_DIR]
+                        .iter()
+                        .map(|sub| root.join(sub))
+                        .filter(|dir| dir.is_dir())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            for dir in &bundled_dirs {
+                eprintln!("DramaDist: 内置运行时目录 {}", dir.display());
             }
-            tools::set_bundled_dir(bundled);
+            tools::set_bundled_dirs(bundled_dirs);
 
             // 启动时把解析结果打出来：出问题时第一时间就知道用的是哪一份
-            for name in ["ffmpeg", "ffprobe"] {
+            for name in ["ffmpeg", "ffprobe", "python"] {
                 match tools::resolve("", name) {
                     Some(path) => eprintln!(
                         "DramaDist: {name} = {}（{}）",

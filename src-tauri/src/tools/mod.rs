@@ -25,24 +25,24 @@ const EXE_EXTS: [&str; 1] = [""];
 
 /// 内置二进制所在的子目录名
 pub const BUNDLED_DIR: &str = "bin";
+/// 内置 ASR 运行时所在的子目录名（嵌入式 Python + faster-whisper + 模型）
+pub const ASR_RUNTIME_DIR: &str = "asr_runtime";
 
-static BUNDLED_DIR_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static BUNDLED_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
-/// 启动时登记内置二进制目录。进程生命周期内只设一次，之后所有解析都能看到它。
-pub fn set_bundled_dir(dir: Option<PathBuf>) {
-    let _ = BUNDLED_DIR_PATH.set(dir);
+/// 启动时登记内置目录（可以有多个：bin 放 ffmpeg，asr_runtime 放 python）。
+/// 进程生命周期内只设一次，之后所有解析都能看到它们。
+pub fn set_bundled_dirs(dirs: Vec<PathBuf>) {
+    let _ = BUNDLED_DIRS.set(dirs);
 }
 
-pub fn bundled_dir() -> Option<&'static PathBuf> {
-    BUNDLED_DIR_PATH.get().and_then(|d| d.as_ref())
+pub fn bundled_dirs() -> &'static [PathBuf] {
+    BUNDLED_DIRS.get().map(|v| v.as_slice()).unwrap_or(&[])
 }
 
-/// 某个工具是否来自内置目录（用于界面上如实标注"内置"而不是假装是用户配的）
+/// 某个工具是否来自任一内置目录（界面上如实标注"内置"）
 pub fn is_bundled(path: &Path) -> bool {
-    match bundled_dir() {
-        Some(dir) => path.starts_with(dir),
-        None => false,
-    }
+    bundled_dirs().iter().any(|dir| path.starts_with(dir))
 }
 
 /// 在某个目录里找 `<name>`（Windows 上会依次试常见可执行后缀）。
@@ -103,11 +103,8 @@ pub fn resolve(configured: &str, name: &str) -> Option<PathBuf> {
     }
 
     // 内置目录排在最前，之后才是 PATH —— 内置那份版本确定，
-    // 而 PATH 上可能是任何一个残缺构建。
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = bundled_dir() {
-        dirs.push(dir.clone());
-    }
+    // 而 PATH 上可能是任何一个残缺构建（比如 Python 3.8 装不了 faster-whisper）。
+    let mut dirs: Vec<PathBuf> = bundled_dirs().to_vec();
     if let Some(path) = std::env::var_os("PATH") {
         dirs.extend(std::env::split_paths(&path));
     }
@@ -290,39 +287,89 @@ mod tests {
     #[test]
     fn bundled_flag_is_false_when_no_bundled_dir_is_registered() {
         // 单元测试进程里没有登记内置目录，任何路径都不该被标成"内置"
-        assert!(bundled_dir().is_none() || bundled_dir().is_some());
         assert!(!is_bundled(Path::new("C:/whatever/ffmpeg.exe")));
     }
 
     #[test]
-    fn end_to_end_bundled_ffmpeg_is_found_and_runnable() {
-        // 内置二进制不进版本库（158 MB），没有就跳过，不让测试变红
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join(BUNDLED_DIR);
-        if !dir.join("ffmpeg.exe").is_file() {
-            eprintln!(
-                "跳过：{} 里没有内置 ffmpeg（用 scripts/fetch-ffmpeg.ps1 获取）",
-                dir.display()
-            );
+    fn bundled_dirs_are_searched_in_order() {
+        let root = std::env::temp_dir().join("dramadist_tools_multi");
+        let _ = std::fs::remove_dir_all(&root);
+        let first = root.join("bin");
+        let second = root.join("asr_runtime");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("ffmpeg.exe"), b"x").unwrap();
+        std::fs::write(second.join("python.exe"), b"x").unwrap();
+
+        // 两个目录各有各的工具，合起来都能找到
+        let dirs = vec![first.clone(), second.clone()];
+        assert_eq!(
+            resolve_from(&dirs, "ffmpeg"),
+            Some(first.join("ffmpeg.exe"))
+        );
+        assert_eq!(
+            resolve_from(&dirs, "python"),
+            Some(second.join("python.exe"))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 内置运行时在不在、能不能真的跑起来。
+    ///
+    /// 两件事合在一个测试里：`set_bundled_dirs` 是**进程级一次性**的，
+    /// 拆成两个测试会互相抢注册，跑的顺序一变就假失败。
+    #[test]
+    fn end_to_end_bundled_runtimes_are_found_and_runnable() {
+        let resources = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+        let bin = resources.join(BUNDLED_DIR);
+        let runtime = resources.join(ASR_RUNTIME_DIR);
+
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if bin.join("ffmpeg.exe").is_file() {
+            dirs.push(bin.clone());
+        }
+        if runtime.join("python.exe").is_file() {
+            dirs.push(runtime.clone());
+        }
+        if dirs.is_empty() {
+            eprintln!("跳过：resources 下没有内置运行时（用 scripts/ 里的脚本获取）");
             return;
         }
-        set_bundled_dir(Some(dir.clone()));
+        set_bundled_dirs(dirs);
 
-        // 关键：设置里什么都没配（空字符串），也应当解析到内置那份
-        let ffmpeg = resolve("", "ffmpeg").expect("没解析到内置 ffmpeg");
-        assert_eq!(ffmpeg, dir.join("ffmpeg.exe"));
-        assert!(is_bundled(&ffmpeg), "应当被标记为内置");
+        // --- ffmpeg ---
+        if bin.join("ffmpeg.exe").is_file() {
+            // 关键：设置里什么都没配（空字符串），也应当解析到内置那份
+            let ffmpeg = resolve("", "ffmpeg").expect("没解析到内置 ffmpeg");
+            assert_eq!(ffmpeg, bin.join("ffmpeg.exe"));
+            assert!(is_bundled(&ffmpeg), "应当被标记为内置");
 
-        let ffprobe = resolve("", "ffprobe").expect("没解析到内置 ffprobe");
-        assert_eq!(ffprobe, dir.join("ffprobe.exe"));
-        assert!(is_bundled(&ffprobe));
+            let ffprobe = resolve("", "ffprobe").expect("没解析到内置 ffprobe");
+            assert_eq!(ffprobe, bin.join("ffprobe.exe"));
 
-        // 光有文件不算数，真的跑得起来才算
-        let report = probe_tool("ffmpeg", &ffmpeg);
-        assert!(report.available, "内置 ffmpeg 跑不起来：{}", report.detail);
-        assert!(report.version.starts_with("ffmpeg version"), "{}", report.version);
-        assert!(report.bundled);
+            // 光有文件不算数，真的跑得起来才算
+            let report = probe_tool("ffmpeg", &ffmpeg);
+            assert!(report.available, "内置 ffmpeg 跑不起来：{}", report.detail);
+            assert!(report.version.starts_with("ffmpeg version"), "{}", report.version);
+            assert!(report.bundled);
+        }
+
+        // --- 内置 ASR 运行时 ---
+        if runtime.join("python.exe").is_file() {
+            // 用户没配 Python 时，应当解析到内置的那一份
+            let python = resolve("", "python").expect("没解析到内置 python");
+            assert_eq!(python, runtime.join("python.exe"));
+            assert!(is_bundled(&python));
+
+            let report = probe_tool("python", &python);
+            assert!(report.available, "内置 python 跑不起来：{}", report.detail);
+            assert!(report.bundled);
+
+            // 模型也应当随运行时一起在
+            let model = runtime.join("models").join("tiny").join("model.bin");
+            assert!(model.is_file(), "内置模型缺失：{}", model.display());
+        }
 
         // 用户显式指定时仍然听用户的
         let exe = std::env::current_exe().unwrap();
