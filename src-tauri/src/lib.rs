@@ -30,7 +30,7 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 pub struct AppState {
     pub db: Mutex<Connection>,
@@ -138,6 +138,46 @@ pub fn run() {
             if recovered > 0 {
                 eprintln!("DramaDist: {recovered} 条队列任务在上次运行中被中断，已退回待跑");
             }
+
+            // 断点续跑第二步：退回队列还不够，得**真的接着跑**。
+            // 只把状态改回 pending 而等用户手点「启动队列」，那叫断点，不叫续跑。
+            // 用户主动暂停过的队列不会自动重启 —— 那是有意的选择，不该被覆盖。
+            let (pending, paused_before) = {
+                let state = app.state::<AppState>();
+                let conn = state
+                    .db
+                    .lock()
+                    .map_err(|_| crate::error::AppError::Msg("数据库锁被污染".into()))?;
+                let counts = db::job_counts(&conn)?;
+                let paused = db::get_setting(&conn, "queue.auto_resume")?
+                    .map(|v| v.trim() == "off")
+                    .unwrap_or(false);
+                (counts.pending, paused)
+            };
+
+            if pending > 0 && !paused_before {
+                eprintln!("DramaDist: 队列里有 {pending} 条待跑任务，自动接着跑");
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    match queue::run(handle.clone(), None).await {
+                        Ok(report) => {
+                            eprintln!(
+                                "DramaDist: 队列结束 —— 完成 {}，失败 {}，剩余 {}（{}）",
+                                report.done, report.failed, report.remaining, report.stopped_because
+                            );
+                            let _ = handle.emit("queue:finished", &report);
+                        }
+                        Err(e) => {
+                            eprintln!("DramaDist: 队列启动失败：{e}");
+                            let _ = handle.emit(
+                                "queue:finished",
+                                serde_json::json!({ "error": e.to_string() }),
+                            );
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

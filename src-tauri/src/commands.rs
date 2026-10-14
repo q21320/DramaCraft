@@ -1847,6 +1847,12 @@ pub fn start_queue(app: tauri::AppHandle, max_jobs: Option<i64>) -> AppResult<()
         }
         // 顺手清掉暂停标记，否则「暂停 → 再点启动」会立刻又停下
         state.queue_paused.store(false, Ordering::SeqCst);
+        // 用户明确点了启动 → 以后可以自动续跑
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
+        db::set_setting(&conn, "queue.auto_resume", "on")?;
     }
 
     let handle = app.clone();
@@ -1869,6 +1875,10 @@ pub fn start_queue(app: tauri::AppHandle, max_jobs: Option<i64>) -> AppResult<()
 #[tauri::command]
 pub fn set_queue_paused(state: tauri::State<'_, AppState>, paused: bool) -> AppResult<bool> {
     state.queue_paused.store(paused, Ordering::SeqCst);
+    // 把"用户主动暂停过"记下来：下次启动时不要自动把队列又跑起来。
+    // 用户按下暂停是有意的选择，不该被一次重启覆盖掉。
+    let conn = lock_db(&state)?;
+    db::set_setting(&conn, "queue.auto_resume", if paused { "off" } else { "on" })?;
     Ok(paused)
 }
 
