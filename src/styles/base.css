@@ -1,0 +1,100 @@
+:root {
+  --dd-radius: 8px;
+  --dd-gap: 14px;
+  --dd-muted: rgba(128, 128, 128, 0.75);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, -apple-system,
+    "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+/* 卡片区块：页面里所有"一块内容"统一用它 */
+.dd-card {
+  border: 1px solid rgba(128, 128, 128, 0.22);
+  border-radius: var(--dd-radius);
+  padding: 16px 18px;
+  margin-bottom: var(--dd-gap);
+}
+
+.dd-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.dd-card-desc {
+  font-size: 12px;
+  color: var(--dd-muted);
+  margin-bottom: 12px;
+}
+
+.dd-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.dd-muted {
+  color: var(--dd-muted);
+}
+
+.dd-mono {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+}
+
+/* 表格：不依赖组件库，避免各处样式打架 */
+table.dd-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+table.dd-table th,
+table.dd-table td {
+  text-align: left;
+  padding: 7px 10px;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.18);
+  white-space: nowrap;
+}
+
+table.dd-table th {
+  font-weight: 600;
+  color: var(--dd-muted);
+  font-size: 12px;
+}
+
+table.dd-table td.dd-wrap {
+  white-space: normal;
+  word-break: break-all;
+}
+
+.dd-scroll {
+  max-height: 380px;
+  overflow: auto;
+  border: 1px solid rgba(128, 128, 128, 0.18);
+  border-radius: var(--dd-radius);
+}
+
+.dd-empty {
+  padding: 34px 0;
+  text-align: center;
+  color: var(--dd-muted);
+  font-size: 13px;
+}

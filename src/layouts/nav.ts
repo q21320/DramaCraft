@@ -1,0 +1,47 @@
+/**
+ * 导航单一来源：菜单项、页头标题与该页职责说明都在这里，避免各页文案对不上。
+ */
+export interface NavItem {
+  key: string;
+  path: string;
+  label: string;
+  /** 页头副标题：这一页到底负责什么 */
+  subtitle: string;
+}
+
+export const navItems: NavItem[] = [
+  {
+    key: "home",
+    path: "/",
+    label: "项目",
+    subtitle: "一个项目 = 一部短剧素材 + 它的切片与分发记录",
+  },
+  {
+    key: "library",
+    path: "/library",
+    label: "素材库",
+    subtitle: "导入长剧素材，自动探测时长、分辨率与音轨",
+  },
+  {
+    key: "slice",
+    path: "/slice",
+    label: "切片工作台",
+    subtitle: "按秒数或份数切分，先预览计划再执行，产出可发布片段",
+  },
+  {
+    key: "subtitle",
+    path: "/subtitle",
+    label: "字幕",
+    subtitle: "ASR 生成字幕轴并校对（v0.2 接入）",
+  },
+  {
+    key: "settings",
+    path: "/settings",
+    label: "设置",
+    subtitle: "指定 ffmpeg / ffprobe / Python 路径，查看各组件可用性",
+  },
+];
+
+export function navByPath(path: string): NavItem | undefined {
+  return navItems.find((n) => n.path === path);
+}

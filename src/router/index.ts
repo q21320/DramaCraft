@@ -1,0 +1,15 @@
+import { createRouter, createWebHashHistory, type RouteRecordRaw } from "vue-router";
+
+const routes: RouteRecordRaw[] = [
+  { path: "/", name: "home", component: () => import("@/views/HomePage.vue") },
+  { path: "/library", name: "library", component: () => import("@/views/LibraryPage.vue") },
+  { path: "/slice", name: "slice", component: () => import("@/views/SlicePage.vue") },
+  { path: "/subtitle", name: "subtitle", component: () => import("@/views/SubtitlePage.vue") },
+  { path: "/settings", name: "settings", component: () => import("@/views/SettingsPage.vue") },
+  { path: "/:pathMatch(.*)*", redirect: "/" },
+];
+
+export default createRouter({
+  history: createWebHashHistory(),
+  routes,
+});
