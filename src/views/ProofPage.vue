@@ -13,7 +13,13 @@ import {
 } from "naive-ui";
 import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { api } from "@/api";
-import type { ProofField, ProofLayout, ProofPreview, ProofRenderReport } from "@/types";
+import type {
+  DocxReport,
+  ProofField,
+  ProofLayout,
+  ProofPreview,
+  ProofRenderReport,
+} from "@/types";
 
 const message = useMessage();
 
@@ -24,6 +30,29 @@ const preview = ref<ProofPreview | null>(null);
 const report = ref<ProofRenderReport | null>(null);
 const outPath = ref("");
 const busy = ref(false);
+
+// 证明文档（docx）
+const docKind = ref<"cost" | "ip">("cost");
+const costForm = ref({
+  dramaName: "",
+  producer: "",
+  date: new Date().toISOString().slice(0, 10),
+  total: "",
+});
+const costRows = ref([
+  { item: "编剧", quantity: "1", unitPrice: "", amount: "" },
+  { item: "演员", quantity: "", unitPrice: "", amount: "" },
+]);
+const ipForm = ref({
+  dramaName: "",
+  episodeCount: 1,
+  totalDuration: "",
+  owner: "",
+  date: new Date().toISOString().slice(0, 10),
+});
+const docOutPath = ref("");
+const docBusy = ref(false);
+const docReport = ref<DocxReport | null>(null);
 
 const fieldCount = computed(() => layout.value?.fields.length ?? 0);
 
@@ -187,6 +216,44 @@ async function render() {
   }
 }
 
+async function pickDocOut() {
+  const suggested = docKind.value === "cost" ? "成本明细表.docx" : "作品权属声明.docx";
+  const picked = await saveDialog({
+    title: "保存证明文档",
+    defaultPath: suggested,
+    filters: [{ name: "Word 文档", extensions: ["docx"] }],
+  });
+  if (typeof picked === "string") docOutPath.value = picked;
+}
+
+function addCostRow() {
+  costRows.value.push({ item: "", quantity: "", unitPrice: "", amount: "" });
+}
+
+async function generateDoc() {
+  if (!docOutPath.value.trim()) {
+    message.warning("请先选择输出路径");
+    return;
+  }
+  docBusy.value = true;
+  docReport.value = null;
+  try {
+    if (docKind.value === "cost") {
+      docReport.value = await api.generateCostDocx(
+        { ...costForm.value, rows: costRows.value },
+        docOutPath.value.trim(),
+      );
+    } else {
+      docReport.value = await api.generateIpDocx(ipForm.value, docOutPath.value.trim());
+    }
+    message.success("文档已生成");
+  } catch (e) {
+    message.error((e as Error).message);
+  } finally {
+    docBusy.value = false;
+  }
+}
+
 onMounted(init);
 </script>
 
@@ -340,6 +407,109 @@ onMounted(init);
     <n-alert v-if="preview.warnings.length > 0" type="warning" title="注意" style="margin-top: 12px">
       <ul style="margin: 0; padding-left: 18px">
         <li v-for="(w, i) in preview.warnings" :key="i" class="dd-wrap">{{ w }}</li>
+      </ul>
+    </n-alert>
+  </div>
+
+  <div class="dd-card">
+    <div class="dd-card-title">证明文档（Word）</div>
+    <div class="dd-card-desc">
+      报备和结算常常要交可以直接打开的 Word 文档。这里按你填的数据生成 ——
+      文档里只有你录入的内容，金额与权属表述请自行核对后再对外提交。
+    </div>
+
+    <div class="dd-row" style="margin-bottom: 12px">
+      <span class="dd-muted" style="width: 64px">类型</span>
+      <n-select
+        v-model:value="docKind"
+        size="small"
+        style="width: 220px"
+        :options="[
+          { label: '短剧制作成本明细表', value: 'cost' },
+          { label: '作品权属声明', value: 'ip' },
+        ]"
+        @update:value="docReport = null"
+      />
+    </div>
+
+    <template v-if="docKind === 'cost'">
+      <div class="dd-row" style="margin-bottom: 8px">
+        <span class="dd-muted" style="width: 64px">剧目名称</span>
+        <n-input v-model:value="costForm.dramaName" size="small" style="width: 260px" />
+        <span class="dd-muted">制作方</span>
+        <n-input v-model:value="costForm.producer" size="small" style="width: 220px" />
+        <span class="dd-muted">制表日期</span>
+        <n-input v-model:value="costForm.date" size="small" style="width: 140px" />
+      </div>
+
+      <table class="dd-table" style="margin-bottom: 8px">
+        <thead>
+          <tr>
+            <th style="width: 220px">项目</th>
+            <th style="width: 120px">数量</th>
+            <th style="width: 140px">单价（元）</th>
+            <th style="width: 140px">金额（元）</th>
+            <th style="width: 60px"></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="(r, i) in costRows" :key="i">
+            <td><n-input v-model:value="r.item" size="tiny" /></td>
+            <td><n-input v-model:value="r.quantity" size="tiny" /></td>
+            <td><n-input v-model:value="r.unitPrice" size="tiny" /></td>
+            <td><n-input v-model:value="r.amount" size="tiny" /></td>
+            <td>
+              <n-button size="tiny" quaternary @click="costRows.splice(i, 1)">删</n-button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="dd-row" style="margin-bottom: 12px">
+        <n-button size="tiny" @click="addCostRow">加一行</n-button>
+        <span class="dd-muted">合计</span>
+        <n-input v-model:value="costForm.total" size="small" style="width: 140px" placeholder="元" />
+      </div>
+    </template>
+
+    <template v-else>
+      <div class="dd-row" style="margin-bottom: 8px">
+        <span class="dd-muted" style="width: 64px">作品名称</span>
+        <n-input v-model:value="ipForm.dramaName" size="small" style="width: 260px" />
+        <span class="dd-muted">集数</span>
+        <n-input-number
+          v-model:value="ipForm.episodeCount"
+          size="small"
+          :min="1"
+          :max="9999"
+          style="width: 110px"
+        />
+      </div>
+      <div class="dd-row" style="margin-bottom: 12px">
+        <span class="dd-muted" style="width: 64px">总时长</span>
+        <n-input v-model:value="ipForm.totalDuration" size="small" style="width: 180px" placeholder="例如 1 小时 36 分" />
+        <span class="dd-muted">权利归属</span>
+        <n-input v-model:value="ipForm.owner" size="small" style="width: 200px" />
+        <span class="dd-muted">声明日期</span>
+        <n-input v-model:value="ipForm.date" size="small" style="width: 140px" />
+      </div>
+    </template>
+
+    <n-space>
+      <n-button size="small" type="primary" :loading="docBusy" @click="generateDoc">
+        生成 Word 文档
+      </n-button>
+      <n-input v-model:value="docOutPath" size="small" style="width: 300px" placeholder="输出 .docx 路径" />
+      <n-button size="small" @click="pickDocOut">选择输出</n-button>
+    </n-space>
+
+    <n-alert v-if="docReport" type="success" title="文档已生成" style="margin-top: 12px">
+      <div class="dd-wrap">
+        输出：<span class="dd-mono">{{ docReport.outPath }}</span>
+        （{{ docReport.blockCount }} 个内容块，{{ (docReport.sizeBytes / 1024).toFixed(0) }} KB）
+      </div>
+      <ul style="margin: 6px 0 0; padding-left: 18px">
+        <li v-for="(w, i) in docReport.warnings" :key="i" class="dd-wrap">{{ w }}</li>
       </ul>
     </n-alert>
   </div>

@@ -10,8 +10,10 @@ import type {
   CloudConfigView,
   CloudTestResult,
   CloudTranscribeReport,
+  CostDocRequest,
   Cue,
   DiscoveredAsset,
+  DocxReport,
   DraftReport,
   EpisodeBoundary,
   EpisodeDetection,
@@ -19,6 +21,7 @@ import type {
   ExportOutcome,
   Job,
   Media,
+  IpDocRequest,
   OcrOptions,
   OcrReport,
   PlatformOption,
@@ -122,6 +125,12 @@ export const api = {
     call<ProofPreview>("proof_preview", { layout, values }),
   proofRender: (layout: ProofLayout, values: Record<string, string>, outPath: string) =>
     call<ProofRenderReport>("proof_render", { layout, values, outPath }),
+
+  // 证明文档（docx）
+  generateCostDocx: (request: CostDocRequest, outPath: string) =>
+    call<DocxReport>("generate_cost_docx", { request, outPath }),
+  generateIpDocx: (request: IpDocRequest, outPath: string) =>
+    call<DocxReport>("generate_ip_docx", { request, outPath }),
 
   // 导出
   exportVideo: (opts: ExportOptions) => call<ExportOutcome>("export_video", { opts }),

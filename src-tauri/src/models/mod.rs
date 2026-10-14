@@ -322,6 +322,49 @@ pub struct CubeInfo {
     pub expected_lines: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocxReport {
+    pub out_path: String,
+    pub size_bytes: i64,
+    /// cost | ip
+    pub kind: String,
+    /// 文档里的块数量，用于界面确认"不是一份空文档"
+    pub block_count: i64,
+    pub warnings: Vec<String>,
+}
+
+/// 成本明细表的一行
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostDocRequest {
+    pub drama_name: String,
+    pub producer: String,
+    pub date: String,
+    pub total: String,
+    pub rows: Vec<CostDocRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostDocRow {
+    pub item: String,
+    pub quantity: String,
+    pub unit_price: String,
+    pub amount: String,
+}
+
+/// 权属声明
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpDocRequest {
+    pub drama_name: String,
+    pub episode_count: i64,
+    pub total_duration: String,
+    pub owner: String,
+    pub date: String,
+}
+
 // ---------------- 证明材料 ----------------
 
 /// 模板图上的一个字段

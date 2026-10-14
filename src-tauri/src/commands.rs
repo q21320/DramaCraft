@@ -4,15 +4,16 @@ use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, Asset, AssetApplyReport, AssetImportReport, AssetKindOption,
-    AssetSummary, CloudConfigView, CloudTestResult, CloudTranscribeReport, Cue, DiscoveredAsset,
-    EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome, Job, Media, MediaProbe,
-    OcrFrame, OcrOptions, OcrReport, PlatformOption, Project, ProofLayout, ProofPreview,
-    ProofRenderReport, PublishAccount, PublishClipEntry, PublishPackageReport, PublishPlan,
-    QueueState, ResplitReport, RuntimeStatus, Segment, SeriesGroup, SliceMode, SlicePlan, ToolPaths,
-    ToolReport, TransformOptions, TransformReport, VerifyItem, VerifyReport,
+    AssetSummary, CloudConfigView, CloudTestResult, CloudTranscribeReport, CostDocRequest, Cue,
+    DiscoveredAsset, DocxReport, EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome,
+    IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PlatformOption, Project,
+    ProofLayout, ProofPreview, ProofRenderReport, PublishAccount, PublishClipEntry,
+    PublishPackageReport, PublishPlan, QueueState, ResplitReport, RuntimeStatus, Segment,
+    SeriesGroup, SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport,
+    VerifyItem, VerifyReport,
 };
 use crate::{
-    asr, asset, cloud, export, jy, media, ocr, proof, publish, queue, series, subtitle, tools,
+    asr, asset, cloud, docx, export, jy, media, ocr, proof, publish, queue, series, subtitle, tools,
     transform, verify, AppState,
 };
 use std::collections::HashMap;
@@ -1162,6 +1163,118 @@ pub async fn resplit_episodes(
             .collect(),
         total_duration_ms,
     })
+}
+
+/// 输出路径统一带上 .docx 后缀 —— 少了它 Word 不会把文件认成文档。
+fn ensure_docx_extension(path: &Path) -> PathBuf {
+    let is_docx = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("docx"))
+        .unwrap_or(false);
+    if is_docx {
+        return path.to_path_buf();
+    }
+    let mut text = path.as_os_str().to_string_lossy().to_string();
+    text.push_str(".docx");
+    PathBuf::from(text)
+}
+
+fn docx_style() -> docx::DocStyle {
+    docx::DocStyle {
+        east_asian_font: "仿宋".to_string(),
+        latin_font: "Times New Roman".to_string(),
+        ..Default::default()
+    }
+}
+
+fn write_proof_docx(
+    kind: &str,
+    blocks: Vec<docx::DocBlock>,
+    title: &str,
+    out_path: &str,
+) -> AppResult<DocxReport> {
+    let out = ensure_docx_extension(Path::new(out_path.trim()));
+    if out.as_os_str().is_empty() {
+        return Err(AppError::Msg("请先选择输出路径".into()));
+    }
+    let block_count = blocks.len() as i64;
+    let meta = docx::DocMeta {
+        title: title.to_string(),
+        author: "DramaDist".to_string(),
+        created: docx::now_iso(),
+    };
+    let size_bytes = docx::write_docx(&out, &blocks, &docx_style(), &meta)?;
+
+    let mut warnings: Vec<String> = Vec::new();
+    warnings.push(
+        "文档只包含你录入的数据，请自行核对金额与权属表述后再对外提交。".to_string(),
+    );
+    if out_path.trim() != out.to_string_lossy() {
+        warnings.push(format!("已自动补上 .docx 后缀：{}", out.to_string_lossy()));
+    }
+
+    Ok(DocxReport {
+        out_path: out.to_string_lossy().to_string(),
+        size_bytes,
+        kind: kind.to_string(),
+        block_count,
+        warnings,
+    })
+}
+
+/// 生成「成本明细表」docx。
+#[tauri::command]
+pub fn generate_cost_docx(request: CostDocRequest, out_path: String) -> AppResult<DocxReport> {
+    if request.drama_name.trim().is_empty() {
+        return Err(AppError::Msg("剧目名称不能为空".into()));
+    }
+    let rows: Vec<docx::CostRow> = request
+        .rows
+        .iter()
+        .map(|r| docx::CostRow {
+            item: r.item.clone(),
+            quantity: r.quantity.clone(),
+            unit_price: r.unit_price.clone(),
+            amount: r.amount.clone(),
+        })
+        .collect();
+    let blocks = docx::build_cost_blocks(
+        request.drama_name.trim(),
+        &rows,
+        request.total.trim(),
+        request.producer.trim(),
+        request.date.trim(),
+    );
+    write_proof_docx(
+        "cost",
+        blocks,
+        &format!("{} - 成本明细表", request.drama_name.trim()),
+        &out_path,
+    )
+}
+
+/// 生成「作品权属声明」docx。
+#[tauri::command]
+pub fn generate_ip_docx(request: IpDocRequest, out_path: String) -> AppResult<DocxReport> {
+    if request.drama_name.trim().is_empty() {
+        return Err(AppError::Msg("作品名称不能为空".into()));
+    }
+    if request.episode_count <= 0 {
+        return Err(AppError::Msg("集数要大于 0".into()));
+    }
+    let blocks = docx::build_ip_blocks(
+        request.drama_name.trim(),
+        request.episode_count,
+        request.total_duration.trim(),
+        request.owner.trim(),
+        request.date.trim(),
+    );
+    write_proof_docx(
+        "ip",
+        blocks,
+        &format!("{} - 作品权属声明", request.drama_name.trim()),
+        &out_path,
+    )
 }
 
 // ---------------- 用户自备素材库 ----------------

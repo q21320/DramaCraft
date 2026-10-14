@@ -170,6 +170,40 @@ export interface ProofRenderReport {
   warnings: string[];
 }
 
+// ---------------- 证明文档（docx） ----------------
+
+export interface DocxReport {
+  outPath: string;
+  sizeBytes: number;
+  /** cost | ip */
+  kind: string;
+  blockCount: number;
+  warnings: string[];
+}
+
+export interface CostDocRow {
+  item: string;
+  quantity: string;
+  unitPrice: string;
+  amount: string;
+}
+
+export interface CostDocRequest {
+  dramaName: string;
+  producer: string;
+  date: string;
+  total: string;
+  rows: CostDocRow[];
+}
+
+export interface IpDocRequest {
+  dramaName: string;
+  episodeCount: number;
+  totalDuration: string;
+  owner: string;
+  date: string;
+}
+
 // ---------------- 云端字幕（用户自备 Key） ----------------
 
 /** 前端能看到的云端配置：**永远不含完整 API Key** */

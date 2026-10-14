@@ -8,6 +8,7 @@ mod asset;
 mod cloud;
 mod commands;
 mod db;
+mod docx;
 mod error;
 mod export;
 mod jy;
@@ -127,6 +128,8 @@ pub fn run() {
             commands::proof_save_layout,
             commands::proof_preview,
             commands::proof_render,
+            commands::generate_cost_docx,
+            commands::generate_ip_docx,
             commands::asset_kinds,
             commands::scan_asset_dir,
             commands::import_assets,
