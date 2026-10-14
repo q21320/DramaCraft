@@ -157,6 +157,12 @@ fn now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// 供其他模块的测试快速建一份可用 schema（`migrate` 本身不对外）。
+#[cfg(test)]
+pub fn migrate_for_tests(conn: &Connection) -> AppResult<()> {
+    migrate(conn)
+}
+
 // ---------- setting ----------
 
 pub fn set_setting(conn: &Connection, key: &str, value: &str) -> AppResult<()> {

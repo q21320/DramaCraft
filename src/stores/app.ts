@@ -1,6 +1,14 @@
 import { defineStore } from "pinia";
 import { api } from "@/api";
-import type { AppInfo, Media, Project, RuntimeStatus, ToolPaths, ToolReport } from "@/types";
+import type {
+  AppInfo,
+  CloudConfigView,
+  Media,
+  Project,
+  RuntimeStatus,
+  ToolPaths,
+  ToolReport,
+} from "@/types";
 
 interface State {
   info: AppInfo | null;
@@ -11,6 +19,7 @@ interface State {
   toolReports: ToolReport[];
   asr: RuntimeStatus | null;
   ocr: RuntimeStatus | null;
+  cloud: CloudConfigView | null;
   loading: boolean;
   error: string;
   /** 最近一次切片输出目录，按项目分开记，避免串台 */
@@ -27,6 +36,7 @@ export const useAppStore = defineStore("app", {
     toolReports: [],
     asr: null,
     ocr: null,
+    cloud: null,
     loading: false,
     error: "",
     outDirs: {},
@@ -58,6 +68,7 @@ export const useAppStore = defineStore("app", {
         this.toolReports = await api.detectTools();
         this.asr = await api.asrStatus();
         this.ocr = await api.ocrStatus();
+        this.cloud = await api.cloudConfig();
         await this.reloadProjects();
       } catch (e) {
         this.error = (e as Error).message;
@@ -120,6 +131,11 @@ export const useAppStore = defineStore("app", {
       this.tools = await api.getTools();
       this.asr = await api.asrStatus();
       this.ocr = await api.ocrStatus();
+      this.cloud = await api.cloudConfig();
+    },
+
+    async reloadCloud() {
+      this.cloud = await api.cloudConfig();
     },
 
     setOutDir(dir: string) {

@@ -66,6 +66,34 @@ export interface RuntimeStatus {
   detail: string;
 }
 
+// ---------------- 云端字幕（用户自备 Key） ----------------
+
+/** 前端能看到的云端配置：**永远不含完整 API Key** */
+export interface CloudConfigView {
+  baseUrl: string;
+  model: string;
+  language: string;
+  hasKey: boolean;
+  /** 打码后的 Key，例如 sk-****abcd */
+  keyHint: string;
+  warnings: string[];
+}
+
+export interface CloudTranscribeReport {
+  cueCount: number;
+  language: string;
+  durationMs: number;
+  endpoint: string;
+  audioBytes: number;
+  warnings: string[];
+}
+
+export interface CloudTestResult {
+  ok: boolean;
+  endpoint: string;
+  detail: string;
+}
+
 // ---------------- 任务队列 ----------------
 
 export interface Job {

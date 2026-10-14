@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
   AsrOutcome,
+  CloudConfigView,
+  CloudTestResult,
+  CloudTranscribeReport,
   Cue,
   DraftReport,
   EpisodeBoundary,
@@ -84,10 +87,22 @@ export const api = {
   importSrt: (mediaId: number, path: string) =>
     call<SrtImportOutcome>("import_srt", { mediaId, path }),
   exportSrt: (mediaId: number, path: string) => call<number>("export_srt", { mediaId, path }),
-  asrTranscribe: (mediaId: number, model: string, language: string) =>
-    call<AsrOutcome>("asr_transcribe", { mediaId, model, language }),
+  asrTranscribe: (mediaId: number, model: string, language: string, overwrite: boolean) =>
+    call<AsrOutcome>("asr_transcribe", { mediaId, model, language, overwrite }),
   recognizeHardSubtitles: (mediaId: number, options: OcrOptions, overwrite: boolean) =>
     call<OcrReport>("recognize_hard_subtitles", { mediaId, options, overwrite }),
+
+  // 云端字幕
+  cloudConfig: () => call<CloudConfigView>("cloud_config"),
+  saveCloudConfig: (
+    baseUrl: string,
+    apiKey: string | null,
+    model: string,
+    language: string,
+  ) => call<CloudConfigView>("save_cloud_config", { baseUrl, apiKey, model, language }),
+  cloudTest: () => call<CloudTestResult>("cloud_test"),
+  cloudTranscribe: (mediaId: number, overwrite: boolean) =>
+    call<CloudTranscribeReport>("cloud_transcribe", { mediaId, overwrite }),
 
   // 导出
   exportVideo: (opts: ExportOptions) => call<ExportOutcome>("export_video", { opts }),

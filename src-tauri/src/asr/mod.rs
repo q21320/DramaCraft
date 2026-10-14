@@ -82,36 +82,16 @@ pub fn transcribe(
         .map_err(|e| AppError::Process(format!("ASR 应答结构不符合约定：{e}")))
 }
 
-/// worker 的段落 → 字幕条目。纯函数，便于测试。
+/// worker 的段落 → 字幕条目。
 ///
-/// 规则：丢弃空文本；倒置区间自动交换；负数起点夹到 0；按起点排序后重新编号。
+/// 清洗规则统一在 [`crate::subtitle::cues_from_timed_text`]，与云端字幕共用一份。
 pub fn response_to_cues(resp: &AsrResponse, media_id: i64) -> Vec<Cue> {
-    let mut cues: Vec<Cue> = resp
+    let items: Vec<(f64, f64, String)> = resp
         .segments
         .iter()
-        .filter_map(|seg| {
-            let text = seg.text.trim();
-            if text.is_empty() {
-                return None;
-            }
-            let start = (seg.start.max(0.0) * 1000.0).round() as i64;
-            let end = (seg.end.max(0.0) * 1000.0).round() as i64;
-            Some(Cue {
-                id: 0,
-                media_id,
-                index_no: 0,
-                start_ms: start.min(end),
-                end_ms: start.max(end),
-                text: text.to_string(),
-            })
-        })
+        .map(|s| (s.start, s.end, s.text.clone()))
         .collect();
-
-    cues.sort_by_key(|c| (c.start_ms, c.end_ms));
-    for (i, cue) in cues.iter_mut().enumerate() {
-        cue.index_no = i as i64 + 1;
-    }
-    cues
+    crate::subtitle::cues_from_timed_text(&items, media_id)
 }
 
 #[cfg(test)]

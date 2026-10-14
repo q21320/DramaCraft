@@ -3,15 +3,15 @@
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AppInfo, AsrOutcome, AsrRequest, Cue, EpisodeBoundary, EpisodeDetection, ExportOptions,
-    ExportOutcome, Job, Media, OcrFrame, OcrOptions, OcrReport, PlatformOption, Project,
-    PublishClipEntry, PublishPackageReport, PublishPlan, PublishAccount, QueueState, ResplitReport,
-    RuntimeStatus,
-    Segment, SeriesGroup, SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions,
-    TransformReport, VerifyItem, VerifyReport,
+    AppInfo, AsrOutcome, AsrRequest, CloudConfigView, CloudTestResult, CloudTranscribeReport, Cue,
+    EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome, Job, Media, OcrFrame,
+    OcrOptions, OcrReport, PlatformOption, Project, PublishAccount, PublishClipEntry,
+    PublishPackageReport, PublishPlan, QueueState, ResplitReport, RuntimeStatus, Segment,
+    SeriesGroup, SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport,
+    VerifyItem, VerifyReport,
 };
 use crate::{
-    asr, export, jy, media, ocr, publish, queue, series, subtitle, tools, transform, verify,
+    asr, cloud, export, jy, media, ocr, publish, queue, series, subtitle, tools, transform, verify,
     AppState,
 };
 use std::sync::atomic::Ordering;
@@ -388,7 +388,10 @@ fn worker_script(app: &tauri::AppHandle, file_name: &str) -> PathBuf {
         .join(file_name)
 }
 
-/// 跑一次 ASR 并把结果整片覆盖到该素材的字幕上。长任务，走 blocking 线程池。
+/// 跑一次本地 ASR 并把结果整片覆盖到该素材的字幕上。长任务，走 blocking 线程池。
+///
+/// 与 OCR / 云端转写一致：已有字幕时默认**拒绝执行**，必须显式 `overwrite`。
+/// 否则一次误点就会把人工校对过的字幕冲掉。
 #[tauri::command]
 pub async fn asr_transcribe(
     app: tauri::AppHandle,
@@ -396,14 +399,24 @@ pub async fn asr_transcribe(
     media_id: i64,
     model: String,
     language: String,
+    overwrite: Option<bool>,
 ) -> AppResult<AsrOutcome> {
-    let (python, worker, audio) = {
+    let overwrite = overwrite.unwrap_or(false);
+
+    let (python, worker, audio, existing) = {
         let configured = lock_tools(&state)?.clone();
         let python = tools::require(&configured.python, "python")?;
         let conn = lock_db(&state)?;
         let target = db::get_media(&conn, media_id)?;
-        (python, worker_script(&app, "asr_worker.py"), target.path)
+        let existing = db::list_cues(&conn, media_id)?.len() as i64;
+        (python, worker_script(&app, "asr_worker.py"), target.path, existing)
     };
+
+    if existing > 0 && !overwrite {
+        return Err(AppError::Msg(format!(
+            "这个素材已经有 {existing} 条字幕了。确认要覆盖的话，勾选「覆盖现有字幕」再执行。"
+        )));
+    }
 
     let model = if model.trim().is_empty() {
         asr::DEFAULT_MODEL.to_string()
@@ -1146,6 +1159,119 @@ pub async fn resplit_episodes(
             .map(|p| p.to_string_lossy().to_string())
             .collect(),
         total_duration_ms,
+    })
+}
+
+// ---------------- 云端字幕（用户自备 Key） ----------------
+
+#[tauri::command]
+pub fn cloud_config(state: tauri::State<'_, AppState>) -> AppResult<CloudConfigView> {
+    let conn = lock_db(&state)?;
+    let cfg = cloud::load_config(&conn)?;
+    Ok(cloud::view(&cfg))
+}
+
+/// 保存云端配置。`api_key` 传 `null` 表示不改动已有 Key（前端不该拿到原 Key）。
+#[tauri::command]
+pub fn save_cloud_config(
+    state: tauri::State<'_, AppState>,
+    base_url: String,
+    api_key: Option<String>,
+    model: String,
+    language: String,
+) -> AppResult<CloudConfigView> {
+    let conn = lock_db(&state)?;
+    let cfg = cloud::save_config(&conn, &base_url, api_key.as_deref(), &model, &language)?;
+    Ok(cloud::view(&cfg))
+}
+
+/// 连通性自检：地址、鉴权、模型名对不对，一次问清楚。
+#[tauri::command]
+pub async fn cloud_test(state: tauri::State<'_, AppState>) -> AppResult<CloudTestResult> {
+    let cfg = {
+        let conn = lock_db(&state)?;
+        cloud::load_config(&conn)?
+    };
+    let endpoint = cloud::transcribe_endpoint(&cfg.base_url);
+    Ok(match cloud::test_connection(&cfg).await {
+        Ok(detail) => CloudTestResult {
+            ok: true,
+            endpoint,
+            detail,
+        },
+        Err(e) => CloudTestResult {
+            ok: false,
+            endpoint,
+            detail: e.to_string(),
+        },
+    })
+}
+
+/// 用云端服务转写某个素材，结果覆盖到它的字幕上。
+#[tauri::command]
+pub async fn cloud_transcribe(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    overwrite: Option<bool>,
+) -> AppResult<CloudTranscribeReport> {
+    let overwrite = overwrite.unwrap_or(false);
+
+    let (ffmpeg, cfg, input, existing) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let conn = lock_db(&state)?;
+        let media = db::get_media(&conn, media_id)?;
+        let cfg = cloud::load_config(&conn)?;
+        let existing = db::list_cues(&conn, media_id)?.len() as i64;
+        (ffmpeg, cfg, media.path, existing)
+    };
+
+    if existing > 0 && !overwrite {
+        return Err(AppError::Msg(format!(
+            "这个素材已经有 {existing} 条字幕了。确认要覆盖的话，勾选「覆盖现有字幕」再执行。"
+        )));
+    }
+
+    // 1) 抽音频（本地，快）
+    let audio = cloud::temp_audio_path(media_id);
+    let ffmpeg_task = ffmpeg.clone();
+    let input_task = input.clone();
+    let audio_task = audio.clone();
+    let audio_bytes = tauri::async_runtime::spawn_blocking(move || {
+        cloud::extract_audio(&ffmpeg_task, Path::new(&input_task), &audio_task)
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("抽音频线程异常终止：{e}")))??;
+
+    // 2) 上传转写
+    let endpoint = cloud::transcribe_endpoint(&cfg.base_url);
+    let response = cloud::transcribe(&cfg, &audio).await;
+    // 中间产物无论成败都清掉
+    let _ = std::fs::remove_file(&audio);
+    let response = response?;
+
+    let cues = cloud::to_cues(&response, media_id);
+    if cues.is_empty() {
+        return Err(AppError::Msg(
+            "云端跑完了但没有返回任何字幕。确认素材里有人声，或换一个模型再试。".into(),
+        ));
+    }
+
+    let cue_count = {
+        let mut conn = lock_db(&state)?;
+        db::replace_cues(&mut conn, media_id, &cues)?
+    };
+
+    Ok(CloudTranscribeReport {
+        cue_count,
+        language: response.language.clone(),
+        duration_ms: (response.duration * 1000.0).round() as i64,
+        endpoint,
+        audio_bytes,
+        warnings: vec![
+            "准确率与断句由服务商模型决定，时间轴可能需要人工校对。".to_string(),
+            "上传的是抽取出的音频，不是整个视频文件。".to_string(),
+        ],
     })
 }
 

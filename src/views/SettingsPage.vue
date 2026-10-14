@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { NAlert, NButton, NInput, NSpace, NTag, useMessage } from "naive-ui";
+import { NAlert, NButton, NInput, NSelect, NSpace, NTag, useMessage } from "naive-ui";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/api";
 import { useAppStore } from "@/stores/app";
-import type { ToolPaths } from "@/types";
+import type { CloudTestResult, ToolPaths } from "@/types";
 
 const store = useAppStore();
 const message = useMessage();
@@ -12,6 +12,56 @@ const message = useMessage();
 const draft = ref<ToolPaths>({ ffmpeg: "", ffprobe: "", python: "" });
 const saving = ref(false);
 const detecting = ref(false);
+
+// 云端字幕配置。apiKey 留空表示「不改动已保存的 Key」——
+// 前端永远拿不到原 Key，只能看到打码后的提示。
+const cloudForm = ref({ baseUrl: "", apiKey: "", model: "whisper-1", language: "zh" });
+const cloudSaving = ref(false);
+const cloudTesting = ref(false);
+const cloudResult = ref<CloudTestResult | null>(null);
+
+function syncCloudForm() {
+  const cfg = store.cloud;
+  cloudForm.value = {
+    baseUrl: cfg?.baseUrl ?? "",
+    apiKey: "",
+    model: cfg?.model ?? "whisper-1",
+    language: cfg?.language ?? "zh",
+  };
+}
+
+async function saveCloud() {
+  cloudSaving.value = true;
+  cloudResult.value = null;
+  try {
+    // 留空 → 传 null，表示保留原 Key
+    const apiKey = cloudForm.value.apiKey.trim();
+    store.cloud = await api.saveCloudConfig(
+      cloudForm.value.baseUrl,
+      apiKey === "" ? null : apiKey,
+      cloudForm.value.model,
+      cloudForm.value.language,
+    );
+    cloudForm.value.apiKey = "";
+    message.success("云端配置已保存");
+  } catch (e) {
+    message.error((e as Error).message);
+  } finally {
+    cloudSaving.value = false;
+  }
+}
+
+async function testCloud() {
+  cloudTesting.value = true;
+  cloudResult.value = null;
+  try {
+    cloudResult.value = await api.cloudTest();
+  } catch (e) {
+    message.error((e as Error).message);
+  } finally {
+    cloudTesting.value = false;
+  }
+}
 
 async function pick(field: keyof ToolPaths) {
   const picked = await open({
@@ -49,6 +99,7 @@ async function redetect() {
 
 onMounted(() => {
   draft.value = { ...store.tools };
+  syncCloudForm();
 });
 </script>
 
@@ -150,6 +201,71 @@ onMounted(() => {
     <pre class="dd-mono" style="margin: 12px 0 0; padding: 10px; background: rgba(128,128,128,0.08); border-radius: 6px">pip install faster-whisper          # 语音转字幕
 pip install rapidocr_onnxruntime    # 硬字幕识别
 pip install pyJianYingDraft         # 剪映草稿导出</pre>
+  </div>
+
+  <div class="dd-card">
+    <div class="dd-card-title">云端字幕（可选）</div>
+    <div class="dd-card-desc">
+      本地 whisper 慢但免费；云端按量计费、几十秒出结果。两条路可随时切换。
+      这里按「OpenAI 兼容」的接口形状实现，你填自己买的任何一家服务都行。
+    </div>
+
+    <div class="dd-row" style="margin-bottom: 10px">
+      <span class="dd-muted" style="width: 84px">Base URL</span>
+      <n-input
+        v-model:value="cloudForm.baseUrl"
+        size="small"
+        style="width: 420px"
+        placeholder="https://api.openai.com/v1"
+      />
+      <span class="dd-muted">多数服务需要带 /v1</span>
+    </div>
+
+    <div class="dd-row" style="margin-bottom: 10px">
+      <span class="dd-muted" style="width: 84px">API Key</span>
+      <n-input
+        v-model:value="cloudForm.apiKey"
+        type="password"
+        show-password-on="click"
+        size="small"
+        style="width: 420px"
+        :placeholder="store.cloud?.hasKey ? `已保存（${store.cloud.keyHint}），留空表示不改动` : '粘贴你的 Key'"
+      />
+    </div>
+
+    <div class="dd-row" style="margin-bottom: 10px">
+      <span class="dd-muted" style="width: 84px">模型</span>
+      <n-input v-model:value="cloudForm.model" size="small" style="width: 220px" placeholder="whisper-1" />
+      <span class="dd-muted" style="margin-left: 14px">语言</span>
+      <n-select
+        v-model:value="cloudForm.language"
+        size="small"
+        style="width: 130px"
+        :options="[
+          { label: '中文', value: 'zh' },
+          { label: '英文', value: 'en' },
+          { label: '自动', value: 'auto' },
+        ]"
+      />
+    </div>
+
+    <n-space style="margin-bottom: 12px">
+      <n-button size="small" type="primary" :loading="cloudSaving" @click="saveCloud">保存</n-button>
+      <n-button size="small" :loading="cloudTesting" :disabled="!store.cloud?.hasKey" @click="testCloud">
+        测试连接
+      </n-button>
+    </n-space>
+
+    <n-alert v-if="cloudResult" :type="cloudResult.ok ? 'success' : 'error'" style="margin-bottom: 12px" :title="cloudResult.ok ? '连接正常' : '连接失败'">
+      <div class="dd-wrap">{{ cloudResult.detail }}</div>
+      <div class="dd-mono dd-muted" style="margin-top: 6px">{{ cloudResult.endpoint }}</div>
+    </n-alert>
+
+    <n-alert v-if="store.cloud && store.cloud.warnings.length > 0" type="warning" title="需要注意">
+      <ul style="margin: 0; padding-left: 18px">
+        <li v-for="(w, i) in store.cloud.warnings" :key="i" class="dd-wrap">{{ w }}</li>
+      </ul>
+    </n-alert>
   </div>
 
   <div class="dd-card">

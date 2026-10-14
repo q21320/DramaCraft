@@ -30,11 +30,12 @@ use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager};
 
 /// 队列支持的任务类型：(key, 中文名)
-pub const KINDS: [(&str, &str); 8] = [
+pub const KINDS: [(&str, &str); 9] = [
     ("slice", "切片"),
     ("transform", "画面处理"),
     ("ocr", "硬字幕识别"),
     ("asr", "语音转字幕"),
+    ("cloud", "云端转字幕"),
     ("export", "导出成片"),
     ("draft", "剪映草稿"),
     ("publish", "发布包"),
@@ -85,6 +86,7 @@ struct AsrPayload {
     media_id: i64,
     model: Option<String>,
     language: Option<String>,
+    overwrite: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +112,13 @@ struct PublishPayload {
 struct VerifyPayload {
     media_id: i64,
     samples: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudPayload {
+    media_id: i64,
+    overwrite: Option<bool>,
 }
 
 fn parse_payload<T: for<'de> Deserialize<'de>>(job: &Job) -> AppResult<T> {
@@ -182,9 +191,19 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                 p.media_id,
                 p.model.unwrap_or_default(),
                 p.language.unwrap_or_default(),
+                p.overwrite,
             )
             .await?;
             Ok(format!("生成 {} 条字幕（{}）", outcome.cue_count, outcome.model))
+        }
+        "cloud" => {
+            let p: CloudPayload = parse_payload(job)?;
+            let report = commands::cloud_transcribe(state, p.media_id, p.overwrite).await?;
+            Ok(format!(
+                "云端生成 {} 条字幕（上传 {}）",
+                report.cue_count,
+                human_size(report.audio_bytes)
+            ))
         }
         "export" => {
             let opts: ExportOptions = parse_payload(job)?;

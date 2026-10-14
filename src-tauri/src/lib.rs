@@ -4,6 +4,7 @@
 //! 重活一律走子进程，主进程只负责编排、落库、上报进度。
 
 mod asr;
+mod cloud;
 mod commands;
 mod db;
 mod error;
@@ -115,6 +116,10 @@ pub fn run() {
             commands::verify_transform,
             commands::ocr_status,
             commands::recognize_hard_subtitles,
+            commands::cloud_config,
+            commands::save_cloud_config,
+            commands::cloud_test,
+            commands::cloud_transcribe,
             commands::scan_series_dir,
             commands::cluster_series_by_intro,
             commands::detect_episodes,

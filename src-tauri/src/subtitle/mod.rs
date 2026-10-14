@@ -133,6 +133,39 @@ pub fn parse_srt(text: &str) -> (Vec<Cue>, Vec<String>) {
     (cues, warnings)
 }
 
+/// 把「秒为单位的 (起, 止, 文本)」统一转成字幕条目。
+///
+/// 本地 ASR 与云端 ASR 的返回形状不同，但清洗规则完全一样：
+/// 丢空文本、倒置区间交换、负数起点夹到 0、按起点排序后重新编号。
+/// 放在这里，两条链路共用一份规则，不会各写一套各漏一处。
+pub fn cues_from_timed_text(items: &[(f64, f64, String)], media_id: i64) -> Vec<Cue> {
+    let mut cues: Vec<Cue> = items
+        .iter()
+        .filter_map(|(start, end, text)| {
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let start = (start.max(0.0) * 1000.0).round() as i64;
+            let end = (end.max(0.0) * 1000.0).round() as i64;
+            Some(Cue {
+                id: 0,
+                media_id,
+                index_no: 0,
+                start_ms: start.min(end),
+                end_ms: start.max(end),
+                text: text.to_string(),
+            })
+        })
+        .collect();
+
+    cues.sort_by_key(|c| (c.start_ms, c.end_ms));
+    for (i, cue) in cues.iter_mut().enumerate() {
+        cue.index_no = i as i64 + 1;
+    }
+    cues
+}
+
 /// 把整片字幕投影到某个时间区间上（用于给切片配字幕）。
 ///
 /// 规则：
@@ -182,6 +215,38 @@ mod tests {
             end_ms: end,
             text: text.to_string(),
         }
+    }
+
+    #[test]
+    fn cues_from_timed_text_normalizes_like_the_asr_path() {
+        let items = vec![
+            (2.0, 3.5, "第二句".to_string()),
+            (0.0, 1.25, "第一句".to_string()),
+            (1.0, 2.0, "   ".to_string()),
+            (5.0, 3.0, "倒置".to_string()),
+            (-1.0, 0.5, "负起点".to_string()),
+        ];
+        let cues = cues_from_timed_text(&items, 9);
+        assert_eq!(cues.len(), 4, "空文本要被丢掉");
+        assert!(cues.iter().all(|c| c.media_id == 9));
+
+        // 负起点被夹到 0；与另一条同起点时按终点排序，所以不能写死下标
+        let first = cues.iter().find(|c| c.text == "第一句").unwrap();
+        assert_eq!((first.start_ms, first.end_ms), (0, 1_250));
+        let negative = cues.iter().find(|c| c.text == "负起点").unwrap();
+        assert_eq!(negative.start_ms, 0, "负起点应被夹到 0");
+        assert_eq!(negative.end_ms, 500);
+
+        // 倒置区间被交换
+        let inverted = cues.iter().find(|c| c.text == "倒置").unwrap();
+        assert_eq!((inverted.start_ms, inverted.end_ms), (3_000, 5_000));
+
+        // 连续编号 + 单调不减
+        assert_eq!(cues[0].index_no, 1);
+        assert_eq!(cues[3].index_no, 4);
+        assert!(cues.windows(2).all(|w| w[0].start_ms <= w[1].start_ms));
+
+        assert!(cues_from_timed_text(&[], 1).is_empty());
     }
 
     #[test]

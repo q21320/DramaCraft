@@ -29,6 +29,9 @@ const busy = ref(false);
 const asrLog = ref("");
 const model = ref("small");
 const language = ref("zh");
+const asrOverwrite = ref(false);
+const cloudBusy = ref(false);
+const cloudLog = ref("");
 
 // 硬字幕识别
 const ocrFps = ref(2);
@@ -113,18 +116,59 @@ async function runAsr() {
     message.warning("当前修改尚未保存，请先保存再生成");
     return;
   }
+  if (cues.value.length > 0 && !asrOverwrite.value) {
+    message.warning(`当前已有 ${cues.value.length} 条字幕。要覆盖请先勾选「覆盖现有字幕」`);
+    return;
+  }
   busy.value = true;
   asrLog.value = "";
   try {
-    const outcome = await api.asrTranscribe(mediaId.value, model.value, language.value);
+    const outcome = await api.asrTranscribe(
+      mediaId.value,
+      model.value,
+      language.value,
+      asrOverwrite.value,
+    );
     asrLog.value = outcome.log;
     await load();
     warnings.value = [];
+    asrOverwrite.value = false;
     message.success(`识别完成，共 ${outcome.cueCount} 条字幕`);
   } catch (e) {
     message.error((e as Error).message);
   } finally {
     busy.value = false;
+  }
+}
+
+/** 交给用户自备 Key 的云端服务转写（快，按量计费） */
+async function runCloud() {
+  if (mediaId.value === null) {
+    message.warning("请先选择素材");
+    return;
+  }
+  if (!store.cloud?.hasKey) {
+    message.warning("还没配置云端 API Key，请到「设置 → 云端字幕」填写");
+    return;
+  }
+  if (cues.value.length > 0 && !asrOverwrite.value) {
+    message.warning(`当前已有 ${cues.value.length} 条字幕。要覆盖请先勾选「覆盖现有字幕」`);
+    return;
+  }
+  cloudBusy.value = true;
+  cloudLog.value = "";
+  try {
+    const report = await api.cloudTranscribe(mediaId.value, asrOverwrite.value);
+    cloudLog.value =
+      `云端返回 ${report.cueCount} 条字幕（语言 ${report.language || "未知"}，` +
+      `上传音频 ${(report.audioBytes / 1024).toFixed(0)} KB）`;
+    await load();
+    asrOverwrite.value = false;
+    message.success(`云端转写完成，共 ${report.cueCount} 条字幕`);
+  } catch (e) {
+    message.error((e as Error).message);
+  } finally {
+    cloudBusy.value = false;
   }
 }
 
@@ -299,11 +343,35 @@ onMounted(() => {
         <n-select v-model:value="model" :options="modelOptions" size="small" style="width: 190px" />
         <n-select v-model:value="language" :options="languageOptions" size="small" style="width: 130px" />
         <n-button size="small" type="primary" :loading="busy" @click="runAsr">
-          生成字幕（ASR）
+          生成字幕（本地）
+        </n-button>
+        <n-button
+          size="small"
+          :loading="cloudBusy"
+          :disabled="!store.cloud?.hasKey"
+          @click="runCloud"
+        >
+          云端转写
         </n-button>
         <n-tag v-if="store.asr" size="small" :type="store.asr.available ? 'success' : 'warning'" :bordered="false">
-          {{ store.asr.available ? "运行时就绪" : "运行时未就绪" }}
+          {{ store.asr.available ? "本地就绪" : "本地未就绪" }}
         </n-tag>
+        <n-tag
+          v-if="store.cloud"
+          size="small"
+          :type="store.cloud.hasKey ? 'success' : 'warning'"
+          :bordered="false"
+        >
+          {{ store.cloud.hasKey ? `云端 ${store.cloud.keyHint}` : "云端未配置" }}
+        </n-tag>
+      </div>
+
+      <div class="dd-row" style="margin-top: 10px">
+        <span class="dd-muted" style="width: 64px"></span>
+        <n-checkbox v-model:checked="asrOverwrite">
+          覆盖现有字幕（当前 {{ cues.length }} 条）
+        </n-checkbox>
+        <span class="dd-muted">本地 ASR 与云端转写共用这一项；不勾选时已有字幕的素材会被拒绝</span>
       </div>
 
       <n-alert
@@ -315,8 +383,12 @@ onMounted(() => {
         {{ store.asr.detail }}
       </n-alert>
 
-      <n-alert v-if="asrLog" type="success" style="margin-top: 12px" title="上次识别结果">
+      <n-alert v-if="asrLog" type="success" style="margin-top: 12px" title="上次本地识别结果">
         {{ asrLog }}
+      </n-alert>
+
+      <n-alert v-if="cloudLog" type="success" style="margin-top: 12px" title="上次云端转写结果">
+        {{ cloudLog }}
       </n-alert>
 
       <n-alert

@@ -236,6 +236,40 @@ pub struct PlatformOption {
     pub note: String,
 }
 
+// ---------------- 云端字幕（用户自备 Key） ----------------
+
+/// 给前端看的云端配置。**永远不含完整 API Key** —— Key 只留在后端。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudConfigView {
+    pub base_url: String,
+    pub model: String,
+    pub language: String,
+    pub has_key: bool,
+    /// 打码后的 Key，例如 `sk-****abcd`
+    pub key_hint: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudTranscribeReport {
+    pub cue_count: i64,
+    pub language: String,
+    pub duration_ms: i64,
+    pub endpoint: String,
+    pub audio_bytes: i64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudTestResult {
+    pub ok: bool,
+    pub endpoint: String,
+    pub detail: String,
+}
+
 // ---------------- 任务队列 ----------------
 
 /// 队列里的一条任务。`payload` 是 JSON，形状由 `kind` 决定。
