@@ -1,4 +1,4 @@
-//! 剧目与集：把散乱的素材按「剧目 → 集」组织起来，并按集重新切分。
+﻿//! 剧目与集：把散乱的素材按「剧目 → 集」组织起来，并按集重新切分。
 //!
 //! 短剧素材到手时通常两种乱法：
 //!
@@ -364,7 +364,7 @@ pub fn resplit_by_episodes(
             end_ms: b.end_ms,
         };
         let out = out_dir.join(format!("第{:02}集.mp4", b.index_no));
-        match crate::media::slice(ffmpeg, input, &out, &plan) {
+        match crate::media::slice(ffmpeg, input, &out, &plan, true) {
             Ok(_) => produced.push(out),
             Err(e) => {
                 return Err(AppError::Process(format!(

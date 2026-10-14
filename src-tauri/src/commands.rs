@@ -1,4 +1,4 @@
-//! 前后端唯一边界。前端只认这里的命令名与参数形状。
+﻿//! 前后端唯一边界。前端只认这里的命令名与参数形状。
 
 use crate::db;
 use crate::error::{AppError, AppResult};
@@ -192,7 +192,9 @@ pub async fn run_slice(
     media_id: i64,
     mode: SliceMode,
     out_dir: String,
+    compatible: Option<bool>,
 ) -> AppResult<Vec<Segment>> {
+    let compatible = compatible.unwrap_or(false);
     let (input_path, plans, ffmpeg) = {
         let configured = lock_tools(&state)?.clone();
         let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
@@ -236,7 +238,7 @@ pub async fn run_slice(
                     }),
                 );
                 let out_path = out_task.join(format!("{:03}.mp4", plan.index));
-                match media::slice(&ffmpeg_task, Path::new(&input_task), &out_path, plan) {
+                match media::slice(&ffmpeg_task, Path::new(&input_task), &out_path, plan, compatible) {
                     Ok(o) => acc.push((
                         plan.clone(),
                         o.out_path.to_string_lossy().to_string(),

@@ -1,4 +1,4 @@
-//! 媒体处理：ffprobe 探测 + ffmpeg 切片。
+﻿//! 媒体处理：ffprobe 探测 + ffmpeg 切片。
 //!
 //! 所有外部进程调用集中在这里，便于统一处理超时、错误信息截断与临时文件清理。
 
@@ -125,7 +125,94 @@ pub struct SliceOutcome {
 /// 切出一片。优先流拷贝（无损且快），失败则回退转码。
 ///
 /// 写入策略：先写 `xxx.part.mp4`，成功后原子重命名 —— 中途失败不会在输出目录留下半成品。
-pub fn slice(ffmpeg: &Path, input: &Path, out: &Path, p: &SlicePlan) -> AppResult<SliceOutcome> {
+/// 可用的 H.264 编码器。
+///
+/// 为什么需要它：源素材常是 **HEVC（H.265）**，而抖音/快手/视频号的上传规范
+/// 要 **H.264**。流拷贝会把 HEVC 原样保留，传上去被拒、或者被平台二次转码掉画质。
+/// 所以「兼容模式」必须真转码，而转码就该尽量用硬件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H264Encoder {
+    Nvenc,
+    Qsv,
+    Amf,
+    X264,
+}
+
+impl H264Encoder {
+    pub fn name(self) -> &'static str {
+        match self {
+            H264Encoder::Nvenc => "h264_nvenc",
+            H264Encoder::Qsv => "h264_qsv",
+            H264Encoder::Amf => "h264_amf",
+            H264Encoder::X264 => "libx264",
+        }
+    }
+
+    pub fn is_hardware(self) -> bool {
+        !matches!(self, H264Encoder::X264)
+    }
+
+    /// 质量参数各家叫法不同，分开给。
+    pub fn quality_args(self) -> Vec<String> {
+        match self {
+            // nvenc 用 -cq 恒定质量；preset 用 p4（速度与质量的中间档）
+            H264Encoder::Nvenc => vec!["-preset".into(), "p4".into(), "-cq".into(), "23".into()],
+            H264Encoder::Qsv => vec!["-global_quality".into(), "23".into()],
+            H264Encoder::Amf => vec!["-quality".into(), "balanced".into(), "-rc".into(), "cqp".into(), "-qp_i".into(), "23".into(), "-qp_p".into(), "23".into()],
+            H264Encoder::X264 => vec!["-preset".into(), "veryfast".into(), "-crf".into(), "20".into()],
+        }
+    }
+}
+
+static H264_ENCODER: std::sync::OnceLock<H264Encoder> = std::sync::OnceLock::new();
+
+/// 探测本机可用的 H.264 编码器，优先硬件。
+///
+/// 探测方式是**真的编一帧**，而不是看 `-encoders` 列表 ——
+/// 列表里有 `h264_nvenc` 不代表这台机器真有 N 卡（没有卡时会直接报错）。
+pub fn pick_h264_encoder(ffmpeg: &Path) -> H264Encoder {
+    *H264_ENCODER.get_or_init(|| {
+        for candidate in [H264Encoder::Nvenc, H264Encoder::Qsv, H264Encoder::Amf] {
+            let mut cmd = Command::new(ffmpeg);
+            crate::proc::no_window(&mut cmd);
+            cmd.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:d=0.1",
+                "-frames:v",
+                "1",
+                "-c:v",
+            ])
+            .arg(candidate.name())
+            .arg("-f")
+            .arg("null")
+            .arg("-");
+            if let Ok(out) = cmd.output() {
+                if out.status.success() {
+                    return candidate;
+                }
+            }
+        }
+        H264Encoder::X264
+    })
+}
+
+
+/// 切一片。
+///
+/// `transcode` 为真时**强制转成 H.264**（平台上传规范要求），
+/// 为假时先试流拷贝（快、无损），失败再退回转码。
+pub fn slice(
+    ffmpeg: &Path,
+    input: &Path,
+    out: &Path,
+    p: &SlicePlan,
+    transcode: bool,
+) -> AppResult<SliceOutcome> {
     if p.end_ms <= p.start_ms {
         return Err(AppError::Msg(format!("非法区间：{}", p.index)));
     }
@@ -156,53 +243,67 @@ pub fn slice(ffmpeg: &Path, input: &Path, out: &Path, p: &SlicePlan) -> AppResul
         temp.to_string_lossy().to_string(),
     ];
 
+    // 兼容模式：直接转码，不走拷贝
+    if transcode {
+        return reencode(ffmpeg, input, &temp, out, p, &duration);
+    }
+
     match run_ffmpeg(ffmpeg, &copy_args) {
         Ok(()) => finish(out, &temp, "流拷贝"),
-        Err(copy_err) => {
+        Err(_copy_err) => {
             // 常见原因：源容器里有 mp4 不支持的流、或时间戳异常
-            let reencode_args: Vec<String> = vec![
-                "-hide_banner".into(),
-                "-nostdin".into(),
-                "-y".into(),
-                "-ss".into(),
-                ms_to_secs(p.start_ms),
-                "-i".into(),
-                input.to_string_lossy().to_string(),
-                "-t".into(),
-                duration,
-                "-map".into(),
-                "0:v:0?".into(),
-                "-map".into(),
-                "0:a:0?".into(),
-                "-c:v".into(),
-                "libx264".into(),
-                "-preset".into(),
-                "veryfast".into(),
-                "-crf".into(),
-                "20".into(),
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                "192k".into(),
-                "-movflags".into(),
-                "+faststart".into(),
-                temp.to_string_lossy().to_string(),
-            ];
-            match run_ffmpeg(ffmpeg, &reencode_args) {
-                Ok(()) => finish(
-                    out,
-                    &temp,
-                    &format!("流拷贝失败已转码：{copy_err}"),
-                ),
-                Err(re_err) => {
-                    let _ = std::fs::remove_file(&temp);
-                    Err(AppError::Process(format!(
-                        "切片失败（流拷贝与转码均失败）。转码错误：{re_err}"
-                    )))
-                }
-            }
+            reencode(ffmpeg, input, &temp, out, p, &duration)
         }
     }
+}
+
+/// 转码那一段抽出来，好让「拷贝失败」和「兼容模式」共用同一份参数。
+fn reencode(
+    ffmpeg: &Path,
+    input: &Path,
+    temp: &Path,
+    out: &Path,
+    p: &SlicePlan,
+    duration: &str,
+) -> AppResult<SliceOutcome> {
+    let encoder = pick_h264_encoder(ffmpeg);
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-y".into(),
+        "-ss".into(),
+        ms_to_secs(p.start_ms),
+        "-i".into(),
+        input.to_string_lossy().to_string(),
+        "-t".into(),
+        duration.to_string(),
+        "-map".into(),
+        "0:v:0?".into(),
+        "-map".into(),
+        "0:a:0?".into(),
+        "-c:v".into(),
+        encoder.name().into(),
+    ];
+    args.extend(encoder.quality_args());
+    args.extend([
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        "192k".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+    ]);
+    args.push(temp.to_string_lossy().to_string());
+
+    run_ffmpeg(ffmpeg, &args).map_err(AppError::Process)?;
+    let detail = if encoder.is_hardware() {
+        format!("转码 → H.264（{} 硬件加速）", encoder.name())
+    } else {
+        "转码 → H.264（CPU）".to_string()
+    };
+    finish(out, temp, &detail)
 }
 
 fn temp_path(out: &Path) -> AppResult<PathBuf> {
@@ -255,6 +356,92 @@ fn finish(out: &Path, temp: &Path, how: &str) -> AppResult<SliceOutcome> {
 mod tests {
     use super::*;
 
+    /// 兼容模式：源是 HEVC 时必须转成 H.264。
+    ///
+    /// 为什么这条重要：抖音/快手/视频号的上传规范要 H.264，
+    /// 而流拷贝会把 HEVC 原样保留。真实的短剧素材包正好就是 HEVC。
+    #[test]
+    fn compatible_mode_turns_hevc_into_h264() {
+        let Some(ffmpeg) = std::env::var("DRAMADIST_TEST_FFMPEG")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+        else {
+            eprintln!("跳过：未设置 DRAMADIST_TEST_FFMPEG");
+            return;
+        };
+        let ffprobe = std::env::var("DRAMADIST_TEST_FFPROBE")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.is_file());
+        let Some(ffprobe) = ffprobe else {
+            eprintln!("跳过：未设置 DRAMADIST_TEST_FFPROBE");
+            return;
+        };
+
+        let dir = std::env::temp_dir().join("dramadist_hevc_compat");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("hevc.mp4");
+
+        // 先造一个 HEVC 源（内置 ffmpeg 带 libx265）
+        let status = crate::proc::no_window(
+            Command::new(&ffmpeg).args([
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=15",
+                "-t", "4", "-c:v", "libx265", "-pix_fmt", "yuv420p",
+                "-tag:v", "hvc1",
+            ]),
+        )
+        .arg(&src)
+        .status()
+        .expect("无法启动 ffmpeg");
+        assert!(status.success(), "生成 HEVC 测试素材失败");
+
+        let probe = crate::media::probe(&ffprobe, &src).unwrap();
+        assert_eq!(probe.format_name.is_empty(), false);
+        // 确认源确实是 HEVC
+        let enc = crate::proc::no_window(
+            Command::new(&ffprobe).args(["-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name", "-of", "csv=p=0"]),
+        )
+        .arg(&src)
+        .output()
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&enc.stdout).trim(), "hevc");
+
+        let plan = SlicePlan {
+            index: 1,
+            start_ms: 0,
+            end_ms: 2000,
+        };
+
+        // 兼容模式：应当是 H.264
+        let out_compat = dir.join("compat.mp4");
+        let outcome = slice(&ffmpeg, &src, &out_compat, &plan, true).expect("兼容模式切片失败");
+        assert!(outcome.size_bytes > 0);
+        let codec = codec_of(&ffprobe, &out_compat);
+        assert_eq!(codec, "h264", "兼容模式必须转成 H.264，实际 {codec}");
+
+        // 非兼容模式：流拷贝，保持 HEVC（快，适合本地预览）
+        let out_copy = dir.join("copy.mp4");
+        slice(&ffmpeg, &src, &out_copy, &plan, false).expect("流拷贝失败");
+        let codec = codec_of(&ffprobe, &out_copy);
+        assert_eq!(codec, "hevc", "非兼容模式应当保持源编码，实际 {codec}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn codec_of(ffprobe: &Path, file: &Path) -> String {
+        let out = crate::proc::no_window(
+            Command::new(ffprobe).args(["-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name", "-of", "csv=p=0"]),
+        )
+        .arg(file)
+        .output()
+        .expect("ffprobe 失败");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
     #[test]
     fn ms_formats_to_three_decimals() {
         assert_eq!(ms_to_secs(0), "0.000");
@@ -290,6 +477,7 @@ mod tests {
             Path::new("E:/nope/in.mp4"),
             Path::new("E:/nope/out.mp4"),
             &bad,
+            true,
         )
         .unwrap_err()
         .to_string();
@@ -372,7 +560,7 @@ mod tests {
         assert_eq!(plans.len(), 3, "12 秒按 4 秒切应得 3 片");
         for p in &plans {
             let out = dir.join(format!("{:03}.mp4", p.index));
-            let outcome = slice(&ffmpeg, &input, &out, p).expect("切片失败");
+            let outcome = slice(&ffmpeg, &input, &out, p, false).expect("切片失败");
             assert!(out.is_file(), "第 {} 片没有产出文件", p.index);
             assert!(outcome.size_bytes > 0, "第 {} 片是空文件", p.index);
         }

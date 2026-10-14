@@ -1,4 +1,4 @@
-//! 任务队列：把长任务排成一队顺序跑，可暂停、可停止、**重启后能接着跑**。
+﻿//! 任务队列：把长任务排成一队顺序跑，可暂停、可停止、**重启后能接着跑**。
 //!
 //! ## 为什么需要它
 //!
@@ -62,6 +62,10 @@ struct SlicePayload {
     media_id: i64,
     mode: SliceMode,
     out_dir: String,
+    /// 兼容模式：强制转成 H.264。流水线默认开着 ——
+    /// 源素材常是 HEVC，而平台上传规范要 H.264。
+    #[serde(default)]
+    compatible: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,7 +160,7 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         "slice" => {
             let p: SlicePayload = parse_payload(job)?;
             let segments =
-                commands::run_slice(app.clone(), state, p.media_id, p.mode, p.out_dir).await?;
+                commands::run_slice(app.clone(), state, p.media_id, p.mode, p.out_dir, Some(p.compatible)).await?;
             let failed = segments.iter().filter(|s| s.status != "ok").count();
             if failed > 0 {
                 Ok(format!("切出 {} 片，其中 {failed} 片失败", segments.len()))

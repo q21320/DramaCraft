@@ -1,4 +1,4 @@
-//! 流水线：把「一个源目录」变成「一批做完的剧」。
+﻿//! 流水线：把「一个源目录」变成「一批做完的剧」。
 //!
 //! ## 为什么要有这一层
 //!
@@ -348,6 +348,8 @@ pub fn stage_payload(
             "mediaId": media_id,
             "mode": { "mode": "fixedDuration", "seconds": slice_ms as f64 / 1000.0 },
             "outDir": out_dir.join("切片").to_string_lossy(),
+            // 切出来要能直接上传：源素材常是 HEVC，而平台要 H.264
+            "compatible": true,
         }),
         "subtitle" => serde_json::json!({
             "mediaId": media_id,
