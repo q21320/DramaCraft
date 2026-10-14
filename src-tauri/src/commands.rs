@@ -3,16 +3,17 @@
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AppInfo, AsrOutcome, AsrRequest, CloudConfigView, CloudTestResult, CloudTranscribeReport, Cue,
-    EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome, Job, Media, OcrFrame,
-    OcrOptions, OcrReport, PlatformOption, Project, ProofLayout, ProofPreview, ProofRenderReport,
-    PublishAccount, PublishClipEntry, PublishPackageReport, PublishPlan, QueueState, ResplitReport,
-    RuntimeStatus, Segment, SeriesGroup, SliceMode, SlicePlan, ToolPaths, ToolReport,
-    TransformOptions, TransformReport, VerifyItem, VerifyReport,
+    AppInfo, AsrOutcome, AsrRequest, Asset, AssetApplyReport, AssetImportReport, AssetKindOption,
+    AssetSummary, CloudConfigView, CloudTestResult, CloudTranscribeReport, Cue, DiscoveredAsset,
+    EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome, Job, Media, MediaProbe,
+    OcrFrame, OcrOptions, OcrReport, PlatformOption, Project, ProofLayout, ProofPreview,
+    ProofRenderReport, PublishAccount, PublishClipEntry, PublishPackageReport, PublishPlan,
+    QueueState, ResplitReport, RuntimeStatus, Segment, SeriesGroup, SliceMode, SlicePlan, ToolPaths,
+    ToolReport, TransformOptions, TransformReport, VerifyItem, VerifyReport,
 };
 use crate::{
-    asr, cloud, export, jy, media, ocr, proof, publish, queue, series, subtitle, tools, transform,
-    verify, AppState,
+    asr, asset, cloud, export, jy, media, ocr, proof, publish, queue, series, subtitle, tools,
+    transform, verify, AppState,
 };
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -1161,6 +1162,270 @@ pub async fn resplit_episodes(
             .collect(),
         total_duration_ms,
     })
+}
+
+// ---------------- 用户自备素材库 ----------------
+
+/// 素材类型选项。程序**不内置任何素材**，全靠用户导入。
+#[tauri::command]
+pub fn asset_kinds() -> AppResult<Vec<AssetKindOption>> {
+    Ok(asset::KINDS
+        .iter()
+        .map(|(key, label)| AssetKindOption {
+            key: (*key).to_string(),
+            label: (*label).to_string(),
+        })
+        .collect())
+}
+
+/// 扫描目录，列出可导入的素材（不写库）。
+#[tauri::command]
+pub fn scan_asset_dir(dir: String) -> AppResult<Vec<DiscoveredAsset>> {
+    asset::scan_dir(Path::new(dir.trim()))
+}
+
+/// 导入素材。音频会读时长，LUT 会解析文件头并核对数据行数。
+#[tauri::command]
+pub fn import_assets(
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+    category: String,
+) -> AppResult<AssetImportReport> {
+    if paths.is_empty() {
+        return Err(AppError::Msg("没有选择要导入的文件".into()));
+    }
+    let ffprobe = {
+        let configured = lock_tools(&state)?.clone();
+        configured.ffprobe
+    };
+    let category = category.trim().to_string();
+    let mut imported = 0i64;
+    let mut skipped: Vec<String> = Vec::new();
+    let supported: Vec<String> = asset::KINDS
+        .iter()
+        .map(|(k, _)| format!("{}（{}）", k, asset::kind_label(k)))
+        .collect();
+
+    for raw in &paths {
+        let path = PathBuf::from(raw.trim());
+        let Some(kind) = asset::classify(&path) else {
+            skipped.push(format!(
+                "{}：不是支持的素材类型，只认 {}",
+                raw,
+                supported.join("、")
+            ));
+            continue;
+        };
+        if !path.is_file() {
+            skipped.push(format!("{raw}：文件不存在"));
+            continue;
+        }
+
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "未命名".to_string());
+        let size_bytes = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
+
+        // 按类型取各自的元信息；取不到就跳过，不塞一条残缺记录进库
+        let (duration_ms, meta) = if kind == "lut" {
+            match asset::read_cube(&path) {
+                Ok(info) => (0, serde_json::to_string(&info).unwrap_or_default()),
+                Err(e) => {
+                    skipped.push(format!("{}：{e}", raw));
+                    continue;
+                }
+            }
+        } else {
+            match media::probe(Path::new(&ffprobe), &path) {
+                Ok(info) if info.has_audio => (info.duration_ms, String::new()),
+                Ok(_) => {
+                    skipped.push(format!("{raw}：这个文件里没有音轨"));
+                    continue;
+                }
+                Err(e) => {
+                    skipped.push(format!("{raw}：读取音频信息失败（{e}）"));
+                    continue;
+                }
+            }
+        };
+
+        let conn = lock_db(&state)?;
+        db::upsert_asset(
+            &conn,
+            &Asset {
+                id: 0,
+                kind: kind.to_string(),
+                name,
+                path: raw.trim().to_string(),
+                category: category.clone(),
+                tags: String::new(),
+                duration_ms,
+                size_bytes,
+                meta,
+                note: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )?;
+        imported += 1;
+    }
+
+    Ok(AssetImportReport {
+        imported,
+        skipped,
+        summary: {
+            let conn = lock_db(&state)?;
+            db::asset_summary(&conn)?
+        },
+    })
+}
+
+#[tauri::command]
+pub fn list_assets(
+    state: tauri::State<'_, AppState>,
+    kind: Option<String>,
+) -> AppResult<Vec<Asset>> {
+    let filter = kind.unwrap_or_default();
+    let filter = filter.trim();
+    // 类型写错时直接报错，而不是静默返回空列表让人以为"素材没了"
+    if !filter.is_empty() && !asset::is_known_kind(filter) {
+        return Err(AppError::Msg(format!(
+            "不认识的素材类型：{filter}（支持 {}）",
+            asset::KINDS.map(|(k, _)| k).join("/")
+        )));
+    }
+    let conn = lock_db(&state)?;
+    db::list_assets(&conn, if filter.is_empty() { None } else { Some(filter) })
+}
+
+#[tauri::command]
+pub fn update_asset(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    name: String,
+    category: String,
+    tags: String,
+    note: String,
+) -> AppResult<Asset> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::Msg("素材名称不能为空".into()));
+    }
+    let conn = lock_db(&state)?;
+    db::update_asset(&conn, id, &name, category.trim(), tags.trim(), note.trim())
+}
+
+/// 从库里移除记录。**不会删磁盘上的文件** —— 那是你自己的素材。
+#[tauri::command]
+pub fn delete_asset(state: tauri::State<'_, AppState>, id: i64) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    db::delete_asset(&conn, id)
+}
+
+#[tauri::command]
+pub fn asset_summary(state: tauri::State<'_, AppState>) -> AppResult<AssetSummary> {
+    let conn = lock_db(&state)?;
+    db::asset_summary(&conn)
+}
+
+/// 给某个素材配 BGM / 音效，产出 `<原名>_bgm.mp4`。
+#[tauri::command]
+pub async fn apply_bgm(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    asset_id: i64,
+    mode: String,
+    bgm_volume: Option<f64>,
+    original_volume: Option<f64>,
+    loop_bgm: Option<bool>,
+) -> AppResult<AssetApplyReport> {
+    let (ffmpeg, ffprobe, video, audio, probe) = {
+        let configured = lock_tools(&state)?.clone();
+        let conn = lock_db(&state)?;
+        let media = db::get_media(&conn, media_id)?;
+        let record = db::get_asset(&conn, asset_id)?;
+        if record.kind != "audio" {
+            return Err(AppError::Msg(format!(
+                "「{}」不是音频素材，不能当 BGM 用",
+                record.name
+            )));
+        }
+        (
+            tools::require(&configured.ffmpeg, "ffmpeg")?,
+            tools::require(&configured.ffprobe, "ffprobe")?,
+            PathBuf::from(media.path),
+            PathBuf::from(record.path),
+            MediaProbe {
+                duration_ms: media.duration_ms,
+                width: media.width,
+                height: media.height,
+                has_audio: media.has_audio,
+                size_bytes: media.size_bytes,
+                format_name: String::new(),
+            },
+        )
+    };
+
+    let out = asset::output_path(&video, "bgm");
+    let mode = asset::parse_bgm_mode(&mode);
+    let bgm_volume = bgm_volume.unwrap_or(0.35);
+    let original_volume = original_volume.unwrap_or(1.0);
+    let loop_bgm = loop_bgm.unwrap_or(false);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        asset::apply_bgm(
+            &ffmpeg,
+            &ffprobe,
+            &video,
+            &audio,
+            &out,
+            mode,
+            bgm_volume,
+            original_volume,
+            loop_bgm,
+            Some(&probe),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("配 BGM 线程异常终止：{e}")))?
+}
+
+/// 给某个素材套 LUT，产出 `<原名>_lut.mp4`。
+#[tauri::command]
+pub async fn apply_lut(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    asset_id: i64,
+    intensity: Option<f64>,
+) -> AppResult<AssetApplyReport> {
+    let (ffmpeg, video, lut) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let conn = lock_db(&state)?;
+        let media = db::get_media(&conn, media_id)?;
+        let record = db::get_asset(&conn, asset_id)?;
+        if record.kind != "lut" {
+            return Err(AppError::Msg(format!(
+                "「{}」不是 LUT 素材",
+                record.name
+            )));
+        }
+        (
+            ffmpeg,
+            PathBuf::from(media.path),
+            PathBuf::from(record.path),
+        )
+    };
+
+    let out = asset::output_path(&video, "lut");
+    let intensity = intensity.unwrap_or(1.0);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        asset::apply_lut(&ffmpeg, &video, &lut, &out, intensity)
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("套用 LUT 线程异常终止：{e}")))?
 }
 
 // ---------------- 证明材料 ----------------

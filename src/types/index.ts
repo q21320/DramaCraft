@@ -66,6 +66,61 @@ export interface RuntimeStatus {
   detail: string;
 }
 
+// ---------------- 用户自备素材库 ----------------
+
+/** 素材库里的一条素材。全部由用户导入，程序不内置任何第三方素材。 */
+export interface Asset {
+  id: number;
+  /** audio | lut */
+  kind: string;
+  name: string;
+  path: string;
+  category: string;
+  tags: string;
+  durationMs: number;
+  sizeBytes: number;
+  /** LUT 的尺寸等额外信息，JSON 字符串 */
+  meta: string;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AssetKindOption {
+  key: string;
+  label: string;
+}
+
+export interface AssetSummary {
+  audio: number;
+  lut: number;
+  total: number;
+  totalBytes: number;
+}
+
+export interface DiscoveredAsset {
+  path: string;
+  fileName: string;
+  kind: string;
+  sizeBytes: number;
+  /** 扫描时就发现的问题（例如 .cube 被截断） */
+  problem: string;
+}
+
+export interface AssetImportReport {
+  imported: number;
+  skipped: string[];
+  summary: AssetSummary;
+}
+
+export interface AssetApplyReport {
+  outPath: string;
+  sizeBytes: number;
+  durationMs: number;
+  filter: string;
+  warnings: string[];
+}
+
 // ---------------- 证明材料 ----------------
 
 export interface ProofField {

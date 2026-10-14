@@ -2,10 +2,16 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
   AsrOutcome,
+  Asset,
+  AssetApplyReport,
+  AssetImportReport,
+  AssetKindOption,
+  AssetSummary,
   CloudConfigView,
   CloudTestResult,
   CloudTranscribeReport,
   Cue,
+  DiscoveredAsset,
   DraftReport,
   EpisodeBoundary,
   EpisodeDetection,
@@ -201,4 +207,33 @@ export const api = {
   cancelPendingJobs: () => call<number>("cancel_pending_jobs"),
   clearFinishedJobs: () => call<number>("clear_finished_jobs"),
   deleteJob: (id: number) => call<void>("delete_job", { id }),
+
+  // 用户自备素材库
+  assetKinds: () => call<AssetKindOption[]>("asset_kinds"),
+  scanAssetDir: (dir: string) => call<DiscoveredAsset[]>("scan_asset_dir", { dir }),
+  importAssets: (paths: string[], category: string) =>
+    call<AssetImportReport>("import_assets", { paths, category }),
+  listAssets: (kind?: string) => call<Asset[]>("list_assets", { kind: kind ?? null }),
+  updateAsset: (id: number, name: string, category: string, tags: string, note: string) =>
+    call<Asset>("update_asset", { id, name, category, tags, note }),
+  deleteAsset: (id: number) => call<void>("delete_asset", { id }),
+  assetSummary: () => call<AssetSummary>("asset_summary"),
+  applyBgm: (
+    mediaId: number,
+    assetId: number,
+    mode: string,
+    bgmVolume: number,
+    originalVolume: number,
+    loopBgm: boolean,
+  ) =>
+    call<AssetApplyReport>("apply_bgm", {
+      mediaId,
+      assetId,
+      mode,
+      bgmVolume,
+      originalVolume,
+      loopBgm,
+    }),
+  applyLut: (mediaId: number, assetId: number, intensity: number) =>
+    call<AssetApplyReport>("apply_lut", { mediaId, assetId, intensity }),
 };

@@ -4,7 +4,8 @@
 
 use crate::error::AppResult;
 use crate::models::{
-    Cue, Job, JobCounts, Media, MediaProbe, Project, PublishAccount, PublishPlan, Segment,
+    Asset, AssetSummary, Cue, Job, JobCounts, Media, MediaProbe, Project, PublishAccount,
+    PublishPlan, Segment,
 };
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -112,8 +113,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_plan_media_platform_account
     ON publish_plan(media_id, platform, account);
 "#;
 
+/// v7：用户自备素材库。
+const SCHEMA_V7: &str = r#"
+CREATE TABLE IF NOT EXISTS asset (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    path        TEXT    NOT NULL,
+    category    TEXT    NOT NULL DEFAULT '',
+    tags        TEXT    NOT NULL DEFAULT '',
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    size_bytes  INTEGER NOT NULL DEFAULT 0,
+    meta        TEXT    NOT NULL DEFAULT '',
+    note        TEXT    NOT NULL DEFAULT '',
+    created_at  TEXT    NOT NULL,
+    updated_at  TEXT    NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_path ON asset(path);
+CREATE INDEX IF NOT EXISTS idx_asset_kind ON asset(kind, category, name);
+"#;
+
 /// 当前 schema 版本。加表/加列时递增，并在 `migrate` 里补一段。
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
@@ -146,6 +167,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     }
     if version < 6 {
         conn.execute_batch(SCHEMA_V6)?;
+    }
+    if version < 7 {
+        conn.execute_batch(SCHEMA_V7)?;
     }
     if version < SCHEMA_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -610,6 +634,146 @@ pub fn list_publish_accounts(conn: &Connection) -> AppResult<Vec<PublishAccount>
         out.push(item?);
     }
     Ok(out)
+}
+
+// ---------- asset（用户自备素材库） ----------
+
+const ASSET_COLUMNS: &str = "id, kind, name, path, category, tags, duration_ms, size_bytes, \
+                             meta, note, created_at, updated_at";
+
+fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
+    Ok(Asset {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        name: row.get(2)?,
+        path: row.get(3)?,
+        category: row.get(4)?,
+        tags: row.get(5)?,
+        duration_ms: row.get(6)?,
+        size_bytes: row.get(7)?,
+        meta: row.get(8)?,
+        note: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+/// 按路径去重：同一个文件重复导入是更新，不是新增。
+pub fn upsert_asset(conn: &Connection, asset: &Asset) -> AppResult<Asset> {
+    let now = now();
+    conn.execute(
+        "INSERT INTO asset(kind, name, path, category, tags, duration_ms, size_bytes, meta, note,
+                           created_at, updated_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+         ON CONFLICT(path) DO UPDATE SET
+             kind        = excluded.kind,
+             name        = excluded.name,
+             category    = excluded.category,
+             tags        = excluded.tags,
+             duration_ms = excluded.duration_ms,
+             size_bytes  = excluded.size_bytes,
+             meta        = excluded.meta,
+             note        = excluded.note,
+             updated_at  = excluded.updated_at",
+        params![
+            asset.kind,
+            asset.name,
+            asset.path,
+            asset.category,
+            asset.tags,
+            asset.duration_ms,
+            asset.size_bytes,
+            asset.meta,
+            asset.note,
+            now
+        ],
+    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ASSET_COLUMNS} FROM asset WHERE path = ?1"
+    ))?;
+    let mut rows = stmt.query(params![asset.path])?;
+    match rows.next()? {
+        Some(row) => Ok(row_to_asset(row)?),
+        None => Err(crate::error::AppError::Msg(
+            "保存素材失败：写回后读不到".into(),
+        )),
+    }
+}
+
+pub fn list_assets(conn: &Connection, kind: Option<&str>) -> AppResult<Vec<Asset>> {
+    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = match kind {
+        Some(k) => (
+            format!(
+                "SELECT {ASSET_COLUMNS} FROM asset WHERE kind = ?1
+                 ORDER BY category ASC, name ASC"
+            ),
+            vec![Box::new(k.to_string())],
+        ),
+        None => (
+            format!(
+                "SELECT {ASSET_COLUMNS} FROM asset ORDER BY kind ASC, category ASC, name ASC"
+            ),
+            vec![],
+        ),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(refs.as_slice(), row_to_asset)?;
+    let mut out = Vec::new();
+    for item in rows {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
+pub fn get_asset(conn: &Connection, id: i64) -> AppResult<Asset> {
+    let asset = conn.query_row(
+        &format!("SELECT {ASSET_COLUMNS} FROM asset WHERE id = ?1"),
+        params![id],
+        row_to_asset,
+    )?;
+    Ok(asset)
+}
+
+/// 只改用户可编辑的字段（名称/分类/标签/备注），路径与大小由导入决定。
+pub fn update_asset(conn: &Connection, id: i64, name: &str, category: &str, tags: &str, note: &str) -> AppResult<Asset> {
+    let changed = conn.execute(
+        "UPDATE asset SET name = ?2, category = ?3, tags = ?4, note = ?5, updated_at = ?6 WHERE id = ?1",
+        params![id, name, category, tags, note, now()],
+    )?;
+    if changed == 0 {
+        return Err(crate::error::AppError::Msg("这条素材不存在".into()));
+    }
+    get_asset(conn, id)
+}
+
+/// 从库里移除记录。**不会删磁盘上的文件** —— 那是用户自己的素材。
+pub fn delete_asset(conn: &Connection, id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM asset WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn asset_summary(conn: &Connection) -> AppResult<AssetSummary> {
+    let mut summary = AssetSummary::default();
+    let mut stmt = conn.prepare("SELECT kind, COUNT(*), COALESCE(SUM(size_bytes), 0) FROM asset GROUP BY kind")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    for item in rows {
+        let (kind, count, bytes) = item?;
+        summary.total += count;
+        summary.total_bytes += bytes;
+        match kind.as_str() {
+            "audio" => summary.audio = count,
+            "lut" => summary.lut = count,
+            _ => {}
+        }
+    }
+    Ok(summary)
 }
 
 // ---------- job（任务队列） ----------
@@ -1266,5 +1430,109 @@ mod tests {
         assert_eq!(all[0].title, "老标题");
         assert_eq!(all[0].status, "published");
         assert_eq!(all[0].account, "", "新列默认空，可由上层归一到默认账号");
+    }
+
+    fn asset(kind: &str, name: &str, path: &str, bytes: i64) -> Asset {
+        Asset {
+            id: 0,
+            kind: kind.to_string(),
+            name: name.to_string(),
+            path: path.to_string(),
+            category: String::new(),
+            tags: String::new(),
+            duration_ms: 0,
+            size_bytes: bytes,
+            meta: String::new(),
+            note: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn assets_dedupe_by_path() {
+        let conn = mem();
+        let first = upsert_asset(&conn, &asset("audio", "提示音", "E:/sfx/a.mp3", 100)).unwrap();
+        assert!(first.id > 0);
+
+        // 同一个路径再导一次是更新，不是新增
+        let again = upsert_asset(&conn, &asset("audio", "提示音改名", "E:/sfx/a.mp3", 200)).unwrap();
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.name, "提示音改名");
+        assert_eq!(again.size_bytes, 200);
+        assert_eq!(list_assets(&conn, None).unwrap().len(), 1);
+
+        upsert_asset(&conn, &asset("lut", "冷调", "E:/luts/cool.cube", 3000)).unwrap();
+        assert_eq!(list_assets(&conn, None).unwrap().len(), 2);
+        assert_eq!(list_assets(&conn, Some("audio")).unwrap().len(), 1);
+        assert_eq!(list_assets(&conn, Some("lut")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn asset_summary_groups_by_kind() {
+        let conn = mem();
+        upsert_asset(&conn, &asset("audio", "a", "E:/s/a.mp3", 100)).unwrap();
+        upsert_asset(&conn, &asset("audio", "b", "E:/s/b.mp3", 200)).unwrap();
+        upsert_asset(&conn, &asset("lut", "c", "E:/l/c.cube", 400)).unwrap();
+
+        let sum = asset_summary(&conn).unwrap();
+        assert_eq!(sum.audio, 2);
+        assert_eq!(sum.lut, 1);
+        assert_eq!(sum.total, 3);
+        assert_eq!(sum.total_bytes, 700);
+    }
+
+    #[test]
+    fn asset_edits_and_removal_do_not_touch_the_disk() {
+        let conn = mem();
+        let dir = std::env::temp_dir().join("dramadist_asset_keep");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("keep.mp3");
+        std::fs::write(&file, b"pretend audio").unwrap();
+        let path = file.to_string_lossy().to_string();
+
+        let saved = upsert_asset(&conn, &asset("audio", "原名", &path, 13)).unwrap();
+        let edited = update_asset(&conn, saved.id, "新名", "分类", "标签", "备注").unwrap();
+        assert_eq!(edited.name, "新名");
+        assert_eq!(edited.category, "分类");
+        assert_eq!(edited.tags, "标签");
+        assert_eq!(edited.note, "备注");
+        assert_eq!(edited.path, path, "改元信息不该动路径");
+        assert_eq!(edited.kind, "audio", "也不该动类型");
+
+        delete_asset(&conn, saved.id).unwrap();
+        assert!(get_asset(&conn, saved.id).is_err());
+        assert!(file.is_file(), "从库里移除不能删用户的文件");
+
+        // 不存在的记录要报错，而不是静默成功
+        assert!(update_asset(&conn, 9999, "x", "", "", "").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v6_database_gains_asset_table_without_losing_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.execute_batch(SCHEMA_V5).unwrap();
+        conn.execute_batch(SCHEMA_V6).unwrap();
+        conn.execute_batch("PRAGMA user_version = 6;").unwrap();
+
+        let p = create_project(&conn, "旧工程", "").unwrap();
+        add_media(&conn, p.id, "E:/a.mp4", "a.mp4", &MediaProbe::default()).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(list_projects(&conn).unwrap()[0].name, "旧工程");
+        assert_eq!(list_media(&conn, p.id).unwrap().len(), 1);
+        assert_eq!(asset_summary(&conn).unwrap().total, 0, "新表可用");
     }
 }

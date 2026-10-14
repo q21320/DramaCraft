@@ -136,10 +136,10 @@ pub fn to_ffmpeg_color(raw: &str) -> Option<String> {
     Some(format!("0x{}", hex.to_uppercase()))
 }
 
-/// 字体路径在 filtergraph 里的写法：反斜杠转正斜杠、冒号转义、整体加引号。
+/// 字体路径在 filtergraph 里的写法。统一走 [`crate::proc::filter_path`]，
+/// 免得这里一套转义、别处又一套。
 pub fn fontfile_expr(path: &str) -> String {
-    let escaped = path.replace('\\', "/").replace(':', "\\:");
-    format!("'{escaped}'")
+    crate::proc::filter_path(path)
 }
 
 /// 水平位置的表达式。用 drawtext 自带的 `text_w`，避免自己算字宽。

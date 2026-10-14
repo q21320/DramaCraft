@@ -184,6 +184,37 @@ pub fn run_json_worker(
     Ok(value)
 }
 
+/// 把文件路径写进 filtergraph 参数的写法，Windows 路径尤其需要：
+/// 反斜杠转正斜杠、冒号转义、单引号按 ffmpeg 的规矩断开再转义，最后整体加引号。
+pub fn filter_path(path: &str) -> String {
+    let escaped = path
+        .replace('\\', "/")
+        .replace(':', "\\:")
+        .replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
+
+#[cfg(test)]
+mod filter_path_tests {
+    use super::filter_path;
+
+    #[test]
+    fn escapes_windows_paths_for_filtergraphs() {
+        assert_eq!(
+            filter_path("C:/Windows/Fonts/simfang.ttf"),
+            "'C\\:/Windows/Fonts/simfang.ttf'"
+        );
+        assert_eq!(filter_path(r"C:\luts\my.cube"), "'C\\:/luts/my.cube'");
+        assert_eq!(filter_path("a/b.cube"), "'a/b.cube'");
+    }
+
+    #[test]
+    fn single_quotes_are_escaped_not_left_to_break_the_graph() {
+        // 直接塞进去会让引号提前闭合，必须写成 '\''
+        assert_eq!(filter_path("a'b.cube"), "'a'\\''b.cube'");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

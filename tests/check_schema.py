@@ -7,8 +7,22 @@ import os
 import sqlite3
 import sys
 
-EXPECTED_VERSION = 6
-EXPECTED_TABLES = {"project", "media", "segment", "cue", "setting", "publish_plan", "job"}
+EXPECTED_VERSION = 7
+EXPECTED_TABLES = {"project", "media", "segment", "cue", "setting", "publish_plan", "job", "asset"}
+EXPECTED_ASSET_COLUMNS = {
+    "id",
+    "kind",
+    "name",
+    "path",
+    "category",
+    "tags",
+    "duration_ms",
+    "size_bytes",
+    "meta",
+    "note",
+    "created_at",
+    "updated_at",
+}
 EXPECTED_PUBLISH_PLAN_COLUMNS = {
     "id",
     "media_id",
@@ -79,6 +93,12 @@ print("publish_plan columns =", sorted(publish_columns))
 missing_publish = EXPECTED_PUBLISH_PLAN_COLUMNS - publish_columns
 if missing_publish:
     problems.append(f"publish_plan 缺少列：{sorted(missing_publish)}")
+
+asset_columns = {r[1] for r in con.execute("PRAGMA table_info(asset)")}
+print("asset columns =", sorted(asset_columns))
+missing_asset = EXPECTED_ASSET_COLUMNS - asset_columns
+if missing_asset:
+    problems.append(f"asset 缺少列：{sorted(missing_asset)}")
 
 if problems:
     for p in problems:

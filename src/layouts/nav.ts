@@ -77,6 +77,12 @@ export const navItems: NavItem[] = [
     subtitle: "模板图填数据，一键出可直接提交的证明图",
   },
   {
+    key: "asset",
+    path: "/asset",
+    label: "素材库",
+    subtitle: "导入你自己的音效 / BGM / LUT，不内置任何第三方素材",
+  },
+  {
     key: "settings",
     path: "/settings",
     label: "设置",

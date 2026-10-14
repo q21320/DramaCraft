@@ -4,6 +4,7 @@
 //! 重活一律走子进程，主进程只负责编排、落库、上报进度。
 
 mod asr;
+mod asset;
 mod cloud;
 mod commands;
 mod db;
@@ -126,6 +127,15 @@ pub fn run() {
             commands::proof_save_layout,
             commands::proof_preview,
             commands::proof_render,
+            commands::asset_kinds,
+            commands::scan_asset_dir,
+            commands::import_assets,
+            commands::list_assets,
+            commands::update_asset,
+            commands::delete_asset,
+            commands::asset_summary,
+            commands::apply_bgm,
+            commands::apply_lut,
             commands::scan_series_dir,
             commands::cluster_series_by_intro,
             commands::detect_episodes,

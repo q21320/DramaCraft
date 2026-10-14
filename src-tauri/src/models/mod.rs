@@ -236,6 +236,92 @@ pub struct PlatformOption {
     pub note: String,
 }
 
+// ---------------- 用户自备素材库 ----------------
+
+/// 素材库里的一条素材。**全部由用户导入**，程序不内置任何第三方素材。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Asset {
+    pub id: i64,
+    /// audio | lut
+    pub kind: String,
+    pub name: String,
+    pub path: String,
+    pub category: String,
+    /// 逗号分隔
+    pub tags: String,
+    /// 音频时长；LUT 为 0
+    pub duration_ms: i64,
+    pub size_bytes: i64,
+    /// 额外信息（LUT 的尺寸等），JSON 字符串
+    pub meta: String,
+    pub note: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetKindOption {
+    pub key: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetImportReport {
+    pub imported: i64,
+    /// 被跳过的文件及原因 —— 不静默丢弃
+    pub skipped: Vec<String>,
+    pub summary: AssetSummary,
+}
+
+/// 导入前扫描到的文件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredAsset {
+    pub path: String,
+    pub file_name: String,
+    pub kind: String,
+    pub size_bytes: i64,
+    /// 扫描时就发现的问题（例如 .cube 被截断），导入时同样会拦下
+    pub problem: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetSummary {
+    pub audio: i64,
+    pub lut: i64,
+    pub total: i64,
+    pub total_bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetApplyReport {
+    pub out_path: String,
+    pub size_bytes: i64,
+    pub duration_ms: i64,
+    pub filter: String,
+    pub warnings: Vec<String>,
+}
+
+/// `.cube` 文件头解析结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CubeInfo {
+    pub title: String,
+    /// 3D LUT 的边长；1D LUT 时为 0
+    pub size: i64,
+    /// 1D LUT 的长度；3D 时为 0
+    pub size_1d: i64,
+    pub domain_min: Vec<f64>,
+    pub domain_max: Vec<f64>,
+    pub data_lines: i64,
+    pub expected_lines: i64,
+}
+
 // ---------------- 证明材料 ----------------
 
 /// 模板图上的一个字段
