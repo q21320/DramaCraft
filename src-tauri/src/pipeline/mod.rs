@@ -273,6 +273,13 @@ pub fn start_pipeline(
         )?;
         drama_ids.push(drama_id);
 
+        // 每集单独一个子目录。
+        //
+        // 这不是美观问题：切片是按「这一集的第几片」编号的（001、002…），
+        // 16 集共用一个目录就会互相覆盖 —— 真实素材那轮 27 片只剩最后 3 片，
+        // 21 片被后来的覆盖掉了，而数据库里还显示"有"（路径确实存在，
+        // 只是内容是别人的）。
+        let mut media_groups: Vec<(i64, String)> = Vec::new();
         let mut media_ids: Vec<i64> = Vec::new();
         for episode in &drama.episodes {
             let path = PathBuf::from(&episode.path);
@@ -286,6 +293,7 @@ pub fn start_pipeline(
             let record =
                 crate::db::add_media(conn, project.id, &episode.path, &episode.file_name, &probe)?;
             media_ids.push(record.id);
+            media_groups.push((record.id, safe_dir_name(&episode.file_name)));
             imported += 1;
         }
 
@@ -295,8 +303,9 @@ pub fn start_pipeline(
         }
 
         for stage in stages {
-            for media_id in &media_ids {
-                let Some(payload) = stage_payload(stage, *media_id, &drama_out, slice_ms, model)?
+            for (media_id, group) in &media_groups {
+                let Some(payload) =
+                    stage_payload(stage, *media_id, &drama_out, slice_ms, model, group)?
                 else {
                     continue;
                 };
@@ -335,14 +344,46 @@ pub fn stage_to_job_kind(stage: &str) -> &'static str {
     }
 }
 
+/// 把文件名变成一个能当目录名的字符串。
+///
+/// 去掉扩展名，并把 Windows 不允许出现在路径里的字符换掉。
+fn safe_dir_name(file_name: &str) -> String {
+    let stem = Path::new(file_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_name.to_string());
+    let cleaned: String = stem
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            other => other,
+        })
+        .collect();
+    // 首尾的点都去掉：结尾的点 Windows 会丢，开头的点在 Unix 上会变隐藏目录，
+    // 两边都不是我们想要的。
+    // 注意 `.mp4` 这种情况 —— Rust 把它当成「隐藏文件、没有扩展名」，
+    // file_stem 原样返回 `.mp4`，去掉点之后就空了，落到「未命名」。
+    let trimmed = cleaned.trim().trim_matches('.').trim().to_string();
+    if trimmed.is_empty() {
+        "未命名".to_string()
+    } else {
+        trimmed
+    }
+}
+
 /// 某一步在某一集上要排什么任务。返回 `None` 表示这一步这集跳过。
+///
+/// `group` 是这一集的目录名 —— **每一步的输出都要放进它自己的子目录**。
+/// 少了这个，同一部剧的每一集都会往同一个目录里写同名文件，互相覆盖。
 pub fn stage_payload(
     stage: &str,
     media_id: i64,
     out_dir: &Path,
     slice_ms: i64,
     model: &str,
+    group: &str,
 ) -> AppResult<Option<String>> {
+    let here = out_dir.join(group);
     let value = match stage {
         "slice" => serde_json::json!({
             "mediaId": media_id,
@@ -351,7 +392,9 @@ pub fn stage_payload(
             // 变体名是 everySeconds。写错不会当场报，而是排进队列、
             // 跑到它的时候才炸 —— 真实素材那轮就是这么栽的。
             "mode": { "mode": "everySeconds", "seconds": slice_ms as f64 / 1000.0 },
-            "outDir": out_dir.join("切片").to_string_lossy(),
+            // 每集一个子目录：切片按「这一集的第几片」编号，
+            // 共用目录会让 16 集互相覆盖
+            "outDir": here.join("切片").to_string_lossy(),
             // 切出来要能直接上传：源素材常是 HEVC，而平台要 H.264
             "compatible": true,
         }),
@@ -368,7 +411,9 @@ pub fn stage_payload(
         }),
         "export" => serde_json::json!({
             "mediaId": media_id,
-            "outPath": out_dir.join("成片").join(format!("{media_id}.mp4")).to_string_lossy(),
+            // 原来用 {media_id}.mp4 当文件名 —— 对用户毫无意义，
+            // 而且换一次运行就换一批名字。用剧集名更好认。
+            "outPath": here.join(format!("{group}_成片.mp4")).to_string_lossy(),
             "burnSubtitles": true,
             "aspect": { "mode": "verticalBlur" },
             "startMs": 0,
@@ -380,7 +425,7 @@ pub fn stage_payload(
             "mediaId": media_id,
             "platform": "douyin",
             "account": "默认账号",
-            "outRoot": out_dir.join("发布包").to_string_lossy(),
+            "outRoot": here.join("发布包").to_string_lossy(),
         }),
         // 证明图要有模板和字段坐标才谈得上生成，没配就跳过 ——
         // 排一个注定失败的任务，只会让整条流水线卡在最后一步
@@ -922,6 +967,74 @@ mod tests {
     }
 
     #[test]
+    fn each_episode_writes_into_its_own_folder() {
+        // 这是真实素材上踩到的坑：16 集共用一个「切片」目录，
+        // 而切片是按「这一集的第几片」编号的（001、002…），
+        // 于是后面的集把前面的全覆盖了 —— 27 片只剩最后 3 片，
+        // 数据库里还显示"有"（路径确实存在，内容却是别人的）。
+        let out = Path::new("D:/二创/某剧");
+        let a = stage_payload("slice", 1, out, 40_000, "small", "某剧-第01集")
+            .unwrap()
+            .unwrap();
+        let b = stage_payload("slice", 2, out, 40_000, "small", "某剧-第02集")
+            .unwrap()
+            .unwrap();
+        let dir_a: serde_json::Value = serde_json::from_str(&a).unwrap();
+        let dir_b: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_ne!(
+            dir_a["outDir"], dir_b["outDir"],
+            "两集的输出目录必须不同，否则会互相覆盖"
+        );
+        assert!(
+            dir_a["outDir"].as_str().unwrap().contains("第01集"),
+            "{}",
+            dir_a["outDir"]
+        );
+        assert!(
+            dir_b["outDir"].as_str().unwrap().contains("第02集"),
+            "{}",
+            dir_b["outDir"]
+        );
+    }
+
+    #[test]
+    fn all_stages_of_one_episode_stay_under_its_own_folder() {
+        // 切片 / 导出 / 发布包 都要落在这一集自己的目录下
+        let out = Path::new("D:/二创/某剧");
+        let group = "某剧-第01集";
+        for stage in ["slice", "export", "package"] {
+            let raw = stage_payload(stage, 1, out, 40_000, "small", group)
+                .unwrap()
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let key = if stage == "slice" { "outDir" } else if stage == "export" { "outPath" } else { "outRoot" };
+            let path = v[key].as_str().unwrap();
+            assert!(
+                path.contains(group),
+                "{stage} 的输出没有落在这一集自己的目录下：{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_names_are_made_safe_for_directories() {
+        assert_eq!(safe_dir_name("某剧-第01集.mp4"), "某剧-第01集");
+        // `.mp4`：Rust 把它当「隐藏文件、没有扩展名」，file_stem 原样返回。
+        // 去掉前导点后剩 `mp4`，是个能用的目录名 —— 不该退化成「未命名」。
+        assert_eq!(safe_dir_name(".mp4"), "mp4");
+        // 全是点才真的没名字可用：`...mp4` 的 file_stem 是 `..`
+        assert_eq!(safe_dir_name("...mp4"), "未命名");
+        // 结尾的点在 Windows 上会被丢掉
+        assert_eq!(safe_dir_name("name...mp4"), "name");
+        // 非法字符换成下划线
+        assert_eq!(safe_dir_name(r#"a"b|c?.mp4"#), "a_b_c_");
+        // 注意入参**永远是裸文件名**（来自 SourceEpisode::file_name），
+        // 不会是路径。所以 Path::file_stem 把 / 当分隔符这件事在实际调用里
+        // 不会发生 —— 这里把这个事实写下来，免得以后有人误传路径进来。
+        assert_eq!(safe_dir_name("a/b.mp4"), "b");
+    }
+
+    #[test]
     fn every_stage_payload_actually_parses() {
         // 这条测试是为了防住一类坑：payload 的**字段名或枚举变体写错**，
         // 编译期查不出来，入队也不报，要跑到那个任务才炸。
@@ -929,7 +1042,7 @@ mod tests {
         // 32 个切片任务全废，还连累了后面的画面处理。
         let mut checked = 0;
         for (stage, _, _, _) in STAGES {
-            let payload = stage_payload(stage, 7, Path::new("E:/out"), 40_000, "small")
+            let payload = stage_payload(stage, 7, Path::new("E:/out"), 40_000, "small", "第01集")
                 .unwrap_or_else(|e| panic!("{stage} 生成参数失败：{e}"));
             let Some(payload) = payload else {
                 continue; // 这一步没配就不排任务，正常
@@ -1086,13 +1199,13 @@ mod tests {
     fn proof_stage_is_skipped_rather_than_queued_to_fail() {
         // 证明图要有模板和字段坐标才谈得上生成，没配就跳过 ——
         // 排一个注定失败的任务只会让流水线卡在最后一步
-        let got = stage_payload("proof", 1, Path::new("E:/o"), 10_000, "").unwrap();
+        let got = stage_payload("proof", 1, Path::new("E:/o"), 10_000, "", "第01集").unwrap();
         assert!(got.is_none());
     }
 
     #[test]
     fn unknown_stage_is_rejected() {
-        let err = stage_payload("nonsense", 1, Path::new("E:/o"), 10_000, "")
+        let err = stage_payload("nonsense", 1, Path::new("E:/o"), 10_000, "", "第01集")
             .unwrap_err()
             .to_string();
         assert!(err.contains("不认识的步骤"), "{err}");
