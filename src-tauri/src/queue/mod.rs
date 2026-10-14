@@ -383,13 +383,29 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             // 失败时整部剧标失败 —— 一步没成，后面的步骤继续跑没有意义。
             if let Some(drama_id) = job.pipeline_drama_id {
                 match &outcome {
-                    Ok(summary) => db::update_pipeline_drama(
-                        &conn,
-                        drama_id,
-                        &job.kind,
-                        "running",
-                        &format!("{}：{}", kind_label(&job.kind), crate::proc::tail(summary)),
-                    )?,
+                    Ok(summary) => {
+                        db::update_pipeline_drama(
+                            &conn,
+                            drama_id,
+                            &job.kind,
+                            "running",
+                            &format!("{}：{}", kind_label(&job.kind), crate::proc::tail(summary)),
+                        )?;
+                        // 这部剧的任务全跑完了吗？跑完就标成完成。
+                        //
+                        // 少了这一步，剧目会永远停在「进行中」——
+                        // 真实素材那轮 64 个任务两个多小时前就跑完了，
+                        // 界面上却还在转，用户以为卡死。
+                        if db::count_pending_jobs_of_drama(&conn, drama_id)? == 0 {
+                            db::update_pipeline_drama(
+                                &conn,
+                                drama_id,
+                                &job.kind,
+                                "done",
+                                "全部步骤已完成",
+                            )?;
+                        }
+                    }
                     Err(e) => {
                         db::update_pipeline_drama(
                             &conn,

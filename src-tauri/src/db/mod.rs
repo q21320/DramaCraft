@@ -1,4 +1,4 @@
-﻿//! SQLite 存取层。
+//! SQLite 存取层。
 //!
 //! 迁移策略：只前进不回退，靠 `PRAGMA user_version` 判断。旧库能直接打开。
 
@@ -1122,6 +1122,20 @@ pub fn cancel_jobs_of_drama(conn: &Connection, drama_id: i64) -> AppResult<i64> 
         params![now(), drama_id],
     )?;
     Ok(changed as i64)
+}
+
+/// 某部剧还有多少没跑的任务。
+///
+/// 用来判断「这部剧做完了没有」—— 任务全跑完就该把剧目标成完成，
+/// 否则它会永远停在「进行中」。真实素材那轮就是这样：
+/// 64 个任务早在两小时前就跑完了，界面上却显示还在跑，用户以为卡死。
+pub fn count_pending_jobs_of_drama(conn: &Connection, drama_id: i64) -> AppResult<i64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM job WHERE pipeline_drama_id = ?1 AND status IN ('pending', 'running')",
+        params![drama_id],
+        |row| row.get(0),
+    )?;
+    Ok(n)
 }
 
 /// 清掉已结束的任务（done / failed / canceled），返回删除条数。
