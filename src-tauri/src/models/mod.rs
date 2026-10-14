@@ -706,6 +706,9 @@ pub struct ToolReport {
     pub available: bool,
     pub version: String,
     pub detail: String,
+    /// 是否来自随程序分发的内置目录
+    #[serde(default)]
+    pub bundled: bool,
 }
 
 // ---------------- ASR ----------------

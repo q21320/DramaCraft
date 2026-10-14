@@ -6,3 +6,9 @@ src-tauri/gen/schemas/
 *.local
 .DS_Store
 Thumbs.db
+
+# 内置的 FFmpeg 二进制（约 158 MB，不进版本库）
+# 用 scripts/fetch-ffmpeg.ps1 获取，说明见 src-tauri/resources/bin/README.txt
+src-tauri/resources/bin/*.exe
+src-tauri/resources/bin/COPYING.GPLv3.txt
+.cache/

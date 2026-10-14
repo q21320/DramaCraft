@@ -57,6 +57,8 @@ export interface ToolReport {
   available: boolean;
   version: string;
   detail: string;
+  /** 是否来自随程序分发的内置目录 */
+  bundled: boolean;
 }
 
 /** 某个可选 Python 运行时的能力状态（ASR / OCR / 草稿各自一份，形状相同） */

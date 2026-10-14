@@ -27,6 +27,7 @@ mod verify;
 
 use models::ToolPaths;
 use rusqlite::Connection;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 use tauri::Manager;
@@ -51,6 +52,41 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
+            // 内置二进制：安装后在资源目录下，开发时在源码的 resources/bin 下。
+            // 登记之后 tools::resolve 就会优先用它 —— 用户不必自己装 ffmpeg。
+            let bundled = app
+                .path()
+                .resource_dir()
+                .ok()
+                .map(|dir| dir.join("resources").join(tools::BUNDLED_DIR))
+                .filter(|dir| dir.is_dir())
+                .or_else(|| {
+                    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("resources")
+                        .join(tools::BUNDLED_DIR);
+                    dev.is_dir().then_some(dev)
+                });
+            if let Some(dir) = &bundled {
+                eprintln!("DramaDist: 使用内置工具目录 {}", dir.display());
+            }
+            tools::set_bundled_dir(bundled);
+
+            // 启动时把解析结果打出来：出问题时第一时间就知道用的是哪一份
+            for name in ["ffmpeg", "ffprobe"] {
+                match tools::resolve("", name) {
+                    Some(path) => eprintln!(
+                        "DramaDist: {name} = {}（{}）",
+                        path.display(),
+                        if tools::is_bundled(&path) {
+                            "内置"
+                        } else {
+                            "外部"
+                        }
+                    ),
+                    None => eprintln!("DramaDist: 没找到 {name}"),
+                }
+            }
+
             let conn = db::open(&data_dir.join("dramadist.db"))?;
 
             // 断点续跑第一步：进程被杀后库里会留下假的 running —— 没有人在跑它。

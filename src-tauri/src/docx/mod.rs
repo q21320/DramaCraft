@@ -617,7 +617,7 @@ mod tests {
                 return Some(path);
             }
         }
-        crate::tools::which("python3").or_else(|| crate::tools::which("python"))
+        crate::tools::resolve("", "python3").or_else(|| crate::tools::resolve("", "python"))
     }
 
     // ---------------- CRC32 ----------------

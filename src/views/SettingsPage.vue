@@ -107,24 +107,25 @@ onMounted(() => {
   <div class="dd-card">
     <div class="dd-card-title">外部工具</div>
     <div class="dd-card-desc">
-      留空则自动在 PATH 与常见位置查找。保存后立即重新检测可用性。
+      ffmpeg / ffprobe 已随程序内置，装好即可用，无需自己配环境。
+      只有想换用别的版本时，才需要在这里填路径（填了就以你的为准）。
     </div>
 
     <div class="dd-row" style="margin-bottom: 10px">
       <span class="dd-muted" style="width: 70px">ffmpeg</span>
-      <n-input v-model:value="draft.ffmpeg" size="small" style="width: 480px" placeholder="留空自动查找" />
+      <n-input v-model:value="draft.ffmpeg" size="small" style="width: 480px" placeholder="留空即用内置版本" />
       <n-button size="small" @click="pick('ffmpeg')">选择</n-button>
     </div>
 
     <div class="dd-row" style="margin-bottom: 10px">
       <span class="dd-muted" style="width: 70px">ffprobe</span>
-      <n-input v-model:value="draft.ffprobe" size="small" style="width: 480px" placeholder="留空自动查找" />
+      <n-input v-model:value="draft.ffprobe" size="small" style="width: 480px" placeholder="留空即用内置版本" />
       <n-button size="small" @click="pick('ffprobe')">选择</n-button>
     </div>
 
     <div class="dd-row" style="margin-bottom: 14px">
       <span class="dd-muted" style="width: 70px">Python</span>
-      <n-input v-model:value="draft.python" size="small" style="width: 480px" placeholder="用于 ASR，可留空" />
+      <n-input v-model:value="draft.python" size="small" style="width: 480px" placeholder="用于 ASR / OCR，可留空" />
       <n-button size="small" @click="pick('python')">选择</n-button>
     </div>
 
@@ -149,7 +150,10 @@ onMounted(() => {
       </thead>
       <tbody>
         <tr v-for="r in store.toolReports" :key="r.name">
-          <td>{{ r.name }}</td>
+          <td>
+            {{ r.name }}
+            <n-tag v-if="r.bundled" size="tiny" type="info" :bordered="false">内置</n-tag>
+          </td>
           <td>
             <n-tag size="tiny" :type="r.available ? 'success' : 'error'" :bordered="false">
               {{ r.available ? "可用" : "不可用" }}
@@ -285,8 +289,23 @@ pip install pyJianYingDraft         # 剪映草稿导出</pre>
     </table>
 
     <n-alert type="info" style="margin-top: 14px" title="合规提示">
-      本项目只调用外部 ffmpeg，不内嵌其二进制。请自行选择合规构建（启用 x264/x265 的 GPL
-      构建在分发时需遵守 GPL）。请勿把第三方商业软件自带的二进制、素材或模板复制进本项目。
+      <div class="dd-wrap">
+        <b>内置了 FFmpeg</b>（{{ store.toolReports.find((r) => r.name === "ffmpeg")?.version || "版本见上表" }}），
+        它是 GPLv3 授权的自由软件，随程序一起分发，所以你不必自己装。
+      </div>
+      <div class="dd-wrap" style="margin-top: 6px">
+        <b>自己用：没有任何影响。</b>GPL 的义务只在「分发」时触发。
+      </div>
+      <div class="dd-wrap" style="margin-top: 6px">
+        <b>要把这个软件发给别人：</b>包含 GPL 组件的软件整体要按 GPL 分发
+        —— 需随附对应源码、保留版权与许可证、不得加更严的限制。
+        换用 LGPL 构建或改为外部指定路径都可以绕开，见
+        <span class="dd-mono">resources/bin/README.txt</span>。
+      </div>
+      <div class="dd-wrap" style="margin-top: 6px">
+        <b>本项目不含任何第三方素材</b>：音效、BGM、LUT 全部由使用者自行导入，
+        证明材料的模板图与字体也用使用者自己的。
+      </div>
     </n-alert>
   </div>
 </template>
