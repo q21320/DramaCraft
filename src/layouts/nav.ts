@@ -71,6 +71,12 @@ export const navItems: NavItem[] = [
     subtitle: "把长任务排成一队顺序跑，关掉应用再打开会接着跑",
   },
   {
+    key: "proof",
+    path: "/proof",
+    label: "证明材料",
+    subtitle: "模板图填数据，一键出可直接提交的证明图",
+  },
+  {
     key: "settings",
     path: "/settings",
     label: "设置",

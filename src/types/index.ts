@@ -66,6 +66,55 @@ export interface RuntimeStatus {
   detail: string;
 }
 
+// ---------------- 证明材料 ----------------
+
+export interface ProofField {
+  key: string;
+  label: string;
+  /** 先擦除的矩形 [x1,y1,x2,y2]；null 表示不擦除 */
+  eraseRect: number[] | null;
+  eraseColor: string;
+  /** 文字绘制区域 [x,y,w,h] */
+  boxRect: number[];
+  fontSize: number;
+  minFontSize: number;
+  color: string;
+  align: string;
+  valign: string;
+  wrap: boolean;
+  lineSpacing: number;
+}
+
+export interface ProofLayout {
+  template: string;
+  imageSize: number[];
+  fontPath: string;
+  fields: ProofField[];
+}
+
+export interface ProofFieldPreview {
+  key: string;
+  label: string;
+  lines: string[];
+  fontSize: number;
+  shrunk: boolean;
+  overflow: boolean;
+}
+
+export interface ProofPreview {
+  fields: ProofFieldPreview[];
+  filter: string;
+  warnings: string[];
+}
+
+export interface ProofRenderReport {
+  outPath: string;
+  sizeBytes: number;
+  fieldCount: number;
+  filter: string;
+  warnings: string[];
+}
+
 // ---------------- 云端字幕（用户自备 Key） ----------------
 
 /** 前端能看到的云端配置：**永远不含完整 API Key** */

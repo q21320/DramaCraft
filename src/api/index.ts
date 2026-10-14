@@ -17,6 +17,9 @@ import type {
   OcrReport,
   PlatformOption,
   Project,
+  ProofLayout,
+  ProofPreview,
+  ProofRenderReport,
   PublishAccount,
   PublishPackageReport,
   PublishPlan,
@@ -103,6 +106,16 @@ export const api = {
   cloudTest: () => call<CloudTestResult>("cloud_test"),
   cloudTranscribe: (mediaId: number, overwrite: boolean) =>
     call<CloudTranscribeReport>("cloud_transcribe", { mediaId, overwrite }),
+
+  // 证明材料
+  proofDefaultLayout: () => call<ProofLayout>("proof_default_layout"),
+  proofLoadLayout: (path: string) => call<ProofLayout>("proof_load_layout", { path }),
+  proofSaveLayout: (path: string, layout: ProofLayout) =>
+    call<void>("proof_save_layout", { path, layout }),
+  proofPreview: (layout: ProofLayout, values: Record<string, string>) =>
+    call<ProofPreview>("proof_preview", { layout, values }),
+  proofRender: (layout: ProofLayout, values: Record<string, string>, outPath: string) =>
+    call<ProofRenderReport>("proof_render", { layout, values, outPath }),
 
   // 导出
   exportVideo: (opts: ExportOptions) => call<ExportOutcome>("export_video", { opts }),

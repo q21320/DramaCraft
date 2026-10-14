@@ -5,15 +5,16 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, CloudConfigView, CloudTestResult, CloudTranscribeReport, Cue,
     EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome, Job, Media, OcrFrame,
-    OcrOptions, OcrReport, PlatformOption, Project, PublishAccount, PublishClipEntry,
-    PublishPackageReport, PublishPlan, QueueState, ResplitReport, RuntimeStatus, Segment,
-    SeriesGroup, SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport,
-    VerifyItem, VerifyReport,
+    OcrOptions, OcrReport, PlatformOption, Project, ProofLayout, ProofPreview, ProofRenderReport,
+    PublishAccount, PublishClipEntry, PublishPackageReport, PublishPlan, QueueState, ResplitReport,
+    RuntimeStatus, Segment, SeriesGroup, SliceMode, SlicePlan, ToolPaths, ToolReport,
+    TransformOptions, TransformReport, VerifyItem, VerifyReport,
 };
 use crate::{
-    asr, cloud, export, jy, media, ocr, publish, queue, series, subtitle, tools, transform, verify,
-    AppState,
+    asr, cloud, export, jy, media, ocr, proof, publish, queue, series, subtitle, tools, transform,
+    verify, AppState,
 };
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -1160,6 +1161,53 @@ pub async fn resplit_episodes(
             .collect(),
         total_duration_ms,
     })
+}
+
+// ---------------- 证明材料 ----------------
+
+/// 一份起步布局：三个最常用字段 + 本机能找到的中文字体。
+#[tauri::command]
+pub fn proof_default_layout() -> AppResult<ProofLayout> {
+    Ok(proof::default_layout())
+}
+
+#[tauri::command]
+pub fn proof_load_layout(path: String) -> AppResult<ProofLayout> {
+    proof::load_layout(Path::new(path.trim()))
+}
+
+#[tauri::command]
+pub fn proof_save_layout(path: String, layout: ProofLayout) -> AppResult<()> {
+    proof::save_layout(Path::new(path.trim()), &layout)
+}
+
+/// 只算不跑：先看清每个字段会怎么排、有没有溢出，再决定要不要生成。
+#[tauri::command]
+pub fn proof_preview(
+    layout: ProofLayout,
+    values: HashMap<String, String>,
+) -> AppResult<ProofPreview> {
+    Ok(proof::preview(&layout, &values))
+}
+
+#[tauri::command]
+pub async fn proof_render(
+    state: tauri::State<'_, AppState>,
+    layout: ProofLayout,
+    values: HashMap<String, String>,
+    out_path: String,
+) -> AppResult<ProofRenderReport> {
+    let ffmpeg = {
+        let configured = lock_tools(&state)?.clone();
+        tools::require(&configured.ffmpeg, "ffmpeg")?
+    };
+    let out = PathBuf::from(out_path.trim());
+    if out.as_os_str().is_empty() {
+        return Err(AppError::Msg("请先选择输出路径".into()));
+    }
+    tauri::async_runtime::spawn_blocking(move || proof::render(&ffmpeg, &layout, &values, &out))
+        .await
+        .map_err(|e| AppError::Msg(format!("渲染线程异常终止：{e}")))?
 }
 
 // ---------------- 云端字幕（用户自备 Key） ----------------

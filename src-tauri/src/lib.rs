@@ -14,6 +14,7 @@ mod media;
 mod models;
 mod ocr;
 mod proc;
+mod proof;
 mod publish;
 mod queue;
 mod series;
@@ -120,6 +121,11 @@ pub fn run() {
             commands::save_cloud_config,
             commands::cloud_test,
             commands::cloud_transcribe,
+            commands::proof_default_layout,
+            commands::proof_load_layout,
+            commands::proof_save_layout,
+            commands::proof_preview,
+            commands::proof_render,
             commands::scan_series_dir,
             commands::cluster_series_by_intro,
             commands::detect_episodes,

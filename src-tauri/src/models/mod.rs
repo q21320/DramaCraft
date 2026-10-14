@@ -236,6 +236,85 @@ pub struct PlatformOption {
     pub note: String,
 }
 
+// ---------------- 证明材料 ----------------
+
+/// 模板图上的一个字段
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProofField {
+    /// 取值键，例如 drama_name / episodes / investment
+    pub key: String,
+    /// 界面上显示的名字
+    pub label: String,
+    /// 先擦除的矩形 `[x1, y1, x2, y2]`（模板上的示例文字），可选
+    #[serde(default)]
+    pub erase_rect: Option<Vec<i64>>,
+    /// 擦除用的颜色，默认白色
+    #[serde(default = "default_erase_color")]
+    pub erase_color: String,
+    /// 文字绘制区域 `[x, y, w, h]`
+    pub box_rect: Vec<i64>,
+    pub font_size: i64,
+    pub min_font_size: i64,
+    /// `#RRGGBB`
+    pub color: String,
+    /// left | center | right
+    pub align: String,
+    /// top | center | bottom
+    pub valign: String,
+    /// 是否按区域宽度自动换行
+    pub wrap: bool,
+    /// 行距倍数，1.0 表示不额外加空
+    pub line_spacing: f64,
+}
+
+fn default_erase_color() -> String {
+    "#FFFFFF".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProofLayout {
+    /// 模板图片路径
+    pub template: String,
+    /// 模板尺寸 `[w, h]`，用于界面定位参考
+    pub image_size: Vec<i64>,
+    /// 字体文件路径
+    pub font_path: String,
+    pub fields: Vec<ProofField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProofFieldPreview {
+    pub key: String,
+    pub label: String,
+    pub lines: Vec<String>,
+    pub font_size: i64,
+    /// 是否因为放不下而缩小过字号
+    pub shrunk: bool,
+    /// 区域放不下（缩到最小字号仍然溢出）
+    pub overflow: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProofPreview {
+    pub fields: Vec<ProofFieldPreview>,
+    pub filter: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProofRenderReport {
+    pub out_path: String,
+    pub size_bytes: i64,
+    pub field_count: i64,
+    pub filter: String,
+    pub warnings: Vec<String>,
+}
+
 // ---------------- 云端字幕（用户自备 Key） ----------------
 
 /// 给前端看的云端配置。**永远不含完整 API Key** —— Key 只留在后端。
