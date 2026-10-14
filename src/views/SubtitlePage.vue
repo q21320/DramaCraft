@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import {
   NAlert,
   NButton,
+  NCheckbox,
   NInput,
   NInputNumber,
   NSelect,
@@ -28,6 +29,17 @@ const busy = ref(false);
 const asrLog = ref("");
 const model = ref("small");
 const language = ref("zh");
+
+// 硬字幕识别
+const ocrFps = ref(2);
+const ocrRegion = ref<"bottom30" | "bottom50" | "full">("bottom30");
+const ocrOverwrite = ref(false);
+const ocrBusy = ref(false);
+const ocrLog = ref("");
+
+const ocrBottomRatio = computed(() =>
+  ocrRegion.value === "full" ? 1.0 : ocrRegion.value === "bottom50" ? 0.5 : 0.3,
+);
 
 const mediaOptions = computed(() =>
   store.media.map((m) => ({
@@ -113,6 +125,49 @@ async function runAsr() {
     message.error((e as Error).message);
   } finally {
     busy.value = false;
+  }
+}
+
+/** 用 OCR 把画面里烧死的硬字幕读出来 */
+async function runOcr() {
+  if (mediaId.value === null) {
+    message.warning("请先选择素材");
+    return;
+  }
+  if (!store.ocr?.available) {
+    message.warning("OCR 运行时未就绪，请到「设置」指定装有 rapidocr_onnxruntime 的 Python");
+    return;
+  }
+  if (cues.value.length > 0 && !ocrOverwrite.value) {
+    message.warning(`当前已有 ${cues.value.length} 条字幕。要覆盖请先勾选「覆盖现有字幕」`);
+    return;
+  }
+
+  ocrBusy.value = true;
+  ocrLog.value = "";
+  try {
+    const report = await api.recognizeHardSubtitles(
+      mediaId.value,
+      {
+        sampleFps: ocrFps.value,
+        bottomRatio: ocrBottomRatio.value,
+        minConfidence: 0.5,
+        mergeThreshold: 0.85,
+        minDurationMs: 400,
+        maxFrames: 4000,
+      },
+      ocrOverwrite.value,
+    );
+    ocrLog.value =
+      `抽帧 ${report.framesSampled} 帧，其中 ${report.framesWithText} 帧读到文字；` +
+      `生成 ${report.cueCount} 条字幕（引擎：${report.engine}）`;
+    await load();
+    ocrOverwrite.value = false;
+    message.success(`识别完成，共 ${report.cueCount} 条字幕`);
+  } catch (e) {
+    message.error((e as Error).message);
+  } finally {
+    ocrBusy.value = false;
   }
 }
 
@@ -273,6 +328,64 @@ onMounted(() => {
         <ul style="margin: 0; padding-left: 18px">
           <li v-for="(w, i) in warnings.slice(0, 8)" :key="i">{{ w }}</li>
         </ul>
+      </n-alert>
+    </div>
+
+    <div class="dd-card">
+      <div class="dd-row" style="justify-content: space-between">
+        <div>
+          <div class="dd-card-title">硬字幕识别（OCR）</div>
+          <div class="dd-card-desc">
+            素材把字幕烧在画面上时，用 OCR 把它们读出来变成可编辑的字幕轴。本地 ONNX 推理，不联网。
+          </div>
+        </div>
+        <n-tag
+          v-if="store.ocr"
+          size="small"
+          :type="store.ocr.available ? 'success' : 'warning'"
+          :bordered="false"
+        >
+          {{ store.ocr.available ? "运行时就绪" : "运行时未就绪" }}
+        </n-tag>
+      </div>
+
+      <div class="dd-row" style="margin-bottom: 10px">
+        <span class="dd-muted" style="width: 76px">抽帧频率</span>
+        <n-input-number v-model:value="ocrFps" size="small" :min="0.5" :max="5" :step="0.5" style="width: 120px" />
+        <span class="dd-muted">帧/秒。硬字幕一般停留 1 秒以上，2 帧/秒足够</span>
+      </div>
+
+      <div class="dd-row" style="margin-bottom: 10px">
+        <span class="dd-muted" style="width: 76px">识别区域</span>
+        <n-select
+          v-model:value="ocrRegion"
+          size="small"
+          style="width: 230px"
+          :options="[
+            { label: '画面底部 30%（推荐）', value: 'bottom30' },
+            { label: '画面底部 50%', value: 'bottom50' },
+            { label: '整帧（字幕位置不固定）', value: 'full' },
+          ]"
+        />
+        <span class="dd-muted">只认底部能少认招牌、水印、弹幕</span>
+      </div>
+
+      <div class="dd-row" style="margin-bottom: 14px">
+        <span class="dd-muted" style="width: 76px">覆盖</span>
+        <n-checkbox v-model:checked="ocrOverwrite">
+          覆盖现有字幕（当前 {{ cues.length }} 条）
+        </n-checkbox>
+        <n-button size="small" type="primary" :loading="ocrBusy" @click="runOcr">
+          识别硬字幕
+        </n-button>
+      </div>
+
+      <n-alert v-if="store.ocr && !store.ocr.available" type="warning" title="OCR 不可用">
+        {{ store.ocr.detail }}
+      </n-alert>
+
+      <n-alert v-if="ocrLog" type="success" style="margin-top: 12px" title="上次识别结果">
+        {{ ocrLog }}
       </n-alert>
     </div>
 

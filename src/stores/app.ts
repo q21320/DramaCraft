@@ -1,6 +1,6 @@
 import { defineStore } from "pinia";
 import { api } from "@/api";
-import type { AppInfo, AsrStatus, Media, Project, ToolPaths, ToolReport } from "@/types";
+import type { AppInfo, Media, Project, RuntimeStatus, ToolPaths, ToolReport } from "@/types";
 
 interface State {
   info: AppInfo | null;
@@ -9,7 +9,8 @@ interface State {
   media: Media[];
   tools: ToolPaths;
   toolReports: ToolReport[];
-  asr: AsrStatus | null;
+  asr: RuntimeStatus | null;
+  ocr: RuntimeStatus | null;
   loading: boolean;
   error: string;
   /** 最近一次切片输出目录，按项目分开记，避免串台 */
@@ -25,6 +26,7 @@ export const useAppStore = defineStore("app", {
     tools: { ffmpeg: "", ffprobe: "", python: "" },
     toolReports: [],
     asr: null,
+    ocr: null,
     loading: false,
     error: "",
     outDirs: {},
@@ -55,6 +57,7 @@ export const useAppStore = defineStore("app", {
         this.tools = await api.getTools();
         this.toolReports = await api.detectTools();
         this.asr = await api.asrStatus();
+        this.ocr = await api.ocrStatus();
         await this.reloadProjects();
       } catch (e) {
         this.error = (e as Error).message;
@@ -116,6 +119,7 @@ export const useAppStore = defineStore("app", {
       this.toolReports = await api.setTools(paths);
       this.tools = await api.getTools();
       this.asr = await api.asrStatus();
+      this.ocr = await api.ocrStatus();
     },
 
     setOutDir(dir: string) {

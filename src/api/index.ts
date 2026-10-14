@@ -2,16 +2,18 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
   AsrOutcome,
-  AsrStatus,
   Cue,
   DraftReport,
   ExportOptions,
   ExportOutcome,
   Media,
+  OcrOptions,
+  OcrReport,
   PlatformOption,
   Project,
   PublishPackageReport,
   PublishPlan,
+  RuntimeStatus,
   Segment,
   SliceMode,
   SlicePlan,
@@ -47,7 +49,8 @@ export const api = {
   getTools: () => call<ToolPaths>("get_tools"),
   detectTools: () => call<ToolReport[]>("detect_tools"),
   setTools: (paths: ToolPaths) => call<ToolReport[]>("set_tools", { paths }),
-  asrStatus: () => call<AsrStatus>("asr_status"),
+  asrStatus: () => call<RuntimeStatus>("asr_status"),
+  ocrStatus: () => call<RuntimeStatus>("ocr_status"),
 
   // 项目
   createProject: (name: string, rootDir: string) =>
@@ -76,6 +79,8 @@ export const api = {
   exportSrt: (mediaId: number, path: string) => call<number>("export_srt", { mediaId, path }),
   asrTranscribe: (mediaId: number, model: string, language: string) =>
     call<AsrOutcome>("asr_transcribe", { mediaId, model, language }),
+  recognizeHardSubtitles: (mediaId: number, options: OcrOptions, overwrite: boolean) =>
+    call<OcrReport>("recognize_hard_subtitles", { mediaId, options, overwrite }),
 
   // 导出
   exportVideo: (opts: ExportOptions) => call<ExportOutcome>("export_video", { opts }),

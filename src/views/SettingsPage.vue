@@ -112,6 +112,47 @@ onMounted(() => {
   </div>
 
   <div class="dd-card">
+    <div class="dd-card-title">可选运行时</div>
+    <div class="dd-card-desc">
+      这两项都跑在上面那个 Python 里，各自需要单独的依赖包；没装不影响其他功能。
+    </div>
+
+    <table class="dd-table">
+      <thead>
+        <tr>
+          <th style="width: 150px">能力</th>
+          <th style="width: 90px">状态</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th>语音转字幕（ASR）</th>
+          <td>
+            <n-tag size="tiny" :type="store.asr?.available ? 'success' : 'warning'" :bordered="false">
+              {{ store.asr?.available ? "就绪" : "未就绪" }}
+            </n-tag>
+          </td>
+          <td class="dd-wrap">{{ store.asr?.detail || "—" }}</td>
+        </tr>
+        <tr>
+          <th>硬字幕识别（OCR）</th>
+          <td>
+            <n-tag size="tiny" :type="store.ocr?.available ? 'success' : 'warning'" :bordered="false">
+              {{ store.ocr?.available ? "就绪" : "未就绪" }}
+            </n-tag>
+          </td>
+          <td class="dd-wrap">{{ store.ocr?.detail || "—" }}</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <pre class="dd-mono" style="margin: 12px 0 0; padding: 10px; background: rgba(128,128,128,0.08); border-radius: 6px">pip install faster-whisper          # 语音转字幕
+pip install rapidocr_onnxruntime    # 硬字幕识别
+pip install pyJianYingDraft         # 剪映草稿导出</pre>
+  </div>
+
+  <div class="dd-card">
     <div class="dd-card-title">关于</div>
     <div class="dd-card-desc">纯本地运行，不上传任何素材与项目数据。</div>
     <table class="dd-table">

@@ -217,6 +217,47 @@ pub struct PlatformOption {
     pub note: String,
 }
 
+// ---------------- OCR 硬字幕识别 ----------------
+
+/// 逐帧 OCR 结果。
+///
+/// 这个结构同时是**子进程协议形状**，所以用 snake_case —— 与 asr / jy 两个
+/// worker 的 JSON 字段风格保持一致；前端拿不到它，不需要 camelCase。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OcrFrame {
+    pub time_ms: i64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrOptions {
+    /// 抽帧频率（帧/秒）。硬字幕一般停留 1 秒以上，2 帧/秒足够。
+    pub sample_fps: f64,
+    /// 只识别画面底部这个比例（1.0 = 全画面）。硬字幕几乎都在底部。
+    pub bottom_ratio: f64,
+    /// 低于这个置信度的识别结果丢弃
+    pub min_confidence: f64,
+    /// 相邻帧文本相似度高于它就当作同一句
+    pub merge_threshold: f64,
+    /// 短于这个时长的字幕丢弃（去掉一闪而过的误识别）
+    pub min_duration_ms: i64,
+    /// 抽帧上限，防止超长视频把磁盘撑爆
+    pub max_frames: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrReport {
+    pub frames_sampled: i64,
+    pub frames_with_text: i64,
+    pub cue_count: i64,
+    pub engine: String,
+    pub duration_ms: i64,
+    pub warnings: Vec<String>,
+}
+
 // ---------------- 去重效果验证 ----------------
 
 /// 单帧比对结果
@@ -306,10 +347,13 @@ pub struct ToolReport {
 
 // ---------------- ASR ----------------
 
-/// ASR 运行时状态
+/// 某个可选 Python 运行时的能力状态。
+///
+/// ASR（faster-whisper）、OCR（rapidocr）、剪映草稿（pyJianYingDraft）各自一份，
+/// 形状相同，前端可以用同一套组件渲染。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AsrStatus {
+pub struct RuntimeStatus {
     pub available: bool,
     pub python: String,
     pub detail: String,

@@ -3,12 +3,12 @@
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AppInfo, AsrOutcome, AsrRequest, AsrStatus, Cue, ExportOptions, ExportOutcome, Media,
-    PlatformOption, Project, PublishClipEntry, PublishPackageReport, PublishPlan, Segment,
-    SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport, VerifyItem,
-    VerifyReport,
+    AppInfo, AsrOutcome, AsrRequest, Cue, ExportOptions, ExportOutcome, Media, OcrFrame,
+    OcrOptions, OcrReport, PlatformOption, Project, PublishClipEntry, PublishPackageReport,
+    PublishPlan, RuntimeStatus, Segment, SliceMode, SlicePlan, ToolPaths, ToolReport,
+    TransformOptions, TransformReport, VerifyItem, VerifyReport,
 };
-use crate::{asr, export, jy, media, publish, subtitle, tools, transform, verify, AppState};
+use crate::{asr, export, jy, media, ocr, publish, subtitle, tools, transform, verify, AppState};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
@@ -71,9 +71,16 @@ pub fn set_tools(state: tauri::State<'_, AppState>, paths: ToolPaths) -> AppResu
 }
 
 #[tauri::command]
-pub fn asr_status(state: tauri::State<'_, AppState>) -> AppResult<AsrStatus> {
+pub fn asr_status(state: tauri::State<'_, AppState>) -> AppResult<RuntimeStatus> {
     let configured = lock_tools(&state)?.clone();
     Ok(asr::status(&configured.python))
+}
+
+/// OCR 硬字幕识别的运行时状态
+#[tauri::command]
+pub fn ocr_status(state: tauri::State<'_, AppState>) -> AppResult<RuntimeStatus> {
+    let configured = lock_tools(&state)?.clone();
+    Ok(ocr::status(&configured.python))
 }
 
 // ---------------- 项目 ----------------
@@ -791,6 +798,122 @@ pub fn revert_segments(
         failed: 0,
         errors: Vec::new(),
         segments,
+    })
+}
+
+// ---------------- OCR 硬字幕识别 ----------------
+
+/// 识别画面里烧死的硬字幕，生成字幕轴。
+///
+/// 已有字幕时默认**拒绝执行**（`overwrite = false`），避免把 ASR 的成果静默冲掉。
+#[tauri::command]
+pub async fn recognize_hard_subtitles(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    options: Option<OcrOptions>,
+    overwrite: Option<bool>,
+) -> AppResult<OcrReport> {
+    let opts = ocr::normalize_options(&options.unwrap_or_else(ocr::default_options));
+    let overwrite = overwrite.unwrap_or(false);
+
+    let (ffmpeg, python, worker, input, media_duration, existing) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let python = tools::require(&configured.python, "python")?;
+        let conn = lock_db(&state)?;
+        let media = db::get_media(&conn, media_id)?;
+        let existing = db::list_cues(&conn, media_id)?.len() as i64;
+        (
+            ffmpeg,
+            python,
+            worker_script(&app, "ocr_worker.py"),
+            media.path,
+            media.duration_ms,
+            existing,
+        )
+    };
+
+    if existing > 0 && !overwrite {
+        return Err(AppError::Msg(format!(
+            "这个素材已经有 {existing} 条字幕了。确认要覆盖的话，勾选「覆盖现有字幕」再执行；\
+             或者先把现有字幕导出成 SRT 备份。"
+        )));
+    }
+
+    let frames_dir = std::env::temp_dir().join(format!("dramadist_ocr_{media_id}"));
+    let opts_task = opts.clone();
+    let frames_dir_task = frames_dir.clone();
+    let ffmpeg_task = ffmpeg.clone();
+    let input_task = input.clone();
+    let python_task = python.clone();
+    let worker_task = worker.clone();
+
+    let outcome = tauri::async_runtime::spawn_blocking(
+        move || -> AppResult<(Vec<OcrFrame>, String, usize)> {
+            let frames =
+                ocr::extract_frames(&ffmpeg_task, Path::new(&input_task), &frames_dir_task, &opts_task)?;
+            let total = frames.len();
+            let (recognized, engine) = ocr::run_worker(
+                &python_task,
+                &worker_task,
+                &frames,
+                &opts_task,
+                ocr::default_timeout(),
+            )?;
+            Ok((recognized, engine, total))
+        },
+    )
+    .await
+    .map_err(|e| AppError::Msg(format!("OCR 线程异常终止：{e}")))?;
+
+    // 抽出来的帧是中间产物，无论成败都清掉
+    let _ = std::fs::remove_dir_all(&frames_dir);
+
+    let (recognized, engine, total_frames) = outcome?;
+    let interval = (1000.0 / opts.sample_fps).round() as i64;
+    let cues = ocr::merge_frames(&recognized, interval, opts.min_duration_ms, opts.merge_threshold);
+
+    if cues.is_empty() {
+        return Err(AppError::Msg(
+            "识别跑完了，但没有拼出任何字幕。可以试试：调低置信度阈值、把「只识别底部」调成 1.0（整帧）、或确认素材里确实有硬字幕。"
+                .into(),
+        ));
+    }
+
+    let with_text = recognized
+        .iter()
+        .filter(|f| !f.text.trim().is_empty())
+        .count() as i64;
+    let cue_count = {
+        let mut conn = lock_db(&state)?;
+        db::replace_cues(&mut conn, media_id, &cues)?
+    };
+
+    let mut warnings: Vec<String> = Vec::new();
+    if total_frames >= opts.max_frames {
+        warnings.push(format!(
+            "抽帧达到上限 {} 帧，视频后面可能没被识别到。可以降低抽帧频率后重试。",
+            opts.max_frames
+        ));
+    }
+    if (with_text as f64) / (total_frames.max(1) as f64) < 0.05 {
+        warnings.push(
+            "只有很少的帧识别到文字。如果素材确实带硬字幕，把「识别区域」调成 1.0（整帧）再试一次。"
+                .into(),
+        );
+    }
+    warnings.push(
+        "硬字幕识别是逐帧推断，断句按相邻帧文本相似度合并，可能需要人工校对时间轴。".into(),
+    );
+
+    Ok(OcrReport {
+        frames_sampled: total_frames as i64,
+        frames_with_text: with_text,
+        cue_count,
+        engine,
+        duration_ms: media_duration,
+        warnings,
     })
 }
 

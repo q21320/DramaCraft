@@ -177,7 +177,7 @@ pub fn compare_files(
     let hashes_before = sample_hashes(ffmpeg, before, before_probe.duration_ms, samples)?;
     let hashes_after = sample_hashes(ffmpeg, after, after_probe.duration_ms, samples)?;
 
-    let (mut items, mean) = compare_hashes(&hashes_before, &hashes_after);
+    let (items, mean) = compare_hashes(&hashes_before, &hashes_after);
 
     let mut warnings: Vec<String> = Vec::new();
     if hashes_before.len() != hashes_after.len() {
@@ -193,11 +193,6 @@ pub fn compare_files(
     }
     if mean >= 0.999 {
         warnings.push("两边几乎完全一致 —— 确认处理真的生效了吗？".into());
-    }
-
-    // 逐帧标注：明显高于均值的帧说明"这一帧几乎没变"
-    for item in items.iter_mut() {
-        item.index = item.index;
     }
 
     Ok(SimilarityReport {

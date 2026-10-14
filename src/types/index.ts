@@ -59,10 +59,31 @@ export interface ToolReport {
   detail: string;
 }
 
-export interface AsrStatus {
+/** 某个可选 Python 运行时的能力状态（ASR / OCR / 草稿各自一份，形状相同） */
+export interface RuntimeStatus {
   available: boolean;
   python: string;
   detail: string;
+}
+
+// ---------------- OCR 硬字幕识别 ----------------
+
+export interface OcrOptions {
+  sampleFps: number;
+  bottomRatio: number;
+  minConfidence: number;
+  mergeThreshold: number;
+  minDurationMs: number;
+  maxFrames: number;
+}
+
+export interface OcrReport {
+  framesSampled: number;
+  framesWithText: number;
+  cueCount: number;
+  engine: string;
+  durationMs: number;
+  warnings: string[];
 }
 
 // ---------------- 字幕 ----------------

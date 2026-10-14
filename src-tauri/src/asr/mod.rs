@@ -11,7 +11,7 @@
 //! 编码、工作目录与超时这三件事统一由 [`crate::proc`] 处理。
 
 use crate::error::{AppError, AppResult};
-use crate::models::{AsrRequest, AsrResponse, AsrStatus, Cue};
+use crate::models::{AsrRequest, AsrResponse, Cue, RuntimeStatus};
 use crate::proc;
 use std::path::Path;
 use std::process::Command;
@@ -25,10 +25,10 @@ pub fn default_timeout() -> Duration {
 }
 
 /// 检查指定 Python 是否具备 faster-whisper。
-pub fn status(python: &str) -> AsrStatus {
+pub fn status(python: &str) -> RuntimeStatus {
     let python = python.trim();
     if python.is_empty() {
-        return AsrStatus {
+        return RuntimeStatus {
             available: false,
             python: String::new(),
             detail: "未指定 Python 运行时，ASR 功能不可用。请在「设置」里选择 python.exe".into(),
@@ -37,7 +37,7 @@ pub fn status(python: &str) -> AsrStatus {
 
     let exe = Path::new(python);
     if !exe.is_file() {
-        return AsrStatus {
+        return RuntimeStatus {
             available: false,
             python: python.to_string(),
             detail: "指定的 Python 路径不存在，请到「设置」重新选择".into(),
@@ -51,18 +51,18 @@ pub fn status(python: &str) -> AsrStatus {
     match proc::no_window(&mut cmd).output() {
         Ok(out) if out.status.success() => {
             let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            AsrStatus {
+            RuntimeStatus {
                 available: true,
                 python: python.to_string(),
                 detail: format!("faster-whisper {ver} 就绪"),
             }
         }
-        Ok(_) => AsrStatus {
+        Ok(_) => RuntimeStatus {
             available: false,
             python: python.to_string(),
             detail: "该 Python 里没有安装 faster-whisper，可执行：pip install faster-whisper".into(),
         },
-        Err(err) => AsrStatus {
+        Err(err) => RuntimeStatus {
             available: false,
             python: python.to_string(),
             detail: format!("无法执行该 Python：{err}"),

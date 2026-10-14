@@ -11,6 +11,7 @@ mod export;
 mod jy;
 mod media;
 mod models;
+mod ocr;
 mod proc;
 mod publish;
 mod subtitle;
@@ -91,6 +92,8 @@ pub fn run() {
             commands::mark_publish_status,
             commands::export_publish_package,
             commands::verify_transform,
+            commands::ocr_status,
+            commands::recognize_hard_subtitles,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
