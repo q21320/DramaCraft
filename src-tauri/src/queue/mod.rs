@@ -101,6 +101,7 @@ struct DraftPayload {
 struct PublishPayload {
     media_id: i64,
     platform: String,
+    account: Option<String>,
     out_root: String,
 }
 
@@ -211,8 +212,14 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         }
         "publish" => {
             let p: PublishPayload = parse_payload(job)?;
-            let report =
-                commands::export_publish_package(state, p.media_id, p.platform, p.out_root).await?;
+            let report = commands::export_publish_package(
+                state,
+                p.media_id,
+                p.platform,
+                p.account,
+                p.out_root,
+            )
+            .await?;
             Ok(format!(
                 "发布包已生成：{} 个片段 / {} 份字幕",
                 report.clip_count, report.subtitle_count

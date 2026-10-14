@@ -3,7 +3,9 @@
 //! 迁移策略：只前进不回退，靠 `PRAGMA user_version` 判断。旧库能直接打开。
 
 use crate::error::AppResult;
-use crate::models::{Cue, Job, JobCounts, Media, MediaProbe, Project, PublishPlan, Segment};
+use crate::models::{
+    Cue, Job, JobCounts, Media, MediaProbe, Project, PublishAccount, PublishPlan, Segment,
+};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
@@ -102,8 +104,16 @@ CREATE TABLE IF NOT EXISTS job (
 CREATE INDEX IF NOT EXISTS idx_job_status ON job(status, id);
 "#;
 
+/// v6：发布台账增加「账号」维度 —— 同一平台可以有多个账号，各自独立记账。
+const SCHEMA_V6: &str = r#"
+ALTER TABLE publish_plan ADD COLUMN account TEXT NOT NULL DEFAULT '';
+DROP INDEX IF EXISTS idx_publish_plan_media_platform;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_plan_media_platform_account
+    ON publish_plan(media_id, platform, account);
+"#;
+
 /// 当前 schema 版本。加表/加列时递增，并在 `migrate` 里补一段。
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
@@ -133,6 +143,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     }
     if version < 5 {
         conn.execute_batch(SCHEMA_V5)?;
+    }
+    if version < 6 {
+        conn.execute_batch(SCHEMA_V6)?;
     }
     if version < SCHEMA_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -460,22 +473,24 @@ fn row_to_publish_plan(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublishPlan>
         id: row.get(0)?,
         media_id: row.get(1)?,
         platform: row.get(2)?,
-        title: row.get(3)?,
-        description: row.get(4)?,
-        tags: row.get(5)?,
-        cover_path: row.get(6)?,
-        status: row.get(7)?,
-        note: row.get(8)?,
-        updated_at: row.get(9)?,
+        account: row.get(3)?,
+        title: row.get(4)?,
+        description: row.get(5)?,
+        tags: row.get(6)?,
+        cover_path: row.get(7)?,
+        status: row.get(8)?,
+        note: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
-const PUBLISH_PLAN_COLUMNS: &str = "id, media_id, platform, title, description, tags, \
+const PUBLISH_PLAN_COLUMNS: &str = "id, media_id, platform, account, title, description, tags, \
                                     cover_path, status, note, updated_at";
 
 pub fn list_publish_plans(conn: &Connection, media_id: i64) -> AppResult<Vec<PublishPlan>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {PUBLISH_PLAN_COLUMNS} FROM publish_plan WHERE media_id = ?1 ORDER BY platform ASC"
+        "SELECT {PUBLISH_PLAN_COLUMNS} FROM publish_plan
+          WHERE media_id = ?1 ORDER BY platform ASC, account ASC"
     ))?;
     let rows = stmt.query_map(params![media_id], row_to_publish_plan)?;
     let mut out = Vec::new();
@@ -489,24 +504,27 @@ pub fn get_publish_plan(
     conn: &Connection,
     media_id: i64,
     platform: &str,
+    account: &str,
 ) -> AppResult<Option<PublishPlan>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {PUBLISH_PLAN_COLUMNS} FROM publish_plan WHERE media_id = ?1 AND platform = ?2"
+        "SELECT {PUBLISH_PLAN_COLUMNS} FROM publish_plan
+          WHERE media_id = ?1 AND platform = ?2 AND account = ?3"
     ))?;
-    let mut rows = stmt.query(params![media_id, platform])?;
+    let mut rows = stmt.query(params![media_id, platform, account])?;
     match rows.next()? {
         Some(row) => Ok(Some(row_to_publish_plan(row)?)),
         None => Ok(None),
     }
 }
 
-/// 保存发布设置（同一素材同一平台只有一条，存在则整体更新）。
+/// 保存发布设置（同一素材 + 平台 + 账号只有一条，存在则整体更新）。
 pub fn upsert_publish_plan(conn: &Connection, plan: &PublishPlan) -> AppResult<PublishPlan> {
     let updated_at = now();
     conn.execute(
-        "INSERT INTO publish_plan(media_id, platform, title, description, tags, cover_path, status, note, updated_at)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-         ON CONFLICT(media_id, platform) DO UPDATE SET
+        "INSERT INTO publish_plan(media_id, platform, account, title, description, tags,
+                                  cover_path, status, note, updated_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(media_id, platform, account) DO UPDATE SET
              title       = excluded.title,
              description = excluded.description,
              tags        = excluded.tags,
@@ -517,6 +535,7 @@ pub fn upsert_publish_plan(conn: &Connection, plan: &PublishPlan) -> AppResult<P
         params![
             plan.media_id,
             plan.platform,
+            plan.account,
             plan.title,
             plan.description,
             plan.tags,
@@ -526,7 +545,7 @@ pub fn upsert_publish_plan(conn: &Connection, plan: &PublishPlan) -> AppResult<P
             updated_at
         ],
     )?;
-    get_publish_plan(conn, plan.media_id, &plan.platform)?
+    get_publish_plan(conn, plan.media_id, &plan.platform, &plan.account)?
         .ok_or_else(|| crate::error::AppError::Msg("保存发布设置失败：写回后读不到".into()))
 }
 
@@ -535,21 +554,56 @@ pub fn set_publish_status(
     conn: &Connection,
     media_id: i64,
     platform: &str,
+    account: &str,
     status: &str,
     note: &str,
 ) -> AppResult<()> {
     let updated_at = now();
     let changed = conn.execute(
-        "UPDATE publish_plan SET status = ?3, note = ?4, updated_at = ?5
-          WHERE media_id = ?1 AND platform = ?2",
-        params![media_id, platform, status, note, updated_at],
+        "UPDATE publish_plan SET status = ?4, note = ?5, updated_at = ?6
+          WHERE media_id = ?1 AND platform = ?2 AND account = ?3",
+        params![media_id, platform, account, status, note, updated_at],
     )?;
     if changed == 0 {
         return Err(crate::error::AppError::Msg(
-            "该平台还没有发布设置，请先填写并保存".into(),
+            "该平台 / 账号还没有发布设置，请先填写并保存".into(),
         ));
     }
     Ok(())
+}
+
+/// 台账总览：按「平台 × 账号」汇总。
+pub fn list_publish_accounts(conn: &Connection) -> AppResult<Vec<PublishAccount>> {
+    let mut stmt = conn.prepare(
+        "SELECT platform, account,
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'draft'     THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'ready'     THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'failed'    THEN 1 ELSE 0 END),
+                MAX(updated_at)
+           FROM publish_plan
+          GROUP BY platform, account
+          ORDER BY platform ASC, account ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PublishAccount {
+            platform: row.get(0)?,
+            platform_label: String::new(),
+            account: row.get(1)?,
+            total: row.get(2)?,
+            draft: row.get(3)?,
+            ready: row.get(4)?,
+            published: row.get(5)?,
+            failed: row.get(6)?,
+            last_updated: row.get(7)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for item in rows {
+        out.push(item?);
+    }
+    Ok(out)
 }
 
 // ---------- job（任务队列） ----------
@@ -920,10 +974,15 @@ mod tests {
     }
 
     fn plan(media_id: i64, platform: &str, title: &str) -> PublishPlan {
+        plan_for(media_id, platform, publish_account_default(), title)
+    }
+
+    fn plan_for(media_id: i64, platform: &str, account: &str, title: &str) -> PublishPlan {
         PublishPlan {
             id: 0,
             media_id,
             platform: platform.to_string(),
+            account: account.to_string(),
             title: title.to_string(),
             description: "简介".into(),
             tags: "短剧,推荐".into(),
@@ -932,6 +991,10 @@ mod tests {
             note: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    fn publish_account_default() -> &'static str {
+        "默认账号"
     }
 
     #[test]
@@ -945,7 +1008,7 @@ mod tests {
         assert!(saved.id > 0);
         assert!(!saved.updated_at.is_empty());
 
-        // 同平台再存是更新，不是新增
+        // 同平台同账号再存是更新，不是新增
         let saved = upsert_publish_plan(&conn, &plan(m.id, "douyin", "改过的标题")).unwrap();
         assert_eq!(saved.title, "改过的标题");
         assert_eq!(list_publish_plans(&conn, m.id).unwrap().len(), 1);
@@ -960,19 +1023,68 @@ mod tests {
     }
 
     #[test]
+    fn same_platform_different_accounts_are_separate_rows() {
+        let conn = mem();
+        let p = create_project(&conn, "p", "").unwrap();
+        let m = add_media(&conn, p.id, "E:/a.mp4", "a.mp4", &MediaProbe::default()).unwrap();
+
+        upsert_publish_plan(&conn, &plan_for(m.id, "douyin", "账号甲", "甲版")).unwrap();
+        upsert_publish_plan(&conn, &plan_for(m.id, "douyin", "账号乙", "乙版")).unwrap();
+        upsert_publish_plan(&conn, &plan_for(m.id, "douyin", "账号甲", "甲版改")).unwrap();
+
+        let all = list_publish_plans(&conn, m.id).unwrap();
+        assert_eq!(all.len(), 2, "同平台不同账号各占一行，同账号是更新");
+        let jia = get_publish_plan(&conn, m.id, "douyin", "账号甲").unwrap().unwrap();
+        assert_eq!(jia.title, "甲版改");
+        let yi = get_publish_plan(&conn, m.id, "douyin", "账号乙").unwrap().unwrap();
+        assert_eq!(yi.title, "乙版");
+        // 不存在的账号组合
+        assert!(get_publish_plan(&conn, m.id, "douyin", "账号丙").unwrap().is_none());
+    }
+
+    #[test]
+    fn publish_accounts_overview_aggregates_by_platform_and_account() {
+        let conn = mem();
+        let p = create_project(&conn, "p", "").unwrap();
+        let a = add_media(&conn, p.id, "E:/a.mp4", "a.mp4", &MediaProbe::default()).unwrap();
+        let b = add_media(&conn, p.id, "E:/b.mp4", "b.mp4", &MediaProbe::default()).unwrap();
+
+        upsert_publish_plan(&conn, &plan_for(a.id, "douyin", "甲", "t1")).unwrap();
+        upsert_publish_plan(&conn, &plan_for(b.id, "douyin", "甲", "t2")).unwrap();
+        upsert_publish_plan(&conn, &plan_for(a.id, "douyin", "乙", "t3")).unwrap();
+        set_publish_status(&conn, a.id, "douyin", "甲", "published", "").unwrap();
+        set_publish_status(&conn, b.id, "douyin", "甲", "failed", "被限流").unwrap();
+
+        let accounts = list_publish_accounts(&conn).unwrap();
+        assert_eq!(accounts.len(), 2, "两个账号两行");
+
+        let jia = accounts.iter().find(|x| x.account == "甲").unwrap();
+        assert_eq!(jia.total, 2);
+        assert_eq!(jia.published, 1);
+        assert_eq!(jia.failed, 1);
+        assert!(!jia.last_updated.is_empty());
+
+        let yi = accounts.iter().find(|x| x.account == "乙").unwrap();
+        assert_eq!(yi.total, 1);
+        assert_eq!(yi.draft, 1);
+    }
+
+    #[test]
     fn publish_status_can_be_marked_and_missing_plan_is_an_error() {
         let conn = mem();
         let p = create_project(&conn, "p", "").unwrap();
         let m = add_media(&conn, p.id, "E:/a.mp4", "a.mp4", &MediaProbe::default()).unwrap();
 
-        let err = set_publish_status(&conn, m.id, "douyin", "published", "")
+        let err = set_publish_status(&conn, m.id, "douyin", "默认账号", "published", "")
             .unwrap_err()
             .to_string();
         assert!(err.contains("还没有发布设置"), "实际：{err}");
 
         upsert_publish_plan(&conn, &plan(m.id, "douyin", "t")).unwrap();
-        set_publish_status(&conn, m.id, "douyin", "published", "已投 3 条").unwrap();
-        let stored = get_publish_plan(&conn, m.id, "douyin").unwrap().unwrap();
+        set_publish_status(&conn, m.id, "douyin", "默认账号", "published", "已投 3 条").unwrap();
+        let stored = get_publish_plan(&conn, m.id, "douyin", "默认账号")
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.status, "published");
         assert_eq!(stored.note, "已投 3 条");
         assert_eq!(stored.title, "t", "改状态不应动标题");
@@ -1113,5 +1225,40 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         assert_eq!(list_projects(&conn).unwrap()[0].name, "旧工程");
         assert_eq!(job_counts(&conn).unwrap().total, 0, "新表可用");
+    }
+
+    #[test]
+    fn v5_database_gains_account_dimension_without_losing_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.execute_batch(SCHEMA_V5).unwrap();
+        conn.execute_batch("PRAGMA user_version = 5;").unwrap();
+
+        let p = create_project(&conn, "旧工程", "").unwrap();
+        let m = add_media(&conn, p.id, "E:/a.mp4", "a.mp4", &MediaProbe::default()).unwrap();
+        // 旧库里的台账没有 account 列，用旧写法塞一条
+        conn.execute(
+            "INSERT INTO publish_plan(media_id, platform, title, description, tags, cover_path, status, note, updated_at)
+             VALUES(?1, 'douyin', '老标题', '', '', '', 'published', '发过了', '2026-01-01 00:00:00')",
+            params![m.id],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let all = list_publish_plans(&conn, m.id).unwrap();
+        assert_eq!(all.len(), 1, "旧数据必须保留");
+        assert_eq!(all[0].title, "老标题");
+        assert_eq!(all[0].status, "published");
+        assert_eq!(all[0].account, "", "新列默认空，可由上层归一到默认账号");
     }
 }

@@ -108,6 +108,7 @@ pub fn run() {
             commands::revert_segments,
             commands::list_platforms,
             commands::list_publish_plans,
+            commands::list_publish_accounts,
             commands::save_publish_plan,
             commands::mark_publish_status,
             commands::export_publish_package,

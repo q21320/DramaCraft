@@ -14,6 +14,7 @@ import type {
   OcrReport,
   PlatformOption,
   Project,
+  PublishAccount,
   PublishPackageReport,
   PublishPlan,
   QueueState,
@@ -115,11 +116,18 @@ export const api = {
   // 发布
   listPlatforms: () => call<PlatformOption[]>("list_platforms"),
   listPublishPlans: (mediaId: number) => call<PublishPlan[]>("list_publish_plans", { mediaId }),
+  listPublishAccounts: () => call<PublishAccount[]>("list_publish_accounts"),
   savePublishPlan: (plan: PublishPlan) => call<PublishPlan>("save_publish_plan", { plan }),
-  markPublishStatus: (mediaId: number, platform: string, status: string, note: string) =>
-    call<PublishPlan>("mark_publish_status", { mediaId, platform, status, note }),
-  exportPublishPackage: (mediaId: number, platform: string, outRoot: string) =>
-    call<PublishPackageReport>("export_publish_package", { mediaId, platform, outRoot }),
+  markPublishStatus: (
+    mediaId: number,
+    platform: string,
+    account: string,
+    status: string,
+    note: string,
+  ) =>
+    call<PublishPlan>("mark_publish_status", { mediaId, platform, account, status, note }),
+  exportPublishPackage: (mediaId: number, platform: string, account: string, outRoot: string) =>
+    call<PublishPackageReport>("export_publish_package", { mediaId, platform, account, outRoot }),
 
   // 去重效果验证
   verifyTransform: (mediaId: number, samples?: number) =>

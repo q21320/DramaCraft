@@ -7,8 +7,21 @@ import os
 import sqlite3
 import sys
 
-EXPECTED_VERSION = 5
+EXPECTED_VERSION = 6
 EXPECTED_TABLES = {"project", "media", "segment", "cue", "setting", "publish_plan", "job"}
+EXPECTED_PUBLISH_PLAN_COLUMNS = {
+    "id",
+    "media_id",
+    "platform",
+    "account",
+    "title",
+    "description",
+    "tags",
+    "cover_path",
+    "status",
+    "note",
+    "updated_at",
+}
 EXPECTED_SEGMENT_COLUMNS = {
     "id",
     "media_id",
@@ -60,6 +73,12 @@ if missing_tables:
 missing_columns = EXPECTED_SEGMENT_COLUMNS - segment_columns
 if missing_columns:
     problems.append(f"segment 缺少列：{sorted(missing_columns)}")
+
+publish_columns = {r[1] for r in con.execute("PRAGMA table_info(publish_plan)")}
+print("publish_plan columns =", sorted(publish_columns))
+missing_publish = EXPECTED_PUBLISH_PLAN_COLUMNS - publish_columns
+if missing_publish:
+    problems.append(f"publish_plan 缺少列：{sorted(missing_publish)}")
 
 if problems:
     for p in problems:

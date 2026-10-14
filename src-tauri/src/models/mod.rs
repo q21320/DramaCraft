@@ -145,13 +145,15 @@ pub struct TransformReport {
 
 // ---------------- 发布 ----------------
 
-/// 一个素材在某个平台上的发布设置与状态（本地台账，不上传任何东西）。
+/// 一个素材在某个平台、某个账号上的发布设置与状态（本地台账，不上传任何东西）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublishPlan {
     pub id: i64,
     pub media_id: i64,
     pub platform: String,
+    /// 账号名。同一平台可以有多个账号，各自独立记账、互不覆盖。
+    pub account: String,
     pub title: String,
     pub description: String,
     /// 标签，逗号分隔的原始文本
@@ -162,6 +164,21 @@ pub struct PublishPlan {
     pub status: String,
     pub note: String,
     pub updated_at: String,
+}
+
+/// 一个「平台 × 账号」的台账汇总
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishAccount {
+    pub platform: String,
+    pub platform_label: String,
+    pub account: String,
+    pub total: i64,
+    pub draft: i64,
+    pub ready: i64,
+    pub published: i64,
+    pub failed: i64,
+    pub last_updated: String,
 }
 
 /// 发布包里的一条片段
@@ -183,6 +200,8 @@ pub struct PublishClipEntry {
 pub struct PublishMetadata {
     pub platform: String,
     pub platform_label: String,
+    /// 发布账号。同一平台多个账号时，发布包会按账号分目录，避免互相覆盖。
+    pub account: String,
     pub media_name: String,
     pub title: String,
     pub description: String,

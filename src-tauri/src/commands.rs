@@ -5,7 +5,8 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, Cue, EpisodeBoundary, EpisodeDetection, ExportOptions,
     ExportOutcome, Job, Media, OcrFrame, OcrOptions, OcrReport, PlatformOption, Project,
-    PublishClipEntry, PublishPackageReport, PublishPlan, QueueState, ResplitReport, RuntimeStatus,
+    PublishClipEntry, PublishPackageReport, PublishPlan, PublishAccount, QueueState, ResplitReport,
+    RuntimeStatus,
     Segment, SeriesGroup, SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions,
     TransformReport, VerifyItem, VerifyReport,
 };
@@ -1493,6 +1494,17 @@ pub fn list_publish_plans(
     db::list_publish_plans(&conn, media_id)
 }
 
+/// 台账总览：按「平台 × 账号」汇总，用来一眼看清每个账号发到什么程度了。
+#[tauri::command]
+pub fn list_publish_accounts(state: tauri::State<'_, AppState>) -> AppResult<Vec<PublishAccount>> {
+    let conn = lock_db(&state)?;
+    let mut accounts = db::list_publish_accounts(&conn)?;
+    for account in accounts.iter_mut() {
+        account.platform_label = publish::platform_label(&account.platform);
+    }
+    Ok(accounts)
+}
+
 #[tauri::command]
 pub fn save_publish_plan(
     state: tauri::State<'_, AppState>,
@@ -1510,6 +1522,7 @@ pub fn save_publish_plan(
         id: plan.id,
         media_id: plan.media_id,
         platform,
+        account: publish::normalize_account(&plan.account),
         title,
         description: plan.description.trim().to_string(),
         tags: plan.tags.trim().to_string(),
@@ -1522,20 +1535,22 @@ pub fn save_publish_plan(
     db::upsert_publish_plan(&conn, &normalized)
 }
 
-/// 标记某个平台发没发出去。这是本地台账，不联网。
+/// 标记某个平台 / 账号发没发出去。这是本地台账，不联网。
 #[tauri::command]
 pub fn mark_publish_status(
     state: tauri::State<'_, AppState>,
     media_id: i64,
     platform: String,
+    account: String,
     status: String,
     note: String,
 ) -> AppResult<PublishPlan> {
     let platform = platform.trim().to_string();
+    let account = publish::normalize_account(&account);
     let status = publish::normalize_status(&status);
     let conn = lock_db(&state)?;
-    db::set_publish_status(&conn, media_id, &platform, &status, note.trim())?;
-    db::get_publish_plan(&conn, media_id, &platform)?
+    db::set_publish_status(&conn, media_id, &platform, &account, &status, note.trim())?;
+    db::get_publish_plan(&conn, media_id, &platform, &account)?
         .ok_or_else(|| AppError::Msg("读取发布设置失败".into()))
 }
 
@@ -1547,12 +1562,14 @@ pub async fn export_publish_package(
     state: tauri::State<'_, AppState>,
     media_id: i64,
     platform: String,
+    account: Option<String>,
     out_root: String,
 ) -> AppResult<PublishPackageReport> {
     let platform = platform.trim().to_string();
     if !publish::is_known_platform(&platform) {
         return Err(AppError::Msg(format!("不支持的平台：{platform}")));
     }
+    let account = publish::normalize_account(account.as_deref().unwrap_or(""));
     let out_root_path = PathBuf::from(out_root.trim());
     if out_root_path.as_os_str().is_empty() {
         return Err(AppError::Msg("请先选择发布包输出目录".into()));
@@ -1564,7 +1581,7 @@ pub async fn export_publish_package(
         let conn = lock_db(&state)?;
 
         let media = db::get_media(&conn, media_id)?;
-        let stored = db::get_publish_plan(&conn, media_id, &platform)?;
+        let stored = db::get_publish_plan(&conn, media_id, &platform, &account)?;
 
         // 还没填设置也能出包：标题用素材名兜底，其余留空
         let fallback_title = media
@@ -1576,6 +1593,7 @@ pub async fn export_publish_package(
             id: stored.as_ref().map(|p| p.id).unwrap_or(0),
             media_id,
             platform: platform.clone(),
+            account: account.clone(),
             title: stored
                 .as_ref()
                 .map(|p| p.title.trim().to_string())

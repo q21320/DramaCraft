@@ -4,7 +4,7 @@ import { NAlert, NButton, NInput, NSelect, NSpace, NTag, useMessage } from "naiv
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/api";
 import { useAppStore } from "@/stores/app";
-import type { PlatformOption, PublishPackageReport, PublishPlan } from "@/types";
+import type { PlatformOption, PublishAccount, PublishPackageReport, PublishPlan } from "@/types";
 import { formatDuration } from "@/utils/format";
 
 const store = useAppStore();
@@ -13,7 +13,9 @@ const message = useMessage();
 const mediaId = ref<number | null>(null);
 const platforms = ref<PlatformOption[]>([]);
 const platform = ref("douyin");
+const account = ref("默认账号");
 const plans = ref<PublishPlan[]>([]);
+const accounts = ref<PublishAccount[]>([]);
 const outRoot = ref("");
 const busy = ref(false);
 const report = ref<PublishPackageReport | null>(null);
@@ -23,6 +25,7 @@ const form = ref<PublishPlan>({
   id: 0,
   mediaId: 0,
   platform: "douyin",
+  account: "默认账号",
   title: "",
   description: "",
   tags: "",
@@ -30,6 +33,19 @@ const form = ref<PublishPlan>({
   status: "draft",
   note: "",
   updatedAt: "",
+});
+
+/** 当前平台下已经用过的账号名，方便复用而不是每次手打 */
+const accountOptions = computed(() => {
+  const names = new Set<string>();
+  names.add("默认账号");
+  for (const p of plans.value) {
+    if (p.platform === platform.value && p.account) names.add(p.account);
+  }
+  for (const a of accounts.value) {
+    if (a.platform === platform.value && a.account) names.add(a.account);
+  }
+  return [...names].map((n) => ({ label: n, value: n }));
 });
 
 const mediaOptions = computed(() =>
@@ -71,6 +87,7 @@ function blankPlan(): PublishPlan {
     id: 0,
     mediaId: mediaId.value ?? 0,
     platform: platform.value,
+    account: account.value,
     title: selected.value?.name.replace(/\.[^.]+$/, "") ?? "",
     description: "",
     tags: "",
@@ -98,10 +115,20 @@ async function loadPlan() {
   if (mediaId.value === null) return;
   try {
     plans.value = await api.listPublishPlans(mediaId.value);
-    const found = plans.value.find((p) => p.platform === platform.value);
+    const found = plans.value.find(
+      (p) => p.platform === platform.value && p.account === account.value,
+    );
     form.value = found ? { ...found } : blankPlan();
   } catch (e) {
     message.error((e as Error).message);
+  }
+}
+
+async function loadAccounts() {
+  try {
+    accounts.value = await api.listPublishAccounts();
+  } catch {
+    accounts.value = [];
   }
 }
 
@@ -135,10 +162,13 @@ async function save() {
   busy.value = true;
   try {
     form.value.platform = platform.value;
+    form.value.account = account.value;
     form.value.mediaId = mediaId.value;
     const saved = await api.savePublishPlan({ ...form.value });
     form.value = { ...saved };
+    account.value = saved.account;
     plans.value = await api.listPublishPlans(mediaId.value);
+    await loadAccounts();
     message.success("已保存");
   } catch (e) {
     message.error((e as Error).message);
@@ -151,9 +181,16 @@ async function mark(status: string) {
   if (mediaId.value === null) return;
   busy.value = true;
   try {
-    const updated = await api.markPublishStatus(mediaId.value, platform.value, status, form.value.note);
+    const updated = await api.markPublishStatus(
+      mediaId.value,
+      platform.value,
+      account.value,
+      status,
+      form.value.note,
+    );
     form.value = { ...updated };
     plans.value = await api.listPublishPlans(mediaId.value);
+    await loadAccounts();
     message.success(`已标记为「${statusLabels[status]}」`);
   } catch (e) {
     message.error((e as Error).message);
@@ -178,7 +215,12 @@ async function exportPackage() {
   busy.value = true;
   report.value = null;
   try {
-    report.value = await api.exportPublishPackage(mediaId.value, platform.value, outRoot.value.trim());
+    report.value = await api.exportPublishPackage(
+      mediaId.value,
+      platform.value,
+      account.value,
+      outRoot.value.trim(),
+    );
     if (report.value.warnings.length > 0) {
       message.warning(`已生成，有 ${report.value.warnings.length} 条提示`);
     } else {
@@ -202,6 +244,11 @@ watch(platform, () => {
   void loadPlan();
 });
 
+watch(account, () => {
+  report.value = null;
+  void loadPlan();
+});
+
 onMounted(async () => {
   try {
     platforms.value = await api.listPlatforms();
@@ -210,6 +257,7 @@ onMounted(async () => {
   }
   if (store.media.length > 0) mediaId.value = store.media[0].id;
   await refreshSegments();
+  await loadAccounts();
   await loadPlan();
 });
 </script>
@@ -241,9 +289,18 @@ onMounted(async () => {
 
       <div class="dd-row" style="margin-bottom: 10px">
         <span class="dd-muted" style="width: 64px">素材</span>
-        <n-select v-model:value="mediaId" :options="mediaOptions" style="width: 340px" />
+        <n-select v-model:value="mediaId" :options="mediaOptions" style="width: 320px" />
         <span class="dd-muted" style="margin-left: 12px">平台</span>
-        <n-select v-model:value="platform" :options="platformOptions" style="width: 220px" />
+        <n-select v-model:value="platform" :options="platformOptions" style="width: 200px" />
+        <span class="dd-muted" style="margin-left: 12px">账号</span>
+        <n-select
+          v-model:value="account"
+          :options="accountOptions"
+          filterable
+          tag
+          style="width: 180px"
+          placeholder="账号名"
+        />
       </div>
 
       <div class="dd-row" style="margin-bottom: 10px">
@@ -398,6 +455,47 @@ onMounted(async () => {
             </td>
             <td class="dd-wrap dd-muted">{{ p.note || "—" }}</td>
             <td class="dd-muted">{{ p.updatedAt }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div v-if="accounts.length > 0" class="dd-card">
+      <div class="dd-card-title">账号台账总览</div>
+      <div class="dd-card-desc">
+        每个「平台 × 账号」的开发现状。切换上面的账号，下面的设置与台账会跟着切。
+      </div>
+      <table class="dd-table">
+        <thead>
+          <tr>
+            <th style="width: 130px">平台</th>
+            <th style="width: 160px">账号</th>
+            <th style="width: 70px">合计</th>
+            <th style="width: 70px">草稿</th>
+            <th style="width: 80px">待发布</th>
+            <th style="width: 80px">已发布</th>
+            <th style="width: 70px">失败</th>
+            <th>最近更新</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="a in accounts" :key="`${a.platform}-${a.account}`">
+            <td>{{ a.platformLabel }}</td>
+            <td
+              style="cursor: pointer"
+              @click="
+                platform = a.platform;
+                account = a.account;
+              "
+            >
+              <n-tag size="tiny" :bordered="false">{{ a.account }}</n-tag>
+            </td>
+            <td>{{ a.total }}</td>
+            <td class="dd-muted">{{ a.draft }}</td>
+            <td class="dd-muted">{{ a.ready }}</td>
+            <td>{{ a.published }}</td>
+            <td :style="a.failed > 0 ? 'color: #d03050' : ''">{{ a.failed }}</td>
+            <td class="dd-muted">{{ a.lastUpdated }}</td>
           </tr>
         </tbody>
       </table>

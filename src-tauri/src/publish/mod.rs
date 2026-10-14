@@ -52,6 +52,18 @@ pub const STATUS_READY: &str = "ready";
 pub const STATUS_PUBLISHED: &str = "published";
 pub const STATUS_FAILED: &str = "failed";
 
+/// 没填账号时用它兜底。留一个空账号名只会让人看不懂台账。
+pub const DEFAULT_ACCOUNT: &str = "默认账号";
+
+/// 账号名归一化：去空白、空值兜底、限长。
+pub fn normalize_account(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_ACCOUNT.to_string();
+    }
+    trimmed.chars().take(40).collect()
+}
+
 pub fn platform_options() -> Vec<PlatformOption> {
     PLATFORMS
         .iter()
@@ -151,6 +163,7 @@ pub fn build_metadata(
     PublishMetadata {
         platform: plan.platform.clone(),
         platform_label: platform_label(&plan.platform),
+        account: normalize_account(&plan.account),
         media_name: media_name.to_string(),
         title: plan.title.trim().to_string(),
         description: plan.description.trim().to_string(),
@@ -170,6 +183,7 @@ pub fn render_readme(meta: &PublishMetadata) -> String {
     out.push_str("DramaDist 发布包\n");
     out.push_str("================\n\n");
     out.push_str(&format!("平台：{}\n", meta.platform_label));
+    out.push_str(&format!("账号：{}\n", meta.account));
     out.push_str(&format!("素材：{}\n", meta.media_name));
     out.push_str(&format!(
         "标题：{}\n",
@@ -246,9 +260,9 @@ pub struct PackageClip {
 
 /// 写出发布包。
 ///
-/// 目录结构：
+/// 目录结构（**带账号一层**，同一平台多账号时互不覆盖）：
 /// ```text
-/// <out_root>/<platform>/<素材名>/
+/// <out_root>/<platform>/<账号>/<素材名>/
 /// ├─ clips/001.mp4 ...
 /// ├─ subtitles/001.srt ...
 /// ├─ cover.jpg
@@ -271,6 +285,7 @@ pub fn write_package(
 
     let root = out_root
         .join(&meta.platform)
+        .join(safe_name(&meta.account, DEFAULT_ACCOUNT))
         .join(safe_name(&meta.media_name, "未命名素材"));
     let clips_dir = root.join("clips");
     let subs_dir = root.join("subtitles");
@@ -387,6 +402,7 @@ mod tests {
             id: 0,
             media_id: 1,
             platform: "douyin".into(),
+            account: "账号甲".into(),
             title: "都市爽剧 第 1 集".into(),
             description: "第一集高能开局".into(),
             tags: "#短剧, 推荐  爽文、短剧".into(),
@@ -477,6 +493,22 @@ mod tests {
         assert_eq!(meta.cover, "cover.jpg");
         assert_eq!(meta.clips.len(), 2);
         assert!(!meta.exported_at.is_empty());
+    }
+
+    #[test]
+    fn account_normalization_falls_back_to_default() {
+        assert_eq!(normalize_account("  "), DEFAULT_ACCOUNT);
+        assert_eq!(normalize_account(""), DEFAULT_ACCOUNT);
+        assert_eq!(normalize_account("  账号甲  "), "账号甲");
+        assert_eq!(normalize_account(&"长".repeat(80)).chars().count(), 40);
+    }
+
+    #[test]
+    fn metadata_carries_the_account() {
+        let meta = build_metadata(&plan(), "a.mp4", 1080, 1920, vec![]);
+        assert_eq!(meta.account, "账号甲");
+        let text = render_readme(&meta);
+        assert!(text.contains("账号：账号甲"), "{text}");
     }
 
     #[test]
@@ -602,6 +634,13 @@ mod tests {
 
         let root = PathBuf::from(&report.out_dir);
         assert!(root.is_dir());
+        // 目录必须按「平台 / 账号 / 素材」分层，否则多账号发布会互相覆盖
+        assert!(
+            report.out_dir.contains("douyin") && report.out_dir.contains("账号甲"),
+            "包目录应按平台与账号分层：{}",
+            report.out_dir
+        );
+        assert!(out_root.join("douyin").join("账号甲").is_dir());
         assert!(root.join("clips").join("001.mp4").is_file());
         assert!(root.join("clips").join("002.mp4").is_file());
         assert!(root.join("subtitles").join("001.srt").is_file());

@@ -278,6 +278,8 @@ export interface PublishPlan {
   id: number;
   mediaId: number;
   platform: string;
+  /** 账号名。同一平台可以有多个账号，各自独立记账 */
+  account: string;
   title: string;
   description: string;
   tags: string;
@@ -286,6 +288,19 @@ export interface PublishPlan {
   status: string;
   note: string;
   updatedAt: string;
+}
+
+/** 一个「平台 × 账号」的台账汇总 */
+export interface PublishAccount {
+  platform: string;
+  platformLabel: string;
+  account: string;
+  total: number;
+  draft: number;
+  ready: number;
+  published: number;
+  failed: number;
+  lastUpdated: string;
 }
 
 export interface PublishClipEntry {
