@@ -1,12 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
+  AsrOutcome,
   AsrStatus,
+  Cue,
+  ExportOptions,
+  ExportOutcome,
   Media,
   Project,
   Segment,
   SliceMode,
   SlicePlan,
+  SrtImportOutcome,
   ToolPaths,
   ToolReport,
 } from "@/types";
@@ -53,4 +58,17 @@ export const api = {
   runSlice: (mediaId: number, mode: SliceMode, outDir: string) =>
     call<Segment[]>("run_slice", { mediaId, mode, outDir }),
   listSegments: (mediaId: number) => call<Segment[]>("list_segments", { mediaId }),
+
+  // 字幕
+  listCues: (mediaId: number) => call<Cue[]>("list_cues", { mediaId }),
+  replaceCues: (mediaId: number, cues: Cue[]) =>
+    call<number>("replace_cues", { mediaId, cues }),
+  importSrt: (mediaId: number, path: string) =>
+    call<SrtImportOutcome>("import_srt", { mediaId, path }),
+  exportSrt: (mediaId: number, path: string) => call<number>("export_srt", { mediaId, path }),
+  asrTranscribe: (mediaId: number, model: string, language: string) =>
+    call<AsrOutcome>("asr_transcribe", { mediaId, model, language }),
+
+  // 导出
+  exportVideo: (opts: ExportOptions) => call<ExportOutcome>("export_video", { opts }),
 };

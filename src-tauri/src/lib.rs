@@ -7,8 +7,10 @@ mod asr;
 mod commands;
 mod db;
 mod error;
+mod export;
 mod media;
 mod models;
+mod subtitle;
 mod tools;
 
 use models::ToolPaths;
@@ -68,6 +70,12 @@ pub fn run() {
             commands::build_slice_plan,
             commands::run_slice,
             commands::list_segments,
+            commands::list_cues,
+            commands::replace_cues,
+            commands::import_srt,
+            commands::export_srt,
+            commands::asr_transcribe,
+            commands::export_video,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

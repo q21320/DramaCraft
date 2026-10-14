@@ -83,6 +83,28 @@ pub struct Segment {
     pub message: String,
 }
 
+// ---------------- 字幕 ----------------
+
+/// 一条字幕。`id` 为 0 表示尚未落库；文本可含换行（SRT 的多行）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Cue {
+    pub id: i64,
+    pub media_id: i64,
+    pub index_no: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
+
+impl Cue {
+    pub fn duration_ms(&self) -> i64 {
+        self.end_ms - self.start_ms
+    }
+}
+
+// ---------------- 外部工具 ----------------
+
 /// 外部工具路径（全部可由用户在设置里覆盖）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +125,8 @@ pub struct ToolReport {
     pub detail: String,
 }
 
+// ---------------- ASR ----------------
+
 /// ASR 运行时状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +134,95 @@ pub struct AsrStatus {
     pub available: bool,
     pub python: String,
     pub detail: String,
+}
+
+/// 发给 Python worker 的请求（一行 JSON）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AsrRequest {
+    pub audio: String,
+    pub model: String,
+    pub language: String,
+    /// 模型下载/缓存目录，留空则用 worker 默认
+    pub model_dir: String,
+    /// auto / cpu / cuda
+    pub device: String,
+    /// 例如 int8 / float16 / int8_float16
+    pub compute_type: String,
+}
+
+/// worker 返回的应答
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AsrResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub language: String,
+    #[serde(default)]
+    pub duration: f64,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub segments: Vec<AsrSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AsrSegment {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
+/// 一次转写的结果概要（返回给前端）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsrOutcome {
+    pub cue_count: i64,
+    pub language: String,
+    pub model: String,
+    pub duration_ms: i64,
+    pub log: String,
+}
+
+// ---------------- 导出 ----------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum AspectMode {
+    /// 保持原始画幅
+    Keep,
+    /// 转 9:16 竖屏，上下用模糊背景填充
+    VerticalBlur,
+    /// 转 9:16 竖屏，等比放大后居中裁切
+    VerticalCrop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportOptions {
+    pub media_id: i64,
+    pub out_path: String,
+    /// 是否把当前字幕烧进画面
+    pub burn_subtitles: bool,
+    pub aspect: AspectMode,
+    /// 只导出这一段（毫秒）；两端都为 0 表示整片
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub crf: u32,
+    pub preset: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportOutcome {
+    pub out_path: String,
+    pub size_bytes: i64,
+    pub duration_ms: i64,
+    pub filter: String,
+    pub log: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -37,8 +37,10 @@
 | `project` | 一个分发项目 | `name`, `root_dir`, `created_at` |
 | `media` | 导入的源素材 | `project_id`, `path`, `duration_ms`, `width`, `height`, `has_audio` |
 | `segment` | 切片结果 | `media_id`, `index_no`, `start_ms`, `end_ms`, `out_path`, `status` |
-| `task` | 长任务状态 | `kind`, `ref_id`, `status`, `progress`, `message`, `log` |
-| `setting` | 键值配置 | `key`, `value`（工具路径、模型路径等） |
+| `cue` | 字幕条目（v2 新增） | `media_id`, `index_no`, `start_ms`, `end_ms`, `text` |
+| `setting` | 键值配置 | `key`, `value`（工具路径等） |
+
+迁移靠 `PRAGMA user_version` 只前进不回退：v1 建的库打开后会自动补上 `cue` 表，旧数据不动。
 
 ## 切片计划算法
 
@@ -55,3 +57,36 @@
 - 后端统一返回 `Result<T, AppError>`；`AppError` 序列化为 `{ code, message }`。
 - 子进程失败时保留 **stderr 片段**（截断到合理长度）写进 `task.log`，便于用户自查。
 - 所有文件写入使用"临时文件 + 原子重命名"，避免半成品污染输出目录。
+
+## 踩过的坑（都是真事故，别重犯）
+
+### 1. 子进程编码：中文 Windows 上 Python 默认写 GBK
+
+Python 在管道里的 stdout 编码跟随系统区域设置。中文 Windows 上是 **GBK**，
+而 Rust 侧按 UTF-8 读 —— 结果不是乱码，而是 `read_to_string` 直接失败、
+**整段输出被丢空**，表现为"worker 没有返回结果"（退出码还是 0，特别难查）。
+
+两处一起改才对：
+
+- Rust 侧给子进程设 `PYTHONUTF8=1` 与 `PYTHONIOENCODING=utf-8`；
+- Rust 侧读取改用 `read_to_end` + `from_utf8_lossy`，即使对面不听话也拿得到内容；
+- worker 自带 `sys.stdout.reconfigure(encoding="utf-8")` 兜底，方便手跑调试。
+
+回归测试：`asr::tests::talks_to_a_stub_worker_over_stdio`（用真实 Python 跑假 worker，
+断言中文原样往返）。
+
+### 2. Windows 路径里的冒号会毁掉 filtergraph
+
+`subtitles=C:\a\b.srt` 里的 `:` 是 filtergraph 的分隔符，需要转义成一团乱麻。
+解法根本不用转义：**把 ffmpeg 的工作目录设为字幕所在目录，滤镜里只写文件名**
+（`subtitles='b.srt'`），路径里的冒号就永远不会进入滤镜串。
+
+### 3. `&lock_db(&state)?` 过不了类型检查
+
+`&MutexGuard<Connection>` 在这个位置不会自动解引用成 `&Connection`。
+统一写成先绑定再用：`let conn = lock_db(&state)?;` 然后 `&conn`。
+
+### 4. 被引用的 composite tsconfig 不能 `noEmit`
+
+`vue-tsc --noEmit` 会报 `TS6310`。要么给被引用工程开启 `emitDeclarationOnly`，
+要么（更简单）直接不要那条 `references`。

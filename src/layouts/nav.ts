@@ -32,7 +32,13 @@ export const navItems: NavItem[] = [
     key: "subtitle",
     path: "/subtitle",
     label: "字幕",
-    subtitle: "ASR 生成字幕轴并校对（v0.2 接入）",
+    subtitle: "ASR 生成字幕轴、导入 SRT、逐条校对",
+  },
+  {
+    key: "export",
+    path: "/export",
+    label: "导出",
+    subtitle: "烧字幕、转竖屏、导出成片",
   },
   {
     key: "settings",

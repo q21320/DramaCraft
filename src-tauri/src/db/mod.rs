@@ -3,7 +3,7 @@
 //! 迁移策略：只前进不回退，靠 `PRAGMA user_version` 判断。旧库能直接打开。
 
 use crate::error::AppResult;
-use crate::models::{Media, MediaProbe, Project, Segment};
+use crate::models::{Cue, Media, MediaProbe, Project, Segment};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
@@ -50,6 +50,22 @@ CREATE TABLE IF NOT EXISTS setting (
 );
 "#;
 
+/// v2：字幕。挂到 media 上，跟着素材级联删除。
+const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS cue (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_id  INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+    index_no  INTEGER NOT NULL,
+    start_ms  INTEGER NOT NULL,
+    end_ms    INTEGER NOT NULL,
+    text      TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_cue_media ON cue(media_id, start_ms);
+"#;
+
+/// 当前 schema 版本。加表时递增，并在 `migrate` 里补一段。
+pub const SCHEMA_VERSION: i64 = 2;
+
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
     // execute_batch 会忽略 PRAGMA 的返回行，比 pragma_update 更稳
@@ -66,7 +82,12 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 1 {
         conn.execute_batch(SCHEMA_V1)?;
-        conn.execute_batch("PRAGMA user_version = 1;")?;
+    }
+    if version < 2 {
+        conn.execute_batch(SCHEMA_V2)?;
+    }
+    if version < SCHEMA_VERSION {
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     }
     Ok(())
 }
@@ -263,11 +284,79 @@ pub fn list_segments(conn: &Connection, media_id: i64) -> AppResult<Vec<Segment>
     Ok(out)
 }
 
+// ---------- cue（字幕） ----------
+
+pub fn list_cues(conn: &Connection, media_id: i64) -> AppResult<Vec<Cue>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, media_id, index_no, start_ms, end_ms, text
+         FROM cue WHERE media_id = ?1 ORDER BY start_ms ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![media_id], |row| {
+        Ok(Cue {
+            id: row.get(0)?,
+            media_id: row.get(1)?,
+            index_no: row.get(2)?,
+            start_ms: row.get(3)?,
+            end_ms: row.get(4)?,
+            text: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for item in rows {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
+pub fn cue_count(conn: &Connection, media_id: i64) -> AppResult<i64> {
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM cue WHERE media_id = ?1",
+        params![media_id],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// 整体替换某个素材的字幕。走事务：要么全换，要么不动，不会留下半份字幕。
+pub fn replace_cues(conn: &mut Connection, media_id: i64, cues: &[Cue]) -> AppResult<i64> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM cue WHERE media_id = ?1", params![media_id])?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO cue(media_id, index_no, start_ms, end_ms, text)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (i, cue) in cues.iter().enumerate() {
+            stmt.execute(params![
+                media_id,
+                i as i64 + 1,
+                cue.start_ms,
+                cue.end_ms,
+                cue.text
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(cues.len() as i64)
+}
+
+pub fn update_cue_text(conn: &Connection, id: i64, text: &str) -> AppResult<()> {
+    let changed = conn.execute("UPDATE cue SET text = ?2 WHERE id = ?1", params![id, text])?;
+    if changed == 0 {
+        return Err(crate::error::AppError::Msg(format!("字幕 {id} 不存在")));
+    }
+    Ok(())
+}
+
+pub fn delete_cue(conn: &Connection, id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM cue WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::MediaProbe;
-
     fn mem() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
@@ -283,7 +372,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, SCHEMA_VERSION);
     }
 
     #[test]
@@ -338,5 +427,82 @@ mod tests {
         insert_segment(&conn, m.id, 1, 0, 1000, "a.mp4", 10, "ok", "").unwrap();
         let segs = list_segments(&conn, m.id).unwrap();
         assert_eq!(segs.iter().map(|s| s.index_no).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    fn sample_cues(media_id: i64) -> Vec<Cue> {
+        vec![
+            Cue {
+                id: 0,
+                media_id,
+                index_no: 0,
+                start_ms: 0,
+                end_ms: 1_000,
+                text: "一".into(),
+            },
+            Cue {
+                id: 0,
+                media_id,
+                index_no: 0,
+                start_ms: 1_000,
+                end_ms: 2_000,
+                text: "二".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn cues_are_replaced_as_a_whole_and_cascade_deleted() {
+        let mut conn = mem();
+        let p = create_project(&conn, "p", "").unwrap();
+        let m = add_media(&conn, p.id, "E:/a.mp4", "a.mp4", &MediaProbe::default()).unwrap();
+
+        let cues = sample_cues(m.id);
+        assert_eq!(replace_cues(&mut conn, m.id, &cues).unwrap(), 2);
+        assert_eq!(cue_count(&conn, m.id).unwrap(), 2);
+
+        // 再存一次是整体替换，不是追加；序号重新从 1 开始
+        assert_eq!(replace_cues(&mut conn, m.id, &cues[..1]).unwrap(), 1);
+        let stored = list_cues(&conn, m.id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].index_no, 1);
+        assert_eq!(stored[0].text, "一");
+
+        // 删素材连带删字幕
+        remove_media(&conn, m.id).unwrap();
+        assert_eq!(cue_count(&conn, m.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn update_missing_cue_is_an_error_not_a_silent_noop() {
+        let mut conn = mem();
+        let p = create_project(&conn, "p", "").unwrap();
+        let m = add_media(&conn, p.id, "E:/a.mp4", "a.mp4", &MediaProbe::default()).unwrap();
+        replace_cues(&mut conn, m.id, &sample_cues(m.id)).unwrap();
+        let id = list_cues(&conn, m.id).unwrap()[0].id;
+
+        update_cue_text(&conn, id, "改过了").unwrap();
+        assert_eq!(list_cues(&conn, m.id).unwrap()[0].text, "改过了");
+
+        let err = update_cue_text(&conn, 99_999, "x").unwrap_err().to_string();
+        assert!(err.contains("不存在"), "实际：{err}");
+    }
+
+    #[test]
+    fn v1_database_upgrades_to_v2_without_losing_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        // 只建 v1 schema，模拟旧版本留下的库
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+        create_project(&conn, "旧项目", "E:/old").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(list_projects(&conn).unwrap()[0].name, "旧项目");
+        assert_eq!(cue_count(&conn, 1).unwrap(), 0, "新表应当可用");
     }
 }

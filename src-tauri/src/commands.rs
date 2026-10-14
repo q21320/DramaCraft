@@ -3,9 +3,10 @@
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AppInfo, AsrStatus, Media, Project, Segment, SliceMode, SlicePlan, ToolPaths, ToolReport,
+    AppInfo, AsrOutcome, AsrRequest, AsrStatus, Cue, ExportOptions, ExportOutcome, Media, Project,
+    Segment, SliceMode, SlicePlan, ToolPaths, ToolReport,
 };
-use crate::{asr, media, tools, AppState};
+use crate::{asr, export, media, subtitle, tools, AppState};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
@@ -278,4 +279,252 @@ pub async fn run_slice(
 pub fn list_segments(state: tauri::State<'_, AppState>, media_id: i64) -> AppResult<Vec<Segment>> {
     let conn = lock_db(&state)?;
     db::list_segments(&conn, media_id)
+}
+
+// ---------------- 字幕 ----------------
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SrtImportOutcome {
+    pub count: i64,
+    pub warnings: Vec<String>,
+}
+
+#[tauri::command]
+pub fn list_cues(state: tauri::State<'_, AppState>, media_id: i64) -> AppResult<Vec<Cue>> {
+    let conn = lock_db(&state)?;
+    db::list_cues(&conn, media_id)
+}
+
+/// 整体覆盖某个素材的字幕（前端编辑后保存走这里）。
+#[tauri::command]
+pub fn replace_cues(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    cues: Vec<Cue>,
+) -> AppResult<i64> {
+    let mut conn = lock_db(&state)?;
+    db::replace_cues(&mut conn, media_id, &cues)
+}
+
+/// 导入 SRT。解析告警会一并返回，前端必须展示 —— 不静默丢内容。
+#[tauri::command]
+pub fn import_srt(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    path: String,
+) -> AppResult<SrtImportOutcome> {
+    let text = std::fs::read_to_string(path.trim())
+        .map_err(|e| AppError::Msg(format!("读取字幕文件失败：{e}")))?;
+    let (cues, warnings) = subtitle::parse_srt(&text);
+    if cues.is_empty() {
+        return Err(AppError::Msg(format!(
+            "没有解析出任何字幕（{} 条告警）",
+            warnings.len()
+        )));
+    }
+    let mut conn = lock_db(&state)?;
+    let count = db::replace_cues(&mut conn, media_id, &cues)?;
+    Ok(SrtImportOutcome { count, warnings })
+}
+
+#[tauri::command]
+pub fn export_srt(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    path: String,
+) -> AppResult<i64> {
+    let cues = {
+        let conn = lock_db(&state)?;
+        db::list_cues(&conn, media_id)?
+    };
+    if cues.is_empty() {
+        return Err(AppError::Msg("这个素材还没有字幕".into()));
+    }
+    let path = PathBuf::from(path.trim());
+    if path.as_os_str().is_empty() {
+        return Err(AppError::Msg("请先设置字幕保存路径".into()));
+    }
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    std::fs::write(&path, subtitle::to_srt(&cues))?;
+    Ok(cues.len() as i64)
+}
+
+// ---------------- ASR ----------------
+
+/// worker 脚本位置：打包后在资源目录，开发时在 `src-tauri/resources`。
+fn worker_script(app: &tauri::AppHandle) -> PathBuf {
+    if let Ok(dir) = app.path().resource_dir() {
+        for candidate in [dir.join("resources").join("asr_worker.py"), dir.join("asr_worker.py")] {
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("asr_worker.py")
+}
+
+/// 跑一次 ASR 并把结果整片覆盖到该素材的字幕上。长任务，走 blocking 线程池。
+#[tauri::command]
+pub async fn asr_transcribe(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    model: String,
+    language: String,
+) -> AppResult<AsrOutcome> {
+    let (python, worker, audio) = {
+        let configured = lock_tools(&state)?.clone();
+        let python = tools::require(&configured.python, "python")?;
+        let conn = lock_db(&state)?;
+        let target = db::get_media(&conn, media_id)?;
+        (python, worker_script(&app), target.path)
+    };
+
+    let model = if model.trim().is_empty() {
+        asr::DEFAULT_MODEL.to_string()
+    } else {
+        model.trim().to_string()
+    };
+    let language = if language.trim().is_empty() {
+        "zh".to_string()
+    } else {
+        language.trim().to_string()
+    };
+
+    let request = AsrRequest {
+        audio,
+        model: model.clone(),
+        language,
+        model_dir: String::new(),
+        device: "auto".into(),
+        compute_type: String::new(),
+    };
+
+    let python_task = python.clone();
+    let worker_task = worker.clone();
+    let response = tauri::async_runtime::spawn_blocking(move || {
+        asr::transcribe(&python_task, &worker_task, &request, asr::default_timeout())
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("ASR 线程异常终止：{e}")))??;
+
+    let cues = asr::response_to_cues(&response, media_id);
+    if cues.is_empty() {
+        return Err(AppError::Msg(
+            "转写流程跑完了，但没有识别出任何语音内容（素材可能是纯音乐或静音）".into(),
+        ));
+    }
+    let count = {
+        let mut conn = lock_db(&state)?;
+        db::replace_cues(&mut conn, media_id, &cues)?
+    };
+
+    Ok(AsrOutcome {
+        cue_count: count,
+        language: response.language.clone(),
+        model: response.model.clone(),
+        duration_ms: (response.duration * 1000.0).round() as i64,
+        log: format!(
+            "模型 {}，语言 {}，共 {} 条字幕",
+            response.model,
+            if response.language.is_empty() {
+                "未知"
+            } else {
+                &response.language
+            },
+            count
+        ),
+    })
+}
+
+// ---------------- 成片导出 ----------------
+
+/// 与成片同名的字幕文件路径（如 `final.mp4` → `final.srt`）。
+fn srt_beside(out_path: &str) -> PathBuf {
+    let path = PathBuf::from(out_path.trim());
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "subtitle".into());
+    let dir = path
+        .parent()
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    dir.join(format!("{stem}.srt"))
+}
+
+#[tauri::command]
+pub async fn export_video(
+    state: tauri::State<'_, AppState>,
+    opts: ExportOptions,
+) -> AppResult<ExportOutcome> {
+    let (ffmpeg, input_path, subtitle_path) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let conn = lock_db(&state)?;
+        let target = db::get_media(&conn, opts.media_id)?;
+
+        let subtitle_path = if opts.burn_subtitles {
+            let cues = db::list_cues(&conn, opts.media_id)?;
+            if cues.is_empty() {
+                return Err(AppError::Msg(
+                    "这个素材还没有字幕，先生成或导入 SRT 再烧进画面".into(),
+                ));
+            }
+            let ranged = opts.end_ms > opts.start_ms;
+            let effective = if ranged {
+                subtitle::project_range(&cues, opts.start_ms, opts.end_ms, 200)
+            } else {
+                cues
+            };
+            if effective.is_empty() {
+                return Err(AppError::Msg("所选区间内没有字幕".into()));
+            }
+            // 字幕与成片同名放在一起：既能被 ffmpeg 同目录读取，也顺手留给用户
+            let srt_path = srt_beside(&opts.out_path);
+            if let Some(dir) = srt_path.parent() {
+                if !dir.as_os_str().is_empty() {
+                    std::fs::create_dir_all(dir)?;
+                }
+            }
+            std::fs::write(&srt_path, subtitle::to_srt(&effective))?;
+            Some(srt_path)
+        } else {
+            None
+        };
+
+        (ffmpeg, target.path, subtitle_path)
+    };
+
+    let ffmpeg_task = ffmpeg.clone();
+    let input_task = input_path.clone();
+    let subtitle_task = subtitle_path.clone();
+    let opts_task = opts.clone();
+
+    let mut outcome = tauri::async_runtime::spawn_blocking(move || {
+        export::export(
+            &ffmpeg_task,
+            Path::new(&input_task),
+            &opts_task,
+            subtitle_task.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("导出线程异常终止：{e}")))??;
+
+    if let Some(srt) = &subtitle_path {
+        outcome.log = format!(
+            "字幕已同步导出：{}\n{}",
+            srt.to_string_lossy(),
+            outcome.log
+        );
+    }
+    Ok(outcome)
 }

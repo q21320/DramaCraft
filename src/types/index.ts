@@ -63,6 +63,58 @@ export interface AsrStatus {
   detail: string;
 }
 
+// ---------------- 字幕 ----------------
+
+/** 一条字幕。`id` 为 0 表示尚未落库 */
+export interface Cue {
+  id: number;
+  mediaId: number;
+  indexNo: number;
+  startMs: number;
+  endMs: number;
+  text: string;
+}
+
+export interface AsrOutcome {
+  cueCount: number;
+  language: string;
+  model: string;
+  durationMs: number;
+  log: string;
+}
+
+export interface SrtImportOutcome {
+  count: number;
+  warnings: string[];
+}
+
+// ---------------- 导出 ----------------
+
+/** 与 Rust 侧 `AspectMode` 的 serde tag 形状一一对应 */
+export type AspectMode =
+  | { mode: "keep" }
+  | { mode: "verticalBlur" }
+  | { mode: "verticalCrop" };
+
+export interface ExportOptions {
+  mediaId: number;
+  outPath: string;
+  burnSubtitles: boolean;
+  aspect: AspectMode;
+  startMs: number;
+  endMs: number;
+  crf: number;
+  preset: string;
+}
+
+export interface ExportOutcome {
+  outPath: string;
+  sizeBytes: number;
+  durationMs: number;
+  filter: string;
+  log: string;
+}
+
 export interface AppInfo {
   name: string;
   version: string;
