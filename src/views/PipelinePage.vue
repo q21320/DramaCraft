@@ -1,5 +1,5 @@
-﻿<script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+<script setup lang="ts">
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   NAlert,
   NButton,
@@ -45,6 +45,25 @@ const activeRun = computed(() => runs.value.find((r) => r.id === activeRunId.val
 const totalSlices = computed(() =>
   outputs.value.reduce((n, e) => n + e.slices.length, 0),
 );
+
+/**
+ * 最后一次成功刷新的时刻。
+ *
+ * 为什么要显示它：光让数字悄悄变，用户根本看不出来界面是活的
+ * —— 上一轮就是这个毛病，库里任务一直在涨，用户以为程序卡死了。
+ * 摆一个走动的时钟，「在实时更新」这件事才看得见。
+ */
+const lastUpdated = ref<Date | null>(null);
+
+/** 有没有正在跑的流水线 —— 决定刷新频率，也决定页面上要不要显示「正在跑」 */
+const busy = computed(() => runs.value.some((r) => r.status === "running"));
+
+const lastUpdatedText = computed(() => {
+  if (!lastUpdated.value) return "";
+  const d = lastUpdated.value;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+});
 
 function humanSize(bytes: number): string {
   if (bytes <= 0) return "—";
@@ -112,6 +131,7 @@ async function refreshRuns() {
     }
     // 顺带刷产出 —— 这样切片一出来就能看见，不用等整条流水线跑完
     await loadOutputs(activeRunId.value);
+    lastUpdated.value = new Date();
   } catch (e) {
     message.error((e as Error).message);
   }
@@ -238,14 +258,10 @@ let timer: number | null = null;
  */
 function startPolling() {
   stopPolling();
-  // 没有正在跑的流水线时慢一点，有的话快一点
-  const busy = runs.value.some((r) => r.status === "running");
+  // 有流水线在跑时快一点，空闲时慢一点省电
   timer = window.setInterval(() => {
-    void refreshRuns().then(() => {
-      const stillBusy = runs.value.some((r) => r.status === "running");
-      if (stillBusy !== busy) startPolling(); // 忙闲切换时调整频率
-    });
-  }, busy ? 2000 : 8000);
+    void refreshRuns();
+  }, busy.value ? 1500 : 8000);
 }
 
 function stopPolling() {
@@ -264,6 +280,8 @@ onMounted(async () => {
   }
   await refreshRuns();
   startPolling();
+  // 忙闲切换时调整刷新频率
+  watch(busy, () => startPolling());
   unlisten = await listen("queue:progress", () => {
     void refreshRuns();
   });
@@ -376,7 +394,15 @@ onUnmounted(() => {
   <div class="dd-card">
     <div class="dd-row" style="justify-content: space-between; margin-bottom: 10px">
       <div class="dd-card-title">运行记录</div>
-      <n-button size="small" @click="refreshRuns">刷新</n-button>
+      <n-space :size="10" align="center">
+        <!-- 「在动」要看得见：光让数字悄悄变，用户会以为卡死了 -->
+        <span v-if="busy" class="dd-live">
+          <span class="dd-dot" />正在跑
+        </span>
+        <span v-else class="dd-muted">空闲</span>
+        <span class="dd-muted dd-clock">最后更新 {{ lastUpdatedText || "—" }}</span>
+        <n-button size="small" @click="refreshRuns">刷新</n-button>
+      </n-space>
     </div>
 
     <div v-if="runs.length === 0" class="dd-empty">还没跑过流水线。</div>
@@ -535,6 +561,37 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* 「正在跑」的呼吸点 */
+.dd-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #18a058;
+}
+.dd-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #18a058;
+  animation: dd-pulse 1.1s ease-in-out infinite;
+}
+@keyframes dd-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.25;
+    transform: scale(0.7);
+  }
+}
+/* 时钟用等宽数字，跳动时不会左右晃 */
+.dd-clock {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
 .dd-ep {
   border: 1px solid rgba(128, 128, 128, 0.22);
   border-radius: 6px;

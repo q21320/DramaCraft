@@ -97,13 +97,19 @@ pub fn build_video_filter(raw: &TransformOptions, target: Option<(u32, u32)>) ->
             Some((w, h)) => {
                 let cw = even(w as f64 * keep);
                 let ch = even(h as f64 * keep);
-                parts.push(format!("crop={cw}:{ch}"));
+                // 横向居中、纵向**贴底**。
+                //
+                // 不能居中裁：字幕通常压在画面底部，居中裁会把底部那一条切掉，
+                // 字幕就缺一半。真实素材上撞到过（那部片子带硬字幕）。
+                // 贴底裁等于只从上方和两侧收，底部原样保留。
+                parts.push(format!("crop={cw}:{ch}:(iw-{cw})/2:ih-{ch}"));
                 parts.push(format!("scale={}:{}", even(w as f64), even(h as f64)));
             }
             None => {
-                // 兜底：不知道源尺寸时只能用相对表达式
+                // 兜底：不知道源尺寸时只能用相对表达式。
+                // 同样贴底：y 取 ih - 裁后高度。
                 parts.push(format!(
-                    "crop=trunc(iw*{keep:.4}/2)*2:trunc(ih*{keep:.4}/2)*2"
+                    "crop=trunc(iw*{keep:.4}/2)*2:trunc(ih*{keep:.4}/2)*2:(iw-trunc(iw*{keep:.4}/2)*2)/2:ih-trunc(ih*{keep:.4}/2)*2"
                 ));
                 parts.push(format!(
                     "scale=trunc(iw/{keep:.4}/2)*2:trunc(ih/{keep:.4}/2)*2"
@@ -283,7 +289,15 @@ pub fn preset_for(level: Intensity, index: usize) -> TransformOptions {
     };
 
     TransformOptions {
-        mirror: rng.next_f64() < 0.5,
+        // **默认不镜像。**
+        //
+        // 原来是掷硬币（50% 概率），结果真实素材上炸了：那部片子带硬字幕，
+        // 镜像之后画面里的字全反了，一半的切片直接废掉。
+        //
+        // 去重手段里，凡是会破坏画面内文字的都不该默认开。变速、调色、加噪点
+        // 都安全；裁切改成贴底裁之后也不会切到字幕；只有镜像是不可挽回的 ——
+        // 所以它必须由用户显式要求。
+        mirror: false,
         crop_ratio: rng.range(r.crop.0, r.crop.1),
         scale_ratio: rng.range(r.scale.0, r.scale.1),
         brightness: signed(&mut rng, r.brightness),
@@ -425,6 +439,51 @@ mod tests {
         assert!(is_noop(&opts()));
         assert_eq!(build_video_filter(&opts(), None), "");
         assert_eq!(build_audio_filter(&opts()), "");
+    }
+
+    /// 自动生成的参数**永远不能镜像**。
+    ///
+    /// 真实素材上炸过：那部片子带硬字幕，镜像之后画面里的字全反了，
+    /// 一半的切片直接废掉。镜像是不可挽回的，只能由用户显式要求。
+    #[test]
+    fn generated_presets_never_mirror() {
+        for level in [Intensity::Light, Intensity::Medium, Intensity::Strong] {
+            for index in 0..200 {
+                let o = preset_for(level, index);
+                assert!(
+                    !o.mirror,
+                    "{level:?} 档第 {index} 组参数镜像了 —— 会自动毁掉画面里的字幕"
+                );
+            }
+        }
+    }
+
+    /// 裁切必须贴底，不能切掉底部字幕。
+    #[test]
+    fn crop_keeps_the_bottom_edge() {
+        let mut o = opts();
+        o.crop_ratio = 0.05;
+        let f = build_video_filter(&o, Some((1080, 1920)));
+        // 贴底裁：y 用 ih - 裁后高度
+        assert!(
+            f.contains("ih-"),
+            "裁切应当贴底（保留底部字幕），实际滤镜：{f}"
+        );
+        // 横向仍居中
+        assert!(f.contains("(iw-"), "横向应当居中，实际滤镜：{f}");
+        // 1080×1920 的源裁 5%：宽 972、高 1728
+        assert!(f.contains("crop=972:1728"), "实际滤镜：{f}");
+    }
+
+    #[test]
+    fn crop_without_target_size_is_also_bottom_anchored() {
+        let mut o = opts();
+        o.crop_ratio = 0.04;
+        let f = build_video_filter(&o, None);
+        assert!(
+            f.contains("ih-trunc"),
+            "不知道源尺寸时也要贴底，实际滤镜：{f}"
+        );
     }
 
     #[test]
@@ -606,9 +665,10 @@ mod tests {
     fn crop_uses_exact_dimensions_when_source_size_is_known() {
         let mut o = opts();
         o.crop_ratio = 0.05; // keep = 0.9
+        // 横向居中、纵向贴底：字幕在底部，居中裁会切到它
         assert_eq!(
             build_video_filter(&o, Some((1080, 1920))),
-            "crop=972:1728,scale=1080:1920"
+            "crop=972:1728:(iw-972)/2:ih-1728,scale=1080:1920"
         );
     }
 

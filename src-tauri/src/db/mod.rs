@@ -803,9 +803,13 @@ pub fn get_pipeline_run(conn: &Connection, id: i64) -> AppResult<Option<Pipeline
 /// 把没跑完的流水线退回"待跑"状态。
 ///
 /// 和队列一样：进程被杀之后，`running` 是个假状态，没有人在跑它。
+///
+/// 文案要説清楚"会自己接着跑"，不能只说"退回待跑" —— 之前写的是
+/// 「上次运行被中断，已退回待跑」，用户看了以为要手动重启，问我
+/// "没办法续接上嘛"。实际上队列起来就会接着干。
 pub fn recover_interrupted_pipelines(conn: &Connection) -> AppResult<i64> {
     let changed = conn.execute(
-        "UPDATE pipeline_drama SET status = 'pending', message = '上次运行被中断，已退回待跑', updated_at = ?1
+        "UPDATE pipeline_drama SET status = 'pending', message = '上次被中断，排队的任务会自动接着跑', updated_at = ?1
           WHERE status = 'running'",
         params![now()],
     )?;
