@@ -200,6 +200,44 @@ export interface PublishPackageReport {
   warnings: string[];
 }
 
+// ---------------- 去重效果验证 ----------------
+
+export interface SimilaritySample {
+  index: number;
+  distance: number;
+  similarity: number;
+}
+
+export interface SimilarityReport {
+  before: string;
+  after: string;
+  samplesCompared: number;
+  meanDistance: number;
+  meanSimilarity: number;
+  verdict: string;
+  samples: SimilaritySample[];
+  warnings: string[];
+}
+
+export interface VerifyItem {
+  segmentId: number;
+  indexNo: number;
+  originalPath: string;
+  currentPath: string;
+  report: SimilarityReport;
+}
+
+export interface VerifyReport {
+  checked: number;
+  unchanged: number;
+  failed: number;
+  meanSimilarity: number;
+  verdict: string;
+  items: VerifyItem[];
+  errors: string[];
+  warnings: string[];
+}
+
 export interface AppInfo {
   name: string;
   version: string;

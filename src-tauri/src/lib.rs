@@ -16,6 +16,7 @@ mod publish;
 mod subtitle;
 mod tools;
 mod transform;
+mod verify;
 
 use models::ToolPaths;
 use rusqlite::Connection;
@@ -89,6 +90,7 @@ pub fn run() {
             commands::save_publish_plan,
             commands::mark_publish_status,
             commands::export_publish_package,
+            commands::verify_transform,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

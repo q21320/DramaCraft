@@ -21,6 +21,7 @@ import type {
   TransformOptions,
   TransformPreview,
   TransformReport,
+  VerifyReport,
 } from "@/types";
 
 /**
@@ -108,4 +109,8 @@ export const api = {
     call<PublishPlan>("mark_publish_status", { mediaId, platform, status, note }),
   exportPublishPackage: (mediaId: number, platform: string, outRoot: string) =>
     call<PublishPackageReport>("export_publish_package", { mediaId, platform, outRoot }),
+
+  // 去重效果验证
+  verifyTransform: (mediaId: number, samples?: number) =>
+    call<VerifyReport>("verify_transform", { mediaId, samples: samples ?? null }),
 };

@@ -5,9 +5,10 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, AsrStatus, Cue, ExportOptions, ExportOutcome, Media,
     PlatformOption, Project, PublishClipEntry, PublishPackageReport, PublishPlan, Segment,
-    SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport,
+    SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport, VerifyItem,
+    VerifyReport,
 };
-use crate::{asr, export, jy, media, publish, subtitle, tools, transform, AppState};
+use crate::{asr, export, jy, media, publish, subtitle, tools, transform, verify, AppState};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
@@ -793,13 +794,151 @@ pub fn revert_segments(
     })
 }
 
+// ---------------- 去重效果验证 ----------------
+
+/// 逐个比对「处理前 vs 处理后」的画面差异，给处理闭环。
+///
+/// 阈值是经验值：各平台判重算法不公开，这里只回答「改动幅度够不够明显」，
+/// **不承诺能过任何平台的判重**。
+#[tauri::command]
+pub async fn verify_transform(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    samples: Option<usize>,
+) -> AppResult<VerifyReport> {
+    let (ffmpeg, ffprobe, segments) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let ffprobe = tools::require(&configured.ffprobe, "ffprobe")?;
+        let conn = lock_db(&state)?;
+        let segments: Vec<Segment> = db::list_segments(&conn, media_id)?
+            .into_iter()
+            .filter(|s| s.status == "ok" && !s.out_path.trim().is_empty())
+            .collect();
+        (ffmpeg, ffprobe, segments)
+    };
+
+    if segments.is_empty() {
+        return Err(AppError::Msg(
+            "这个素材还没有成功的切片，先到「切片工作台」执行切片".into(),
+        ));
+    }
+
+    let sample_count = samples.unwrap_or(verify::DEFAULT_SAMPLES).clamp(2, 30);
+
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let mut items: Vec<VerifyItem> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut unchanged = 0i64;
+        let mut failed = 0i64;
+
+        for seg in segments {
+            if seg.original_path.trim().is_empty() {
+                unchanged += 1;
+                continue;
+            }
+            let before = PathBuf::from(&seg.original_path);
+            let after = PathBuf::from(&seg.out_path);
+            if !before.is_file() || !after.is_file() {
+                failed += 1;
+                if errors.len() < 10 {
+                    errors.push(format!("片段 {}：处理前后的文件有缺失，无法比对", seg.index_no));
+                }
+                continue;
+            }
+
+            let before_probe = match media::probe(&ffprobe, &before) {
+                Ok(p) => p,
+                Err(e) => {
+                    failed += 1;
+                    if errors.len() < 10 {
+                        errors.push(format!("片段 {}：读取原文件失败（{e}）", seg.index_no));
+                    }
+                    continue;
+                }
+            };
+            let after_probe = match media::probe(&ffprobe, &after) {
+                Ok(p) => p,
+                Err(e) => {
+                    failed += 1;
+                    if errors.len() < 10 {
+                        errors.push(format!("片段 {}：读取处理后的文件失败（{e}）", seg.index_no));
+                    }
+                    continue;
+                }
+            };
+
+            match verify::compare_files(
+                &ffmpeg,
+                &before,
+                &before_probe,
+                &after,
+                &after_probe,
+                sample_count,
+            ) {
+                Ok(report) => items.push(VerifyItem {
+                    segment_id: seg.id,
+                    index_no: seg.index_no,
+                    original_path: seg.original_path.clone(),
+                    current_path: seg.out_path.clone(),
+                    report,
+                }),
+                Err(e) => {
+                    failed += 1;
+                    if errors.len() < 10 {
+                        errors.push(format!("片段 {}：比对失败（{e}）", seg.index_no));
+                    }
+                }
+            }
+        }
+
+        (items, errors, unchanged, failed)
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("验证线程异常终止：{e}")))?;
+
+    let (items, errors, unchanged, failed) = outcome;
+    let mean = if items.is_empty() {
+        0.0
+    } else {
+        items.iter().map(|i| i.report.mean_similarity).sum::<f64>() / items.len() as f64
+    };
+
+    let mut warnings: Vec<String> = Vec::new();
+    if items.is_empty() {
+        warnings.push("没有可比对的片段：这些切片还没做过画面处理".into());
+    } else if mean >= 0.95 {
+        warnings.push(
+            "平均相似度偏高，说明改动幅度很小。可以到「画面处理」用更高档位重做一次。".into(),
+        );
+    }
+    warnings.push(
+        "结论基于感知哈希（dHash），只说明改动幅度；各平台判重算法不公开，不承诺能过任何平台的判重。"
+            .into(),
+    );
+
+    Ok(VerifyReport {
+        checked: items.len() as i64,
+        unchanged,
+        failed,
+        mean_similarity: mean,
+        verdict: if items.is_empty() {
+            "无可比对片段".to_string()
+        } else {
+            verify::verdict(mean).to_string()
+        },
+        items,
+        errors,
+        warnings,
+    })
+}
+
 // ---------------- 发布 ----------------
 
 #[tauri::command]
 pub fn list_platforms() -> AppResult<Vec<PlatformOption>> {
     Ok(publish::platform_options())
 }
-
 #[tauri::command]
 pub fn list_publish_plans(
     state: tauri::State<'_, AppState>,

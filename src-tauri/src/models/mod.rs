@@ -217,6 +217,57 @@ pub struct PlatformOption {
     pub note: String,
 }
 
+// ---------------- 去重效果验证 ----------------
+
+/// 单帧比对结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimilaritySample {
+    pub index: i64,
+    /// 汉明距离（0..=64）
+    pub distance: u32,
+    pub similarity: f64,
+}
+
+/// 两个文件的相似度报告
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimilarityReport {
+    pub before: String,
+    pub after: String,
+    pub samples_compared: i64,
+    pub mean_distance: f64,
+    pub mean_similarity: f64,
+    pub verdict: String,
+    pub samples: Vec<SimilaritySample>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyItem {
+    pub segment_id: i64,
+    pub index_no: i64,
+    pub original_path: String,
+    pub current_path: String,
+    pub report: SimilarityReport,
+}
+
+/// 一个素材下全部已处理片段的验证汇总
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyReport {
+    pub checked: i64,
+    /// 还没做过画面处理、无需验证的片段数
+    pub unchanged: i64,
+    pub failed: i64,
+    pub mean_similarity: f64,
+    pub verdict: String,
+    pub items: Vec<VerifyItem>,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 // ---------------- 字幕 ----------------
 
 /// 一条字幕。`id` 为 0 表示尚未落库；文本可含换行（SRT 的多行）。

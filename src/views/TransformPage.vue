@@ -16,7 +16,7 @@ import {
 } from "naive-ui";
 import { api } from "@/api";
 import { useAppStore } from "@/stores/app";
-import type { Segment, TransformOptions, TransformReport } from "@/types";
+import type { Segment, TransformOptions, TransformReport, VerifyReport } from "@/types";
 import { formatDuration } from "@/utils/format";
 
 const store = useAppStore();
@@ -30,6 +30,8 @@ const videoFilter = ref("");
 const audioFilter = ref("");
 const busy = ref(false);
 const report = ref<TransformReport | null>(null);
+const verifying = ref(false);
+const verifyReport = ref<VerifyReport | null>(null);
 
 const manual = ref<TransformOptions>({
   mirror: false,
@@ -167,8 +169,42 @@ function resetManual() {
   };
 }
 
+/** 差异越明显，对这个工具来说越是「好结果」 */
+function verdictType(v: string): "success" | "warning" | "error" | "default" {
+  if (v === "差异明显") return "success";
+  if (v === "有差异") return "warning";
+  if (v === "几乎没变") return "error";
+  return "default";
+}
+
+function percent(value: number): string {
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+async function runVerify() {
+  if (mediaId.value === null) {
+    message.warning("请先选择素材");
+    return;
+  }
+  if (processedCount.value === 0) {
+    message.warning("还没有处理过的片段，请先执行画面处理");
+    return;
+  }
+  verifying.value = true;
+  verifyReport.value = null;
+  try {
+    verifyReport.value = await api.verifyTransform(mediaId.value);
+    message.success(`已比对 ${verifyReport.value.checked} 个片段`);
+  } catch (e) {
+    message.error((e as Error).message);
+  } finally {
+    verifying.value = false;
+  }
+}
+
 watch(mediaId, () => {
   report.value = null;
+  verifyReport.value = null;
   void refreshSegments();
   schedulePreview();
 });
@@ -298,6 +334,14 @@ onMounted(async () => {
         <n-button size="small" type="primary" :loading="busy" :disabled="!canRun" @click="run">
           开始处理
         </n-button>
+        <n-button
+          size="small"
+          :loading="verifying"
+          :disabled="processedCount === 0"
+          @click="runVerify"
+        >
+          验证处理效果
+        </n-button>
         <n-popconfirm @positive-click="revert">
           <template #trigger>
             <n-button size="small" :loading="busy" :disabled="processedCount === 0">还原</n-button>
@@ -305,6 +349,67 @@ onMounted(async () => {
           把所有片段指回处理前的文件？处理产物会留在磁盘上，不会删除。
         </n-popconfirm>
       </n-space>
+    </div>
+
+    <div v-if="verifyReport" class="dd-card">
+      <div class="dd-row" style="justify-content: space-between">
+        <div>
+          <div class="dd-card-title">处理效果验证</div>
+          <div class="dd-card-desc">
+            已比对 {{ verifyReport.checked }} 个片段，平均相似度
+            {{ percent(verifyReport.meanSimilarity) }}
+            <span v-if="verifyReport.unchanged > 0">；另有 {{ verifyReport.unchanged }} 个片段未处理</span>
+          </div>
+        </div>
+        <n-tag size="small" :type="verdictType(verifyReport.verdict)" :bordered="false">
+          {{ verifyReport.verdict }}
+        </n-tag>
+      </div>
+
+      <div v-if="verifyReport.items.length === 0" class="dd-empty">
+        没有可比对的片段。
+      </div>
+
+      <div v-else class="dd-scroll" style="max-height: 300px">
+        <table class="dd-table">
+          <thead>
+            <tr>
+              <th style="width: 60px">#</th>
+              <th style="width: 110px">相似度</th>
+              <th style="width: 130px">平均汉明距离</th>
+              <th style="width: 110px">结论</th>
+              <th>采样帧</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in verifyReport.items" :key="item.segmentId">
+              <td>{{ item.indexNo }}</td>
+              <td class="dd-mono">{{ percent(item.report.meanSimilarity) }}</td>
+              <td class="dd-mono">{{ item.report.meanDistance.toFixed(1) }} / 64</td>
+              <td>
+                <n-tag size="tiny" :type="verdictType(item.report.verdict)" :bordered="false">
+                  {{ item.report.verdict }}
+                </n-tag>
+              </td>
+              <td class="dd-mono dd-muted">
+                {{ item.report.samplesCompared }} 帧
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <n-alert v-if="verifyReport.errors.length > 0" type="error" style="margin-top: 12px" title="失败明细">
+        <ul style="margin: 0; padding-left: 18px">
+          <li v-for="(e, i) in verifyReport.errors" :key="i" class="dd-wrap">{{ e }}</li>
+        </ul>
+      </n-alert>
+
+      <n-alert v-if="verifyReport.warnings.length > 0" type="info" style="margin-top: 12px" title="说明">
+        <ul style="margin: 0; padding-left: 18px">
+          <li v-for="(w, i) in verifyReport.warnings" :key="i" class="dd-wrap">{{ w }}</li>
+        </ul>
+      </n-alert>
     </div>
 
     <div v-if="report" class="dd-card">
