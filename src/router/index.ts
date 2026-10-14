@@ -10,6 +10,7 @@ const routes: RouteRecordRaw[] = [
   { path: "/transform", name: "transform", component: () => import("@/views/TransformPage.vue") },
   { path: "/publish", name: "publish", component: () => import("@/views/PublishPage.vue") },
   { path: "/series", name: "series", component: () => import("@/views/SeriesPage.vue") },
+  { path: "/queue", name: "queue", component: () => import("@/views/QueuePage.vue") },
   { path: "/settings", name: "settings", component: () => import("@/views/SettingsPage.vue") },
   { path: "/:pathMatch(.*)*", redirect: "/" },
 ];

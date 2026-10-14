@@ -3,7 +3,7 @@
 //! 迁移策略：只前进不回退，靠 `PRAGMA user_version` 判断。旧库能直接打开。
 
 use crate::error::AppResult;
-use crate::models::{Cue, Media, MediaProbe, Project, PublishPlan, Segment};
+use crate::models::{Cue, Job, JobCounts, Media, MediaProbe, Project, PublishPlan, Segment};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
@@ -86,8 +86,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_plan_media_platform
     ON publish_plan(media_id, platform);
 "#;
 
+/// v5：任务队列。
+const SCHEMA_V5: &str = r#"
+CREATE TABLE IF NOT EXISTS job (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_id   INTEGER,
+    kind       TEXT    NOT NULL,
+    payload    TEXT    NOT NULL DEFAULT '{}',
+    status     TEXT    NOT NULL DEFAULT 'pending',
+    message    TEXT    NOT NULL DEFAULT '',
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    NOT NULL,
+    updated_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_status ON job(status, id);
+"#;
+
 /// 当前 schema 版本。加表/加列时递增，并在 `migrate` 里补一段。
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
@@ -114,6 +130,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     }
     if version < 4 {
         conn.execute_batch(SCHEMA_V4)?;
+    }
+    if version < 5 {
+        conn.execute_batch(SCHEMA_V5)?;
     }
     if version < SCHEMA_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -533,6 +552,159 @@ pub fn set_publish_status(
     Ok(())
 }
 
+// ---------- job（任务队列） ----------
+
+pub const JOB_PENDING: &str = "pending";
+pub const JOB_RUNNING: &str = "running";
+pub const JOB_DONE: &str = "done";
+pub const JOB_FAILED: &str = "failed";
+pub const JOB_CANCELED: &str = "canceled";
+
+const JOB_COLUMNS: &str =
+    "id, media_id, kind, payload, status, message, attempts, created_at, updated_at";
+
+fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
+    Ok(Job {
+        id: row.get(0)?,
+        media_id: row.get(1)?,
+        kind: row.get(2)?,
+        payload: row.get(3)?,
+        status: row.get(4)?,
+        message: row.get(5)?,
+        attempts: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+pub fn enqueue_job(
+    conn: &Connection,
+    media_id: Option<i64>,
+    kind: &str,
+    payload: &str,
+) -> AppResult<Job> {
+    let now = now();
+    conn.execute(
+        "INSERT INTO job(media_id, kind, payload, status, message, attempts, created_at, updated_at)
+         VALUES(?1, ?2, ?3, 'pending', '', 0, ?4, ?4)",
+        params![media_id, kind, payload, now],
+    )?;
+    get_job(conn, conn.last_insert_rowid())
+}
+
+pub fn get_job(conn: &Connection, id: i64) -> AppResult<Job> {
+    let job = conn.query_row(
+        &format!("SELECT {JOB_COLUMNS} FROM job WHERE id = ?1"),
+        params![id],
+        row_to_job,
+    )?;
+    Ok(job)
+}
+
+/// 列表：正在跑的排最前，然后按入队顺序。
+pub fn list_jobs(conn: &Connection, limit: i64) -> AppResult<Vec<Job>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {JOB_COLUMNS} FROM job
+         ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, id ASC
+         LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map(params![limit.clamp(1, 2000)], row_to_job)?;
+    let mut out = Vec::new();
+    for item in rows {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
+/// 取下一条待跑任务（先入先出）。
+pub fn next_pending_job(conn: &Connection) -> AppResult<Option<Job>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {JOB_COLUMNS} FROM job WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+    ))?;
+    let mut rows = stmt.query([])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row_to_job(row)?)),
+        None => Ok(None),
+    }
+}
+
+pub fn mark_job_running(conn: &Connection, id: i64) -> AppResult<()> {
+    conn.execute(
+        "UPDATE job SET status = 'running', message = '', attempts = attempts + 1, updated_at = ?2
+          WHERE id = ?1",
+        params![id, now()],
+    )?;
+    Ok(())
+}
+
+pub fn finish_job(conn: &Connection, id: i64, status: &str, message: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE job SET status = ?2, message = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, status, message, now()],
+    )?;
+    Ok(())
+}
+
+/// 把「正在跑」的任务退回待跑。**这是断点续跑的关键一步。**
+///
+/// 进程被杀或崩溃后，库里会留下 `running` —— 那是假状态：没有人在跑它。
+/// 启动时必须退回去，否则这些任务永远不会再被拾起，界面上还会一直显示"进行中"。
+pub fn recover_interrupted_jobs(conn: &Connection) -> AppResult<i64> {
+    let changed = conn.execute(
+        "UPDATE job SET status = 'pending', message = '上次运行被中断，已退回队列', updated_at = ?1
+          WHERE status = 'running'",
+        params![now()],
+    )?;
+    Ok(changed as i64)
+}
+
+pub fn cancel_pending_jobs(conn: &Connection) -> AppResult<i64> {
+    let changed = conn.execute(
+        "UPDATE job SET status = 'canceled', message = '已取消', updated_at = ?1
+          WHERE status = 'pending'",
+        params![now()],
+    )?;
+    Ok(changed as i64)
+}
+
+/// 清掉已结束的任务（done / failed / canceled），返回删除条数。
+pub fn clear_finished_jobs(conn: &Connection) -> AppResult<i64> {
+    let changed = conn.execute(
+        "DELETE FROM job WHERE status IN ('done', 'failed', 'canceled')",
+        [],
+    )?;
+    Ok(changed as i64)
+}
+
+pub fn delete_job(conn: &Connection, id: i64) -> AppResult<()> {
+    conn.execute(
+        "DELETE FROM job WHERE id = ?1 AND status <> 'running'",
+        params![id],
+    )?;
+    Ok(())
+}
+
+pub fn job_counts(conn: &Connection) -> AppResult<JobCounts> {
+    let mut counts = JobCounts::default();
+    let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM job GROUP BY status")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for item in rows {
+        let (status, n) = item?;
+        counts.total += n;
+        match status.as_str() {
+            JOB_PENDING => counts.pending = n,
+            JOB_RUNNING => counts.running = n,
+            JOB_DONE => counts.done = n,
+            JOB_FAILED => counts.failed = n,
+            JOB_CANCELED => counts.canceled = n,
+            _ => {}
+        }
+    }
+    Ok(counts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,8 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_database_gains_publish_plan_without_losing_data() {
-        let conn = Connection::open_in_memory().unwrap();
+    fn v3_database_gains_publish_plan_without_losing_data() {        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         conn.execute_batch(SCHEMA_V1).unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
@@ -824,5 +995,123 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         assert_eq!(list_projects(&conn).unwrap()[0].name, "旧工程");
         assert_eq!(list_publish_plans(&conn, 1).unwrap().len(), 0, "新表可用");
+    }
+
+    #[test]
+    fn jobs_are_first_in_first_out() {
+        let conn = mem();
+        let a = enqueue_job(&conn, Some(1), "slice", r#"{"mediaId":1}"#).unwrap();
+        let b = enqueue_job(&conn, Some(2), "ocr", "{}").unwrap();
+        assert_eq!(a.status, JOB_PENDING);
+        assert_eq!(a.attempts, 0);
+        assert_eq!(a.payload, r#"{"mediaId":1}"#);
+
+        assert_eq!(next_pending_job(&conn).unwrap().unwrap().id, a.id);
+
+        mark_job_running(&conn, a.id).unwrap();
+        let running = get_job(&conn, a.id).unwrap();
+        assert_eq!(running.status, JOB_RUNNING);
+        assert_eq!(running.attempts, 1, "尝试次数要累加");
+        assert_eq!(
+            next_pending_job(&conn).unwrap().unwrap().id,
+            b.id,
+            "正在跑的那条不该被再次取出"
+        );
+    }
+
+    #[test]
+    fn restart_returns_running_jobs_to_pending() {
+        let conn = mem();
+        let job = enqueue_job(&conn, None, "export", "{}").unwrap();
+        mark_job_running(&conn, job.id).unwrap();
+
+        // 模拟进程被杀后重启
+        assert_eq!(recover_interrupted_jobs(&conn).unwrap(), 1);
+        let after = get_job(&conn, job.id).unwrap();
+        assert_eq!(after.status, JOB_PENDING, "假的 running 必须退回待跑");
+        assert!(!after.message.is_empty(), "要说明为什么退回");
+
+        // 没有 running 时是空操作
+        assert_eq!(recover_interrupted_jobs(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn finishing_jobs_and_counting() {
+        let conn = mem();
+        let a = enqueue_job(&conn, None, "slice", "{}").unwrap();
+        let b = enqueue_job(&conn, None, "slice", "{}").unwrap();
+        enqueue_job(&conn, None, "slice", "{}").unwrap();
+
+        mark_job_running(&conn, a.id).unwrap();
+        finish_job(&conn, a.id, JOB_DONE, "切了 10 片").unwrap();
+        mark_job_running(&conn, b.id).unwrap();
+        finish_job(&conn, b.id, JOB_FAILED, "ffmpeg 报错").unwrap();
+
+        let counts = job_counts(&conn).unwrap();
+        assert_eq!(counts.done, 1);
+        assert_eq!(counts.failed, 1);
+        assert_eq!(counts.pending, 1);
+        assert_eq!(counts.total, 3);
+        assert_eq!(get_job(&conn, a.id).unwrap().message, "切了 10 片");
+
+        assert_eq!(clear_finished_jobs(&conn).unwrap(), 2);
+        assert_eq!(job_counts(&conn).unwrap().total, 1);
+    }
+
+    #[test]
+    fn cancel_pending_leaves_running_alone() {
+        let conn = mem();
+        let running = enqueue_job(&conn, None, "slice", "{}").unwrap();
+        let waiting = enqueue_job(&conn, None, "slice", "{}").unwrap();
+        mark_job_running(&conn, running.id).unwrap();
+
+        assert_eq!(cancel_pending_jobs(&conn).unwrap(), 1);
+        assert_eq!(get_job(&conn, running.id).unwrap().status, JOB_RUNNING);
+        assert_eq!(get_job(&conn, waiting.id).unwrap().status, JOB_CANCELED);
+    }
+
+    #[test]
+    fn running_job_cannot_be_deleted() {
+        let conn = mem();
+        let job = enqueue_job(&conn, None, "slice", "{}").unwrap();
+        mark_job_running(&conn, job.id).unwrap();
+        delete_job(&conn, job.id).unwrap();
+        assert!(get_job(&conn, job.id).is_ok(), "正在跑的任务不该被删掉");
+
+        finish_job(&conn, job.id, JOB_DONE, "").unwrap();
+        delete_job(&conn, job.id).unwrap();
+        assert!(get_job(&conn, job.id).is_err(), "结束后才可以删");
+    }
+
+    #[test]
+    fn listing_puts_running_first() {
+        let conn = mem();
+        let a = enqueue_job(&conn, None, "slice", "{}").unwrap();
+        let b = enqueue_job(&conn, None, "slice", "{}").unwrap();
+        mark_job_running(&conn, b.id).unwrap();
+        let list = list_jobs(&conn, 10).unwrap();
+        assert_eq!(list[0].id, b.id, "正在跑的排最前");
+        assert_eq!(list[1].id, a.id);
+    }
+
+    #[test]
+    fn v4_database_gains_job_table_without_losing_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        create_project(&conn, "旧工程", "").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(list_projects(&conn).unwrap()[0].name, "旧工程");
+        assert_eq!(job_counts(&conn).unwrap().total, 0, "新表可用");
     }
 }

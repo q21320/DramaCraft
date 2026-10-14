@@ -8,6 +8,7 @@ import type {
   EpisodeDetection,
   ExportOptions,
   ExportOutcome,
+  Job,
   Media,
   OcrOptions,
   OcrReport,
@@ -15,6 +16,7 @@ import type {
   Project,
   PublishPackageReport,
   PublishPlan,
+  QueueState,
   ResplitReport,
   RuntimeStatus,
   Segment,
@@ -145,4 +147,22 @@ export const api = {
     }),
   resplitEpisodes: (mediaId: number, boundaries: EpisodeBoundary[], outDir: string) =>
     call<ResplitReport>("resplit_episodes", { mediaId, boundaries, outDir }),
+
+  // 任务队列
+  queueState: () => call<QueueState>("queue_state"),
+  listJobs: (limit?: number) => call<Job[]>("list_jobs", { limit: limit ?? null }),
+  enqueueJob: (mediaId: number | null, kind: string, payload: Record<string, unknown>) =>
+    call<Job>("enqueue_job", { mediaId, kind, payload: JSON.stringify(payload) }),
+  enqueueBatch: (mediaIds: number[], kind: string, payload: Record<string, unknown>) =>
+    call<number>("enqueue_batch", {
+      mediaIds,
+      kind,
+      payload: JSON.stringify(payload),
+    }),
+  startQueue: (maxJobs?: number) => call<void>("start_queue", { maxJobs: maxJobs ?? null }),
+  setQueuePaused: (paused: boolean) => call<boolean>("set_queue_paused", { paused }),
+  requestQueueStop: () => call<boolean>("request_queue_stop"),
+  cancelPendingJobs: () => call<number>("cancel_pending_jobs"),
+  clearFinishedJobs: () => call<number>("clear_finished_jobs"),
+  deleteJob: (id: number) => call<void>("delete_job", { id }),
 };

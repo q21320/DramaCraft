@@ -65,6 +65,12 @@ export const navItems: NavItem[] = [
     subtitle: "按文件名重组剧目；用片头指纹检测集边界并按集重切",
   },
   {
+    key: "queue",
+    path: "/queue",
+    label: "任务队列",
+    subtitle: "把长任务排成一队顺序跑，关掉应用再打开会接着跑",
+  },
+  {
     key: "settings",
     path: "/settings",
     label: "设置",

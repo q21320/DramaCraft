@@ -217,6 +217,56 @@ pub struct PlatformOption {
     pub note: String,
 }
 
+// ---------------- 任务队列 ----------------
+
+/// 队列里的一条任务。`payload` 是 JSON，形状由 `kind` 决定。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Job {
+    pub id: i64,
+    pub media_id: Option<i64>,
+    /// slice | transform | ocr | asr | export | draft | publish | verify
+    pub kind: String,
+    pub payload: String,
+    /// pending | running | done | failed | canceled
+    pub status: String,
+    pub message: String,
+    pub attempts: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct JobCounts {
+    pub pending: i64,
+    pub running: i64,
+    pub done: i64,
+    pub failed: i64,
+    pub canceled: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueReport {
+    pub processed: i64,
+    pub done: i64,
+    pub failed: i64,
+    pub remaining: i64,
+    /// 停止原因：跑完了 / 被暂停 / 被要求停止 / 达到本次上限
+    pub stopped_because: String,
+    pub messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueState {
+    pub running: bool,
+    pub paused: bool,
+    pub counts: JobCounts,
+}
+
 // ---------------- 剧目与集 ----------------
 
 /// 从文件名解析出来的一条素材

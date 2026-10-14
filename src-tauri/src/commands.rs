@@ -4,14 +4,16 @@ use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, Cue, EpisodeBoundary, EpisodeDetection, ExportOptions,
-    ExportOutcome, Media, OcrFrame, OcrOptions, OcrReport, PlatformOption, Project,
-    PublishClipEntry, PublishPackageReport, PublishPlan, ResplitReport, RuntimeStatus, Segment,
-    SeriesGroup, SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport,
-    VerifyItem, VerifyReport,
+    ExportOutcome, Job, Media, OcrFrame, OcrOptions, OcrReport, PlatformOption, Project,
+    PublishClipEntry, PublishPackageReport, PublishPlan, QueueState, ResplitReport, RuntimeStatus,
+    Segment, SeriesGroup, SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions,
+    TransformReport, VerifyItem, VerifyReport,
 };
 use crate::{
-    asr, export, jy, media, ocr, publish, series, subtitle, tools, transform, verify, AppState,
+    asr, export, jy, media, ocr, publish, queue, series, subtitle, tools, transform, verify,
+    AppState,
 };
+use std::sync::atomic::Ordering;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
@@ -1144,6 +1146,197 @@ pub async fn resplit_episodes(
             .collect(),
         total_duration_ms,
     })
+}
+
+// ---------------- 任务队列 ----------------
+
+#[tauri::command]
+pub fn queue_state(state: tauri::State<'_, AppState>) -> AppResult<QueueState> {
+    let conn = lock_db(&state)?;
+    Ok(QueueState {
+        running: state.queue_running.load(Ordering::SeqCst),
+        paused: state.queue_paused.load(Ordering::SeqCst),
+        counts: db::job_counts(&conn)?,
+    })
+}
+
+#[tauri::command]
+pub fn list_jobs(state: tauri::State<'_, AppState>, limit: Option<i64>) -> AppResult<Vec<Job>> {
+    let conn = lock_db(&state)?;
+    db::list_jobs(&conn, limit.unwrap_or(300))
+}
+
+#[tauri::command]
+pub fn enqueue_job(
+    state: tauri::State<'_, AppState>,
+    media_id: Option<i64>,
+    kind: String,
+    payload: Option<String>,
+) -> AppResult<Job> {
+    let kind = kind.trim().to_string();
+    if !queue::is_known_kind(&kind) {
+        return Err(AppError::Msg(format!(
+            "不支持的任务类型：{kind}（支持：{}）",
+            queue::KINDS.map(|(k, _)| k).join("/")
+        )));
+    }
+    let payload = payload.unwrap_or_else(|| "{}".to_string());
+    // 入队时先验一次 JSON，参数写错立刻报，而不是排到一半才炸
+    serde_json::from_str::<serde_json::Value>(&payload)
+        .map_err(|e| AppError::Msg(format!("参数不是合法 JSON：{e}")))?;
+
+    let conn = lock_db(&state)?;
+    db::enqueue_job(&conn, media_id, &kind, &payload)
+}
+
+/// 批量入队：同一份参数模板套用到多个素材（会自动写入各自的 `mediaId`）。
+#[tauri::command]
+pub fn enqueue_batch(
+    state: tauri::State<'_, AppState>,
+    media_ids: Vec<i64>,
+    kind: String,
+    payload: Option<String>,
+) -> AppResult<i64> {
+    let kind = kind.trim().to_string();
+    if !queue::is_known_kind(&kind) {
+        return Err(AppError::Msg(format!("不支持的任务类型：{kind}")));
+    }
+    if media_ids.is_empty() {
+        return Err(AppError::Msg("没有选择素材".into()));
+    }
+
+    let mut template: serde_json::Map<String, serde_json::Value> = match payload {
+        Some(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+            .map_err(|e| AppError::Msg(format!("参数必须是 JSON 对象：{e}")))?,
+        _ => serde_json::Map::new(),
+    };
+
+    let conn = lock_db(&state)?;
+    let mut count = 0i64;
+    for media_id in &media_ids {
+        template.insert("mediaId".to_string(), serde_json::json!(media_id));
+
+        // 批量任务里凡是要落地成文件名的，都必须按素材区分，否则会互相覆盖
+        if kind == "draft" || kind == "export" {
+            let media = db::get_media(&conn, *media_id)?;
+            let stem = media
+                .name
+                .rsplit_once('.')
+                .map(|(s, _)| s.to_string())
+                .unwrap_or_else(|| media.name.clone());
+
+            if kind == "draft" {
+                let base = template
+                    .get("draftName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let name = if base.is_empty() {
+                    format!("{stem}_切片")
+                } else {
+                    format!("{base}_{stem}")
+                };
+                template.insert(
+                    "draftName".to_string(),
+                    serde_json::json!(jy::safe_draft_name(&name)),
+                );
+            } else {
+                let raw = template
+                    .get("outPath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if raw.is_empty() {
+                    return Err(AppError::Msg("导出任务需要指定输出目录".into()));
+                }
+                let given = PathBuf::from(&raw);
+                let dir = if given.extension().is_some() {
+                    // 给的是具体文件名 → 取它所在目录，文件名按素材名重算
+                    given
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from("."))
+                } else {
+                    given
+                };
+                template.insert(
+                    "outPath".to_string(),
+                    serde_json::json!(dir
+                        .join(format!("{stem}_out.mp4"))
+                        .to_string_lossy()
+                        .to_string()),
+                );
+            }
+        }
+
+        let text = serde_json::Value::Object(template.clone()).to_string();
+        db::enqueue_job(&conn, Some(*media_id), &kind, &text)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// 启动队列。后台跑、立即返回，进度通过 `queue:progress` 事件推送。
+#[tauri::command]
+pub fn start_queue(app: tauri::AppHandle, max_jobs: Option<i64>) -> AppResult<()> {
+    {
+        let state = app.state::<AppState>();
+        if state.queue_running.load(Ordering::SeqCst) {
+            return Err(AppError::Msg("队列已经在跑了".into()));
+        }
+        // 顺手清掉暂停标记，否则「暂停 → 再点启动」会立刻又停下
+        state.queue_paused.store(false, Ordering::SeqCst);
+    }
+
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        match queue::run(handle.clone(), max_jobs).await {
+            Ok(report) => {
+                let _ = handle.emit("queue:finished", &report);
+            }
+            Err(e) => {
+                let _ = handle.emit(
+                    "queue:finished",
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_queue_paused(state: tauri::State<'_, AppState>, paused: bool) -> AppResult<bool> {
+    state.queue_paused.store(paused, Ordering::SeqCst);
+    Ok(paused)
+}
+
+/// 请求停止：**跑完当前这条**才停，不会把正在编码的 ffmpeg 砍掉。
+#[tauri::command]
+pub fn request_queue_stop(state: tauri::State<'_, AppState>) -> AppResult<bool> {
+    state.queue_cancel.store(true, Ordering::SeqCst);
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn cancel_pending_jobs(state: tauri::State<'_, AppState>) -> AppResult<i64> {
+    let conn = lock_db(&state)?;
+    db::cancel_pending_jobs(&conn)
+}
+
+#[tauri::command]
+pub fn clear_finished_jobs(state: tauri::State<'_, AppState>) -> AppResult<i64> {
+    let conn = lock_db(&state)?;
+    db::clear_finished_jobs(&conn)
+}
+
+/// 删掉单条任务（正在跑的不允许删）。
+#[tauri::command]
+pub fn delete_job(state: tauri::State<'_, AppState>, id: i64) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    db::delete_job(&conn, id)
 }
 
 // ---------------- 去重效果验证 ----------------

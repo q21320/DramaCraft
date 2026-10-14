@@ -66,6 +66,53 @@ export interface RuntimeStatus {
   detail: string;
 }
 
+// ---------------- 任务队列 ----------------
+
+export interface Job {
+  id: number;
+  mediaId: number | null;
+  /** slice | transform | ocr | asr | export | draft | publish | verify */
+  kind: string;
+  payload: string;
+  /** pending | running | done | failed | canceled */
+  status: string;
+  message: string;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface JobCounts {
+  pending: number;
+  running: number;
+  done: number;
+  failed: number;
+  canceled: number;
+  total: number;
+}
+
+export interface QueueState {
+  running: boolean;
+  paused: boolean;
+  counts: JobCounts;
+}
+
+export interface QueueReport {
+  processed: number;
+  done: number;
+  failed: number;
+  remaining: number;
+  stoppedBecause: string;
+  messages: string[];
+}
+
+export interface QueueProgress {
+  jobId: number;
+  kind: string;
+  phase: "running" | "done" | "failed";
+  message?: string;
+}
+
 // ---------------- 剧目与集 ----------------
 
 export interface SeriesFile {

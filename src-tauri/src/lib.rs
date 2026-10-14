@@ -14,6 +14,7 @@ mod models;
 mod ocr;
 mod proc;
 mod publish;
+mod queue;
 mod series;
 mod subtitle;
 mod tools;
@@ -22,12 +23,19 @@ mod verify;
 
 use models::ToolPaths;
 use rusqlite::Connection;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 use tauri::Manager;
 
 pub struct AppState {
     pub db: Mutex<Connection>,
     pub tools: Mutex<ToolPaths>,
+    /// 队列是否正在跑（同时只允许一个 runner）
+    pub queue_running: AtomicBool,
+    /// 暂停标记：跑完当前这条后不再取新的
+    pub queue_paused: AtomicBool,
+    /// 停止请求：同样在当前任务跑完后生效
+    pub queue_cancel: AtomicBool,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -40,6 +48,10 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let conn = db::open(&data_dir.join("dramadist.db"))?;
+
+            // 断点续跑第一步：进程被杀后库里会留下假的 running —— 没有人在跑它。
+            // 必须退回 pending，否则这些任务永远不会再被拾起。
+            let recovered = db::recover_interrupted_jobs(&conn)?;
 
             // 自动探测一遍，再用用户上次保存的路径覆盖
             let mut paths = tools::initial_paths();
@@ -59,7 +71,14 @@ pub fn run() {
             app.manage(AppState {
                 db: Mutex::new(conn),
                 tools: Mutex::new(paths),
+                queue_running: AtomicBool::new(false),
+                queue_paused: AtomicBool::new(false),
+                queue_cancel: AtomicBool::new(false),
             });
+
+            if recovered > 0 {
+                eprintln!("DramaDist: {recovered} 条队列任务在上次运行中被中断，已退回待跑");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -99,6 +118,16 @@ pub fn run() {
             commands::cluster_series_by_intro,
             commands::detect_episodes,
             commands::resplit_episodes,
+            commands::queue_state,
+            commands::list_jobs,
+            commands::enqueue_job,
+            commands::enqueue_batch,
+            commands::start_queue,
+            commands::set_queue_paused,
+            commands::request_queue_stop,
+            commands::cancel_pending_jobs,
+            commands::clear_finished_jobs,
+            commands::delete_job,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
