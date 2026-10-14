@@ -45,10 +45,15 @@ const VIDEO_EXTS: [&str; 7] = ["mp4", "mkv", "mov", "avi", "flv", "ts", "m4v"];
 const IMAGE_EXTS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "bmp"];
 const TEXT_EXTS: [&str; 2] = ["txt", "md"];
 
-/// 认封面时优先这些关键词
-const COVER_HINTS: [&str; 5] = ["封面", "cover", "poster", "海报", "folder"];
-/// 认简介时优先这些关键词
-const SYNOPSIS_HINTS: [&str; 5] = ["简介", "说明", "synopsis", "desc", "介绍"];
+/// 认封面时优先这些关键词。
+///
+/// `poster` 不是拍脑袋加的 —— 真实素材包里封面就叫 `poster.jpg`。
+const COVER_HINTS: [&str; 6] = ["封面", "cover", "poster", "海报", "folder", "thumb"];
+/// 认简介时优先这些关键词。
+///
+/// `intro` 同理：真实素材包里简介叫 `intro.txt`。这类素材包常用英文文件名，
+/// 只认中文关键词会漏掉。
+const SYNOPSIS_HINTS: [&str; 7] = ["简介", "说明", "介绍", "intro", "synopsis", "desc", "readme"];
 
 fn ext_of(path: &Path) -> String {
     path.extension()
@@ -948,6 +953,71 @@ mod tests {
         assert_eq!(outcome.queued, 1);
         assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
         assert!(outcome.skipped[0].contains("第02集"), "{:?}", outcome.skipped);
+    }
+
+    #[test]
+    fn real_world_material_pack_is_scanned_correctly() {
+        // 照着一份真实的短剧素材包写的（百度网盘下的）：
+        //   intro.txt        ← 英文名，不是「简介.txt」
+        //   poster.jpg       ← 英文名，不是「封面.jpg」
+        //   <剧名>-第01集.mp4 … 第10集.mp4
+        //   <剧名>-第11集.mp4.baiduyun.p.downloading  ← 没下完的临时文件
+        let t = TempTree::new("realpack");
+        const DRAMA: &str = "弟弟结婚，我的新车竟成了贺礼";
+        for n in 1..=10 {
+            t.file(
+                &format!("{DRAMA}/{DRAMA}-第{n:02}集.mp4"),
+                b"x",
+            );
+        }
+        // 百度网盘没下完的临时文件：扩展名是 .downloading，不能被当成视频
+        t.file(
+            &format!("{DRAMA}/{DRAMA}-第11集.mp4.baiduyun.p.downloading"),
+            b"partial",
+        );
+        t.file(&format!("{DRAMA}/intro.txt"), "简介正文".as_bytes());
+        t.file(&format!("{DRAMA}/poster.jpg"), b"img");
+
+        // 以素材包所在的那一层为根目录（里面只有一个剧的子目录）
+        let root = t.dir("pack");
+        // 把剧目录挪进 pack 下
+        let from = t.path().join(DRAMA);
+        let to = root.join(DRAMA);
+        std::fs::rename(&from, &to).unwrap();
+
+        let scan = scan_source(&root).unwrap();
+        assert_eq!(scan.dramas.len(), 1);
+
+        let d = &scan.dramas[0];
+        assert_eq!(d.name, DRAMA, "剧名应当取目录名");
+        assert_eq!(
+            d.episode_count, 10,
+            "没下完的 .baiduyun.p.downloading 不能被算成一集"
+        );
+        assert_eq!(d.synopsis, "简介正文", "intro.txt 要认出来（英文名）");
+        assert!(d.cover.ends_with("poster.jpg"), "{}", d.cover);
+        assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+
+        // 集号要连续排好
+        let nums: Vec<i64> = d.episodes.iter().filter_map(|e| e.episode).collect();
+        assert_eq!(nums, (1..=10).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn downloading_temp_files_are_not_treated_as_video() {
+        // 素材包里常混着网盘的下载中文件，扩展名千奇百怪
+        for name in [
+            "第01集.mp4.baiduyun.p.downloading",
+            "第02集.mp4.crdownload",
+            "第03集.mp4.part",
+            "第04集.mp4.!ut",
+        ] {
+            let t = TempTree::new("dl");
+            t.file(&format!("剧/{name}"), b"partial");
+            // 只有这一个文件时应当报"没找到视频"，而不是把它当成一集
+            let err = scan_source(t.path()).unwrap_err().to_string();
+            assert!(err.contains("没找到视频文件"), "{name} 被误当成了视频");
+        }
     }
 
     #[test]
