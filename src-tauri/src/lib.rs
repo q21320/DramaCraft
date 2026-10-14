@@ -15,6 +15,7 @@ mod jy;
 mod media;
 mod models;
 mod ocr;
+mod pipeline;
 mod proc;
 mod proof;
 mod publish;
@@ -111,6 +112,7 @@ pub fn run() {
             // 断点续跑第一步：进程被杀后库里会留下假的 running —— 没有人在跑它。
             // 必须退回 pending，否则这些任务永远不会再被拾起。
             let recovered = db::recover_interrupted_jobs(&conn)?;
+            let recovered_pipelines = db::recover_interrupted_pipelines(&conn)?;
 
             // 自动探测一遍，再用用户上次保存的路径覆盖
             let mut paths = tools::initial_paths();
@@ -137,6 +139,9 @@ pub fn run() {
 
             if recovered > 0 {
                 eprintln!("DramaDist: {recovered} 条队列任务在上次运行中被中断，已退回待跑");
+            }
+            if recovered_pipelines > 0 {
+                eprintln!("DramaDist: {recovered_pipelines} 部剧的流水线在上次运行中被中断，已退回待跑");
             }
 
             // 断点续跑第二步：退回队列还不够，得**真的接着跑**。
@@ -249,6 +254,13 @@ pub fn run() {
             commands::cancel_pending_jobs,
             commands::clear_finished_jobs,
             commands::delete_job,
+            commands::pipeline_stages,
+            commands::pipeline_scan,
+            commands::pipeline_default_out_dir,
+            commands::pipeline_start,
+            commands::pipeline_list,
+            commands::pipeline_get,
+            commands::pipeline_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

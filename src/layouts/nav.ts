@@ -11,6 +11,12 @@ export interface NavItem {
 
 export const navItems: NavItem[] = [
   {
+    key: "pipeline",
+    path: "/pipeline",
+    label: "流水线",
+    subtitle: "指一个源目录，从头到尾把一批剧做完（一部做完再做下一部）",
+  },
+  {
     key: "home",
     path: "/",
     label: "项目",

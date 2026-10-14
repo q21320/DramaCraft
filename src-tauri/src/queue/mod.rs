@@ -345,6 +345,22 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                 Ok(summary) => db::finish_job(&conn, job.id, db::JOB_DONE, summary)?,
                 Err(e) => db::finish_job(&conn, job.id, db::JOB_FAILED, &e.to_string())?,
             }
+
+            // 流水线任务：把进度写回它所属的那部剧。
+            // 失败时整部剧标失败 —— 一步没成，后面的步骤继续跑没有意义。
+            if let Some(drama_id) = job.pipeline_drama_id {
+                let (status, message) = match &outcome {
+                    Ok(summary) => ("running", summary.clone()),
+                    Err(e) => ("failed", e.to_string()),
+                };
+                db::update_pipeline_drama(
+                    &conn,
+                    drama_id,
+                    &job.kind,
+                    status,
+                    &format!("{}：{}", kind_label(&job.kind), crate::proc::tail(&message)),
+                )?;
+            }
         }
 
         match outcome {
@@ -394,6 +410,8 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             .db
             .lock()
             .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
+        // 队列空了就把流水线的状态收口，别让它永远停在"运行中"
+        let _ = db::refresh_pipeline_run_status(&conn);
         db::job_counts(&conn)?.pending
     };
 
@@ -439,6 +457,7 @@ mod tests {
             attempts: 0,
             created_at: String::new(),
             updated_at: String::new(),
+            pipeline_drama_id: None,
         };
         let err = parse_payload::<SlicePayload>(&job).unwrap_err().to_string();
         assert!(err.contains("#42"), "错误里要带上任务号：{err}");
@@ -457,6 +476,7 @@ mod tests {
             attempts: 0,
             created_at: String::new(),
             updated_at: String::new(),
+            pipeline_drama_id: None,
         };
         let parsed: SlicePayload = parse_payload(&job).unwrap();
         assert_eq!(parsed.media_id, 3);

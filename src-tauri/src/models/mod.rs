@@ -236,6 +236,102 @@ pub struct PlatformOption {
     pub note: String,
 }
 
+// ---------------- 流水线 ----------------
+
+/// 源目录里扫描到的一集
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceEpisode {
+    pub path: String,
+    pub file_name: String,
+    /// 解析出的集号；认不出为 null
+    pub episode: Option<i64>,
+    pub size_bytes: i64,
+}
+
+/// 源目录里扫描到的一部剧
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceDrama {
+    pub name: String,
+    pub dir: String,
+    pub episode_count: i64,
+    pub episodes: Vec<SourceEpisode>,
+    /// 简介正文（已读出来）
+    pub synopsis: String,
+    pub synopsis_path: String,
+    pub cover: String,
+    /// 扫描时发现的问题，逐条说清
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceScan {
+    pub root: String,
+    pub total_episodes: i64,
+    pub dramas: Vec<SourceDrama>,
+    pub warnings: Vec<String>,
+}
+
+/// 流水线里可以做的一步。顺序即执行顺序。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineStage {
+    pub key: String,
+    pub label: String,
+    /// 这一步是不是默认勾选
+    pub enabled_by_default: bool,
+    /// 一句话说明它做什么
+    pub detail: String,
+}
+
+/// 起一条流水线之后拿到的结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartOutcome {
+    pub run_id: i64,
+    pub drama_count: i64,
+    pub imported: i64,
+    /// 排进队列的任务数
+    pub queued: i64,
+    /// 读不出来、被跳过的文件及原因
+    pub skipped: Vec<String>,
+}
+
+/// 一部剧在流水线里的进度
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineDrama {
+    pub id: i64,
+    pub run_id: i64,
+    pub name: String,
+    pub src_dir: String,
+    pub out_dir: String,
+    pub episode_count: i64,
+    /// 最后完成的步骤 key；空串表示还没开始
+    pub stage: String,
+    /// pending | running | done | failed | skipped
+    pub status: String,
+    pub message: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineRun {
+    pub id: i64,
+    pub root_dir: String,
+    pub out_dir: String,
+    /// 勾选的步骤，JSON 数组
+    pub stages: String,
+    pub status: String,
+    pub drama_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub dramas: Vec<PipelineDrama>,
+}
+
 // ---------------- 用户自备素材库 ----------------
 
 /// 素材库里的一条素材。**全部由用户导入**，程序不内置任何第三方素材。
@@ -495,6 +591,9 @@ pub struct Job {
     pub attempts: i64,
     pub created_at: String,
     pub updated_at: String,
+    /// 属于哪部剧（流水线任务才有）
+    #[serde(default)]
+    pub pipeline_drama_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

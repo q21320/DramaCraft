@@ -68,6 +68,68 @@ export interface RuntimeStatus {
   detail: string;
 }
 
+// ---------------- 流水线 ----------------
+
+export interface SourceEpisode {
+  path: string;
+  fileName: string;
+  episode: number | null;
+  sizeBytes: number;
+}
+
+export interface SourceDrama {
+  name: string;
+  dir: string;
+  episodeCount: number;
+  episodes: SourceEpisode[];
+  synopsis: string;
+  synopsisPath: string;
+  cover: string;
+  warnings: string[];
+}
+
+export interface SourceScan {
+  root: string;
+  totalEpisodes: number;
+  dramas: SourceDrama[];
+  warnings: string[];
+}
+
+export interface PipelineStageOption {
+  key: string;
+  label: string;
+  enabledByDefault: boolean;
+  detail: string;
+}
+
+export interface PipelineDrama {
+  id: number;
+  runId: number;
+  name: string;
+  srcDir: string;
+  outDir: string;
+  episodeCount: number;
+  /** 最后完成的步骤 key；空串表示还没开始 */
+  stage: string;
+  /** pending | running | done | failed | skipped */
+  status: string;
+  message: string;
+  updatedAt: string;
+}
+
+export interface PipelineRun {
+  id: number;
+  rootDir: string;
+  outDir: string;
+  /** 勾选的步骤，JSON 数组字符串 */
+  stages: string;
+  status: string;
+  dramaCount: number;
+  createdAt: string;
+  updatedAt: string;
+  dramas: PipelineDrama[];
+}
+
 // ---------------- 用户自备素材库 ----------------
 
 /** 素材库里的一条素材。全部由用户导入，程序不内置任何第三方素材。 */

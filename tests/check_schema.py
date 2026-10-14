@@ -7,8 +7,31 @@ import os
 import sqlite3
 import sys
 
-EXPECTED_VERSION = 7
-EXPECTED_TABLES = {"project", "media", "segment", "cue", "setting", "publish_plan", "job", "asset"}
+EXPECTED_VERSION = 8
+EXPECTED_TABLES = {
+    "project",
+    "media",
+    "segment",
+    "cue",
+    "setting",
+    "publish_plan",
+    "job",
+    "asset",
+    "pipeline_run",
+    "pipeline_drama",
+}
+EXPECTED_PIPELINE_DRAMA_COLUMNS = {
+    "id",
+    "run_id",
+    "name",
+    "src_dir",
+    "out_dir",
+    "episode_count",
+    "stage",
+    "status",
+    "message",
+    "updated_at",
+}
 EXPECTED_ASSET_COLUMNS = {
     "id",
     "kind",
@@ -99,6 +122,17 @@ print("asset columns =", sorted(asset_columns))
 missing_asset = EXPECTED_ASSET_COLUMNS - asset_columns
 if missing_asset:
     problems.append(f"asset 缺少列：{sorted(missing_asset)}")
+
+drama_columns = {r[1] for r in con.execute("PRAGMA table_info(pipeline_drama)")}
+print("pipeline_drama columns =", sorted(drama_columns))
+missing_drama = EXPECTED_PIPELINE_DRAMA_COLUMNS - drama_columns
+if missing_drama:
+    problems.append(f"pipeline_drama 缺少列：{sorted(missing_drama)}")
+
+job_columns = {r[1] for r in con.execute("PRAGMA table_info(job)")}
+print("job columns =", sorted(job_columns))
+if "pipeline_drama_id" not in job_columns:
+    problems.append("job 缺少 pipeline_drama_id —— 流水线任务没法挂到剧上")
 
 if problems:
     for p in problems:

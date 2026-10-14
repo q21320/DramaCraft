@@ -6,15 +6,16 @@ use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, Asset, AssetApplyReport, AssetImportReport, AssetKindOption,
     AssetSummary, CloudConfigView, CloudTestResult, CloudTranscribeReport, CostDocRequest, Cue,
     DiscoveredAsset, DocxReport, EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome,
-    IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PlatformOption, Project,
+    IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
+    PipelineStage, PlatformOption, Project,
     ProofLayout, ProofPreview, ProofRenderReport, PublishAccount, PublishClipEntry,
     PublishPackageReport, PublishPlan, QueueState, ResplitReport, RuntimeStatus, Segment,
-    SeriesGroup, SliceMode, SlicePlan, ToolPaths, ToolReport, TransformOptions, TransformReport,
-    VerifyItem, VerifyReport,
+    SeriesGroup, SliceMode, SlicePlan, SourceScan, ToolPaths, ToolReport,
+    TransformOptions, TransformReport, VerifyItem, VerifyReport,
 };
 use crate::{
-    asr, asset, cloud, docx, export, jy, media, ocr, proof, publish, queue, series, subtitle, tools,
-    transform, verify, AppState,
+    asr, asset, cloud, docx, export, jy, media, ocr, pipeline, proof, publish, queue, series,
+    subtitle, tools, transform, verify, AppState,
 };
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -1714,6 +1715,141 @@ pub async fn cloud_transcribe(
             "上传的是抽取出的音频，不是整个视频文件。".to_string(),
         ],
     })
+}
+
+// ---------------- 流水线 ----------------
+
+/// 流水线能做哪些步骤（界面据此渲染勾选项）
+#[tauri::command]
+pub fn pipeline_stages() -> AppResult<Vec<PipelineStage>> {
+    Ok(pipeline::stage_list())
+}
+
+/// 扫描源目录：一个目录进去，一批剧目出来。
+///
+/// 这是整条流水线的入口 —— 指一个目录，剩下的交给后面的步骤。
+#[tauri::command]
+pub fn pipeline_scan(root: String) -> AppResult<SourceScan> {
+    let root = root.trim();
+    if root.is_empty() {
+        return Err(AppError::Msg("请先选择源目录".into()));
+    }
+    pipeline::scan_source(Path::new(root))
+}
+
+/// 默认导出目录：源目录旁边加「二创」，不污染原素材。
+#[tauri::command]
+pub fn pipeline_default_out_dir(root: String) -> AppResult<String> {
+    if root.trim().is_empty() {
+        return Err(AppError::Msg("请先选择源目录".into()));
+    }
+    Ok(pipeline::default_out_dir(Path::new(root.trim()), "二创")
+        .to_string_lossy()
+        .to_string())
+}
+
+/// 开始一条流水线。
+///
+/// 做三件事：给这次运行建一条记录、把每部剧的每一集导入素材库、
+/// 然后**按步骤顺序**把任务排进队列（不是按剧排——先把所有剧都切完，
+/// 再统一起字幕，批量处理时更顺）。
+#[tauri::command]
+pub fn pipeline_start(
+    state: tauri::State<'_, AppState>,
+    root: String,
+    out_dir: String,
+    stages: Vec<String>,
+    slice_seconds: Option<f64>,
+    model: Option<String>,
+) -> AppResult<PipelineRun> {
+    let root_path = PathBuf::from(root.trim());
+    if root_path.as_os_str().is_empty() {
+        return Err(AppError::Msg("请先选择源目录".into()));
+    }
+
+    let enabled: Vec<String> = stages
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if enabled.is_empty() {
+        return Err(AppError::Msg("至少要勾选一个步骤".into()));
+    }
+    for key in &enabled {
+        if !pipeline::is_known_stage(key) {
+            return Err(AppError::Msg(format!("不认识的步骤：{key}")));
+        }
+    }
+
+    let out_root = if out_dir.trim().is_empty() {
+        pipeline::default_out_dir(&root_path, "二创")
+    } else {
+        PathBuf::from(out_dir.trim())
+    };
+    let slice_ms = ((slice_seconds.unwrap_or(40.0)).clamp(3.0, 600.0) * 1000.0).round() as i64;
+    let asr_model = model.unwrap_or_default();
+
+    let ffprobe = {
+        let configured = lock_tools(&state)?.clone();
+        tools::require(&configured.ffprobe, "ffprobe")?
+    };
+
+    let conn = lock_db(&state)?;
+    let outcome = pipeline::start_pipeline(
+        &conn,
+        &ffprobe,
+        &root_path,
+        &out_root,
+        &enabled,
+        slice_ms,
+        &asr_model,
+    )?;
+
+    if !outcome.skipped.is_empty() {
+        // 读不出来的文件不能悄悄咽掉 —— 但要让它可查，而不是弹一堆错误
+        eprintln!(
+            "DramaDist: 流水线有 {} 个文件没能导入：{}",
+            outcome.skipped.len(),
+            outcome.skipped.join("；")
+        );
+    }
+    if outcome.imported == 0 {
+        return Err(AppError::Msg(format!(
+            "一部剧的素材都没能导入。{}",
+            outcome.skipped.first().cloned().unwrap_or_default()
+        )));
+    }
+
+    db::get_pipeline_run(&conn, outcome.run_id)?
+        .ok_or_else(|| AppError::Msg("流水线建好了却读不出来".into()))
+}
+
+#[tauri::command]
+pub fn pipeline_list(state: tauri::State<'_, AppState>, limit: Option<i64>) -> AppResult<Vec<PipelineRun>> {
+    let conn = lock_db(&state)?;
+    db::list_pipeline_runs(&conn, limit.unwrap_or(20))
+}
+
+#[tauri::command]
+pub fn pipeline_get(state: tauri::State<'_, AppState>, id: i64) -> AppResult<Option<PipelineRun>> {
+    let conn = lock_db(&state)?;
+    db::get_pipeline_run(&conn, id)
+}
+
+/// 取消一条流水线：把它所有还没跑的任务撤掉。
+#[tauri::command]
+pub fn pipeline_cancel(state: tauri::State<'_, AppState>, id: i64) -> AppResult<i64> {
+    let conn = lock_db(&state)?;
+    let dramas = db::list_pipeline_dramas(&conn, id)?;
+    let mut canceled = 0i64;
+    for drama in dramas {
+        canceled += db::cancel_jobs_of_drama(&conn, drama.id)?;
+        if drama.status != "done" {
+            db::update_pipeline_drama(&conn, drama.id, &drama.stage, "skipped", "已取消")?;
+        }
+    }
+    db::set_pipeline_run_status(&conn, id, db::RUN_CANCELED)?;
+    Ok(canceled)
 }
 
 // ---------------- 任务队列 ----------------

@@ -4,8 +4,8 @@
 
 use crate::error::AppResult;
 use crate::models::{
-    Asset, AssetSummary, Cue, Job, JobCounts, Media, MediaProbe, Project, PublishAccount,
-    PublishPlan, Segment,
+    Asset, AssetSummary, Cue, Job, JobCounts, Media, MediaProbe, PipelineDrama, PipelineRun,
+    Project, PublishAccount, PublishPlan, Segment,
 };
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -133,8 +133,39 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_path ON asset(path);
 CREATE INDEX IF NOT EXISTS idx_asset_kind ON asset(kind, category, name);
 "#;
 
+/// v8：流水线。一次运行 = 一个源目录；一部剧一行，记录它走到哪一步。
+const SCHEMA_V8: &str = r#"
+CREATE TABLE IF NOT EXISTS pipeline_run (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_dir    TEXT    NOT NULL,
+    out_dir     TEXT    NOT NULL DEFAULT '',
+    stages      TEXT    NOT NULL DEFAULT '[]',
+    status      TEXT    NOT NULL DEFAULT 'running',
+    created_at  TEXT    NOT NULL,
+    updated_at  TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_drama (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        INTEGER NOT NULL REFERENCES pipeline_run(id) ON DELETE CASCADE,
+    name          TEXT    NOT NULL,
+    src_dir       TEXT    NOT NULL,
+    out_dir       TEXT    NOT NULL DEFAULT '',
+    episode_count INTEGER NOT NULL DEFAULT 0,
+    stage         TEXT    NOT NULL DEFAULT '',
+    status        TEXT    NOT NULL DEFAULT 'pending',
+    message       TEXT    NOT NULL DEFAULT '',
+    updated_at    TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_drama_run ON pipeline_drama(run_id, id);
+
+-- 任务要知道自己属于哪部剧，流水线才能显示进度
+ALTER TABLE job ADD COLUMN pipeline_drama_id INTEGER;
+"#;
+
 /// 当前 schema 版本。加表/加列时递增，并在 `migrate` 里补一段。
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
@@ -170,6 +201,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     }
     if version < 7 {
         conn.execute_batch(SCHEMA_V7)?;
+    }
+    if version < 8 {
+        conn.execute_batch(SCHEMA_V8)?;
     }
     if version < SCHEMA_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -636,6 +670,179 @@ pub fn list_publish_accounts(conn: &Connection) -> AppResult<Vec<PublishAccount>
     Ok(out)
 }
 
+// ---------- pipeline（流水线） ----------
+
+pub const RUN_RUNNING: &str = "running";
+pub const RUN_DONE: &str = "done";
+pub const RUN_FAILED: &str = "failed";
+pub const RUN_CANCELED: &str = "canceled";
+
+const DRAMA_COLUMNS: &str =
+    "id, run_id, name, src_dir, out_dir, episode_count, stage, status, message, updated_at";
+
+fn row_to_pipeline_drama(row: &rusqlite::Row<'_>) -> rusqlite::Result<PipelineDrama> {
+    Ok(PipelineDrama {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        name: row.get(2)?,
+        src_dir: row.get(3)?,
+        out_dir: row.get(4)?,
+        episode_count: row.get(5)?,
+        stage: row.get(6)?,
+        status: row.get(7)?,
+        message: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+pub fn create_pipeline_run(
+    conn: &Connection,
+    root_dir: &str,
+    out_dir: &str,
+    stages: &[String],
+) -> AppResult<i64> {
+    let now = now();
+    conn.execute(
+        "INSERT INTO pipeline_run(root_dir, out_dir, stages, status, created_at, updated_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?5)",
+        params![
+            root_dir,
+            out_dir,
+            serde_json::to_string(stages)?,
+            RUN_RUNNING,
+            now
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn add_pipeline_drama(
+    conn: &Connection,
+    run_id: i64,
+    name: &str,
+    src_dir: &str,
+    out_dir: &str,
+    episode_count: i64,
+) -> AppResult<i64> {
+    conn.execute(
+        "INSERT INTO pipeline_drama(run_id, name, src_dir, out_dir, episode_count, stage, status, message, updated_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, '', 'pending', '', ?6)",
+        params![run_id, name, src_dir, out_dir, episode_count, now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn update_pipeline_drama(
+    conn: &Connection,
+    id: i64,
+    stage: &str,
+    status: &str,
+    message: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE pipeline_drama SET stage = ?2, status = ?3, message = ?4, updated_at = ?5
+          WHERE id = ?1",
+        params![id, stage, status, message, now()],
+    )?;
+    Ok(())
+}
+
+pub fn set_pipeline_run_status(conn: &Connection, id: i64, status: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE pipeline_run SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, status, now()],
+    )?;
+    Ok(())
+}
+
+pub fn list_pipeline_runs(conn: &Connection, limit: i64) -> AppResult<Vec<PipelineRun>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, root_dir, out_dir, stages, status, created_at, updated_at
+           FROM pipeline_run ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit.clamp(1, 200)], |row| {
+        Ok(PipelineRun {
+            id: row.get(0)?,
+            root_dir: row.get(1)?,
+            out_dir: row.get(2)?,
+            stages: row.get(3)?,
+            status: row.get(4)?,
+            drama_count: 0,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+            dramas: Vec::new(),
+        })
+    })?;
+    let mut out = Vec::new();
+    for item in rows {
+        let mut run = item?;
+        run.dramas = list_pipeline_dramas(conn, run.id)?;
+        run.drama_count = run.dramas.len() as i64;
+        out.push(run);
+    }
+    Ok(out)
+}
+
+pub fn list_pipeline_dramas(conn: &Connection, run_id: i64) -> AppResult<Vec<PipelineDrama>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {DRAMA_COLUMNS} FROM pipeline_drama WHERE run_id = ?1 ORDER BY id ASC"
+    ))?;
+    let rows = stmt.query_map(params![run_id], row_to_pipeline_drama)?;
+    let mut out = Vec::new();
+    for item in rows {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
+pub fn get_pipeline_run(conn: &Connection, id: i64) -> AppResult<Option<PipelineRun>> {
+    let runs = list_pipeline_runs(conn, 200)?;
+    Ok(runs.into_iter().find(|r| r.id == id))
+}
+
+/// 把没跑完的流水线退回"待跑"状态。
+///
+/// 和队列一样：进程被杀之后，`running` 是个假状态，没有人在跑它。
+pub fn recover_interrupted_pipelines(conn: &Connection) -> AppResult<i64> {
+    let changed = conn.execute(
+        "UPDATE pipeline_drama SET status = 'pending', message = '上次运行被中断，已退回待跑', updated_at = ?1
+          WHERE status = 'running'",
+        params![now()],
+    )?;
+    Ok(changed as i64)
+}
+
+/// 一部剧的所有任务都结束了，就把这条流水线的状态收口。
+///
+/// 不这么做的话，运行状态会永远停在 `running` —— 界面上看着像还在跑，
+/// 其实早就没事干了。
+pub fn refresh_pipeline_run_status(conn: &Connection) -> AppResult<i64> {
+    let mut stmt = conn.prepare("SELECT id FROM pipeline_run WHERE status = ?1")?;
+    let ids: Vec<i64> = stmt
+        .query_map(params![RUN_RUNNING], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    drop(stmt);
+
+    let mut updated = 0i64;
+    for id in ids {
+        let dramas = list_pipeline_dramas(conn, id)?;
+        if dramas.is_empty() {
+            continue;
+        }
+        // 还有 pending / running 的就没跑完
+        if dramas
+            .iter()
+            .any(|d| d.status == "pending" || d.status == "running")
+        {
+            continue;
+        }
+        let failed = dramas.iter().any(|d| d.status == "failed");
+        set_pipeline_run_status(conn, id, if failed { RUN_FAILED } else { RUN_DONE })?;
+        updated += 1;
+    }
+    Ok(updated)
+}
+
 // ---------- asset（用户自备素材库） ----------
 
 const ASSET_COLUMNS: &str = "id, kind, name, path, category, tags, duration_ms, size_bytes, \
@@ -785,7 +992,7 @@ pub const JOB_FAILED: &str = "failed";
 pub const JOB_CANCELED: &str = "canceled";
 
 const JOB_COLUMNS: &str =
-    "id, media_id, kind, payload, status, message, attempts, created_at, updated_at";
+    "id, media_id, kind, payload, status, message, attempts, created_at, updated_at, pipeline_drama_id";
 
 fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     Ok(Job {
@@ -798,6 +1005,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         attempts: row.get(6)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
+        pipeline_drama_id: row.get(9)?,
     })
 }
 
@@ -807,11 +1015,22 @@ pub fn enqueue_job(
     kind: &str,
     payload: &str,
 ) -> AppResult<Job> {
+    enqueue_job_for(conn, media_id, kind, payload, None)
+}
+
+/// 入队，并可选地挂在某部剧下（流水线用）。
+pub fn enqueue_job_for(
+    conn: &Connection,
+    media_id: Option<i64>,
+    kind: &str,
+    payload: &str,
+    pipeline_drama_id: Option<i64>,
+) -> AppResult<Job> {
     let now = now();
     conn.execute(
-        "INSERT INTO job(media_id, kind, payload, status, message, attempts, created_at, updated_at)
-         VALUES(?1, ?2, ?3, 'pending', '', 0, ?4, ?4)",
-        params![media_id, kind, payload, now],
+        "INSERT INTO job(media_id, kind, payload, status, message, attempts, created_at, updated_at, pipeline_drama_id)
+         VALUES(?1, ?2, ?3, 'pending', '', 0, ?4, ?4, ?5)",
+        params![media_id, kind, payload, now, pipeline_drama_id],
     )?;
     get_job(conn, conn.last_insert_rowid())
 }
@@ -887,6 +1106,16 @@ pub fn cancel_pending_jobs(conn: &Connection) -> AppResult<i64> {
         "UPDATE job SET status = 'canceled', message = '已取消', updated_at = ?1
           WHERE status = 'pending'",
         params![now()],
+    )?;
+    Ok(changed as i64)
+}
+
+/// 撤掉某部剧还没跑的任务（流水线取消时用）。
+pub fn cancel_jobs_of_drama(conn: &Connection, drama_id: i64) -> AppResult<i64> {
+    let changed = conn.execute(
+        "UPDATE job SET status = 'canceled', message = '流水线已取消', updated_at = ?1
+          WHERE status = 'pending' AND pipeline_drama_id = ?2",
+        params![now(), drama_id],
     )?;
     Ok(changed as i64)
 }

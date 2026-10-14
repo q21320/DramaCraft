@@ -26,6 +26,8 @@ import type {
   OcrReport,
   PlatformOption,
   Project,
+  PipelineRun,
+  PipelineStageOption,
   ProofLayout,
   ProofPreview,
   ProofRenderReport,
@@ -39,6 +41,7 @@ import type {
   SeriesGroup,
   SliceMode,
   SlicePlan,
+  SourceScan,
   SrtImportOutcome,
   ToolPaths,
   ToolReport,
@@ -246,4 +249,27 @@ export const api = {
     }),
   applyLut: (mediaId: number, assetId: number, intensity: number) =>
     call<AssetApplyReport>("apply_lut", { mediaId, assetId, intensity }),
+
+  // 流水线
+  pipelineStages: () => call<PipelineStageOption[]>("pipeline_stages"),
+  pipelineScan: (root: string) => call<SourceScan>("pipeline_scan", { root }),
+  pipelineDefaultOutDir: (root: string) =>
+    call<string>("pipeline_default_out_dir", { root }),
+  pipelineStart: (
+    root: string,
+    outDir: string,
+    stages: string[],
+    sliceSeconds: number,
+    model: string,
+  ) =>
+    call<PipelineRun>("pipeline_start", {
+      root,
+      outDir,
+      stages,
+      sliceSeconds,
+      model,
+    }),
+  pipelineList: (limit?: number) => call<PipelineRun[]>("pipeline_list", { limit: limit ?? 20 }),
+  pipelineGet: (id: number) => call<PipelineRun | null>("pipeline_get", { id }),
+  pipelineCancel: (id: number) => call<number>("pipeline_cancel", { id }),
 };

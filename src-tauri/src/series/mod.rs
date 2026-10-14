@@ -102,11 +102,12 @@ pub fn parse_series(file_name: &str) -> String {
     let cleaned = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     let cleaned = cleaned.trim().to_string();
 
-    if cleaned.is_empty() {
-        stem.trim().to_string()
-    } else {
-        cleaned
-    }
+    // 剥完什么都不剩，就如实返回空 —— 说明这个文件名里压根没有剧名。
+    //
+    // 以前这里会退回原始文件名，那是个**假答案**：`第01集.mp4` 会被当成
+    // 剧名「第01集」。调用方（files_to_entries）本来就会把空串映射成「未命名」，
+    // 而流水线要靠"空"来判断"该用目录名当剧名"，所以这里必须诚实。
+    cleaned
 }
 
 /// 把路径列表解析成条目（不分组）。
@@ -453,9 +454,11 @@ mod tests {
     }
 
     #[test]
-    fn series_name_falls_back_to_whole_stem() {
+    fn a_name_without_an_episode_marker_is_kept_as_is() {
         assert_eq!(parse_series("没有集号的名字.mp4"), "没有集号的名字");
-        assert_eq!(parse_series("01.mp4"), "01");
+        // 但「01.mp4」整个就是集号 —— 剥掉之后什么都不剩，
+        // 这时返回空串才诚实（以前会退回 "01"，那是把集号当成了剧名）
+        assert_eq!(parse_series("01.mp4"), "");
     }
 
     // ---------------- 分组 ----------------
@@ -493,6 +496,21 @@ mod tests {
         let eps: Vec<Option<i64>> = groups[0].episodes.iter().map(|e| e.episode).collect();
         assert_eq!(eps, vec![Some(1), Some(2), None], "没集号的排最后");
         assert_eq!(groups[0].episodes.last().unwrap().file_name, "剧.mp4");
+    }
+
+    #[test]
+    fn filename_with_only_an_episode_marker_has_no_series_name() {
+        // 剥掉集号标记后什么都不剩 —— 这时必须如实返回空，
+        // 不能退回原始文件名，否则「第01集」会被当成剧名。
+        for name in ["第01集.mp4", "EP05.mkv", "07.mp4", "S01E07.mp4"] {
+            let got = parse_series(name);
+            assert!(
+                got.is_empty(),
+                "{name} 里没有剧名，应当返回空串，实际得到「{got}」"
+            );
+        }
+        // 而带剧名的仍然正常
+        assert_eq!(parse_series("都市爽剧_第01集.mp4"), "都市爽剧");
     }
 
     #[test]
