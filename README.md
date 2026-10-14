@@ -29,7 +29,7 @@
 | FFmpeg 切片执行（流拷贝 + 回退转码） | ✅ 已实现 |
 | ASR 字幕轴（faster-whisper 子进程） | ✅ 已实现（**运行时与 tiny 模型已内置**，装上即用） |
 | 字幕编辑 / SRT 导入导出 | ✅ 已实现 |
-| 硬字幕识别（OCR） | ✅ 已实现（需自备 Python + rapidocr_onnxruntime） |
+| 硬字幕识别（OCR） | ✅ 已实现（**运行时与模型已内置**，装上即用） |
 | 云端字幕（用户自备 Key） | ✅ 已实现（OpenAI 兼容接口，本地 mock 端到端验证） |
 | 证明材料生成（模板图填数据） | ✅ 已实现（模板 + 字段坐标，ffmpeg 渲染） |
 | 证明文档生成（成本明细 / 权属声明 docx） | ✅ 已实现（自写 OOXML + ZIP，零新增依赖） |
@@ -137,19 +137,27 @@ pwsh -File scripts/fetch-ffmpeg.ps1                    # 从官方构建下载
 pwsh -File scripts/fetch-ffmpeg.ps1 -Source E:\ffmpeg\bin   # 或从本地已有的复制
 ```
 
-### 关于内置的 ASR 运行时
+### 关于内置的 ASR / OCR 运行时
 
-`src-tauri/resources/asr_runtime/`（327 MB）里是完整的语音转字幕运行时：
-嵌入式 Python 3.13 + faster-whisper 1.2.1 + ctranslate2 + onnxruntime + Whisper tiny 模型。
+`src-tauri/resources/asr_runtime/`（941 MB）里是完整的语音与文字识别运行时：
+嵌入式 Python 3.13 + faster-whisper + ctranslate2 + onnxruntime + OpenCC
++ RapidOCR + OpenCV + Whisper tiny/small 模型。
 **不需要你装 Python，也不需要 pip install 任何东西。**
 
-- 全部组件都是宽松许可（PSF / MIT / BSD / Apache-2.0），分发本软件**不因此产生开源义务**
-- 模型只有 tiny（最小最快，准确率一般）。想换更大的规格，把模型目录放到
-  `models\<规格名>\` 下，程序启动时会自动列出来
-- 二进制不进版本库，clone 后用 `scripts/fetch-asr-runtime.ps1` 获取
+一个运行时同时支撑两条路：
 
-> 为什么脚本是「从本地复制」而不是「下载」：这套东西国内下不全 ——
-> Python 嵌入式包和 PyPI 都通，但模型所在的 HuggingFace 与 hf-mirror 实测均超时。
+| 路径 | 做什么 | 用什么 |
+|---|---|---|
+| 语音转字幕 | 听声音，识别对白 | faster-whisper（默认 small） |
+| 硬字幕识别 | 看画面，读出已烧上去的字 | RapidOCR + PP-OCRv3 |
+
+- 全部组件都是宽松许可（PSF / MIT / BSD / Apache-2.0），分发本软件**不因此产生开源义务**
+- 语音识别结果自动**繁转简**（Whisper 对中文会在繁简之间乱跳，实测不处理时相似度只有 0.611，处理后 0.944）
+- 硬字幕识别实测一字不差
+- 二进制不进版本库，clone 后用 `scripts/fetch-asr-runtime.ps1` 与 `scripts/fetch-model.ps1` 获取
+
+> 为什么模型走 ModelScope 而不是 HuggingFace：后者在这类网络下实测超时，
+> ModelScope（阿里的模型站）国内直连很快，而且有 faster-whisper 的镜像。
 
 ### 想用硬字幕 OCR / 剪映草稿
 

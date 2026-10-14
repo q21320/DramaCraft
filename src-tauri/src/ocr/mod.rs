@@ -638,6 +638,90 @@ mod tests {
         path.is_file().then_some(path)
     }
 
+    /// 内置运行时里的 OCR 能不能用 —— 正对"要不要自己装 Python"这个问题。
+    #[test]
+    fn bundled_runtime_reports_ocr_available() {
+        let python = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("asr_runtime")
+            .join("python.exe");
+        if !python.is_file() {
+            eprintln!("跳过：没有内置运行时");
+            return;
+        }
+        let s = status(&python.to_string_lossy());
+        assert!(s.available, "内置运行时应当报告 OCR 可用：{}", s.detail);
+    }
+
+    /// 用内置运行时 + 内置 ffmpeg 画一张带中文的图，再读回来。
+    /// 验证的是"真的能认字"，而不是"包能导入"。
+    #[test]
+    fn end_to_end_bundled_runtime_reads_chinese() {
+        let resources = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+        let python = resources.join("asr_runtime").join("python.exe");
+        let ffmpeg = resources.join("bin").join("ffmpeg.exe");
+        if !python.is_file() || !ffmpeg.is_file() {
+            eprintln!("跳过：内置运行时或 ffmpeg 不在");
+            return;
+        }
+        let font = Path::new("C:/Windows/Fonts/simhei.ttf");
+        if !font.is_file() {
+            eprintln!("跳过：本机没有黑体");
+            return;
+        }
+
+        let worker = resources.join("ocr_worker.py");
+        let dir = std::env::temp_dir().join("dramadist_ocr_bundled_e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("cn.png");
+
+        // 画两行中文。用 textfile 避开 filtergraph 转义。
+        let text_file = dir.join("lines.txt");
+        std::fs::write(&text_file, "第三集 林小雨").unwrap();
+        let font_expr = crate::proc::filter_path(&font.to_string_lossy());
+        let filter = format!(
+            "drawtext=fontfile={font_expr}:textfile='lines.txt':expansion=none:fontsize=48:fontcolor=black:x=40:y=80"
+        );
+        let ok = crate::proc::no_window(
+            Command::new(&ffmpeg)
+                .current_dir(&dir)
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+                .arg("color=c=white:s=640x260")
+                .arg("-vf")
+                .arg(&filter)
+                .args(["-frames:v", "1"])
+                .arg(&image),
+        )
+        .status()
+        .expect("无法启动 ffmpeg");
+        assert!(ok.success(), "生成测试图失败");
+
+        let opts = default_options();
+        let (frames, _) = run_worker(
+            &python,
+            &worker,
+            std::slice::from_ref(&image),
+            &opts,
+            Duration::from_secs(300),
+        )
+        .expect("OCR 失败");
+
+        let joined: String = frames
+            .iter()
+            .map(|f| normalize_text(&f.text))
+            .collect::<Vec<_>>()
+            .join("");
+        // 允许标点/空格差异，但字必须是那几个字
+        let compact: String = joined.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("第三集林小雨"),
+            "内置运行时应当一字不差地读出中文，实际读到：{compact}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn end_to_end_reads_burned_in_subtitles() {
         let (Some(ffmpeg), Some(python)) = (
