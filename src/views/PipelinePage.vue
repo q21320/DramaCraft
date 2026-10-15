@@ -16,7 +16,13 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/api";
-import type { OutputEpisode, PipelineRun, PipelineStageOption, SourceScan } from "@/types";
+import type {
+  LabelPosition,
+  OutputEpisode,
+  PipelineRun,
+  PipelineStageOption,
+  SourceScan,
+} from "@/types";
 
 const message = useMessage();
 
@@ -26,6 +32,30 @@ const root = ref("");
 const outDir = ref("");
 const sliceSeconds = ref(40);
 const model = ref("small");
+
+/**
+ * 片头标识。
+ *
+ * **这是合规开关，不是去重手段。**《人工智能生成合成内容标识办法》要求
+ * AI 生成 / 合成的内容显著标识。画面经过 AI 处理（去字幕、AI 生成封面
+ * 或文案等）后发布，应当标识。
+ *
+ * 默认**关**：内容是 AI 生成的才需要标，标错了是另一种不实。
+ */
+const labelEnabled = ref(false);
+const labelText = ref("AI创作");
+const labelSeconds = ref(3);
+const labelPosition = ref<LabelPosition>("topLeft");
+
+const labelPositions: { label: string; value: LabelPosition }[] = [
+  { label: "左上角", value: "topLeft" },
+  { label: "右上角", value: "topRight" },
+  { label: "左下角", value: "bottomLeft" },
+  { label: "右下角", value: "bottomRight" },
+  { label: "顶部居中", value: "topCenter" },
+  { label: "底部居中", value: "bottomCenter" },
+];
+
 const scan = ref<SourceScan | null>(null);
 const scanning = ref(false);
 const starting = ref(false);
@@ -383,6 +413,32 @@ onUnmounted(() => {
       />
     </div>
 
+    <!-- 片头标识：合规功能，默认关 -->
+    <div class="dd-label-box">
+      <n-checkbox v-model:checked="labelEnabled">
+        片头加「AI 生成内容」标识
+      </n-checkbox>
+      <div class="dd-muted" style="margin-left: 22px; margin-top: 2px">
+        《人工智能生成合成内容标识办法》要求 AI 生成 / 合成的内容显著标识。
+        **画面经过 AI 处理**（AI 去字幕、AI 生成封面或文案等）后发布，应当标识。
+        没用到 AI 就别勾 —— 标错了是另一种不实。
+      </div>
+      <div v-if="labelEnabled" class="dd-row" style="gap: 8px; margin: 8px 0 0 22px; flex-wrap: wrap">
+        <span class="dd-muted">文字</span>
+        <n-input v-model:value="labelText" size="small" style="width: 140px" maxlength="16" />
+        <span class="dd-muted">显示</span>
+        <n-input-number v-model:value="labelSeconds" size="small" :min="0.5" :max="15" :step="0.5" style="width: 100px" />
+        <span class="dd-muted">秒</span>
+        <span class="dd-muted">位置</span>
+        <n-select
+          v-model:value="labelPosition"
+          size="small"
+          style="width: 120px"
+          :options="labelPositions"
+        />
+      </div>
+    </div>
+
     <n-space>
       <n-button size="small" type="primary" :loading="starting" @click="start">
         开始流水线
@@ -592,6 +648,14 @@ onUnmounted(() => {
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
+/* 片头标识：合规开关，视觉上和去重参数分开 */
+.dd-label-box {
+  border: 1px solid rgba(128, 128, 128, 0.22);
+  border-radius: 6px;
+  padding: 9px 11px;
+  margin-bottom: 14px;
+}
+
 .dd-ep {
   border: 1px solid rgba(128, 128, 128, 0.22);
   border-radius: 6px;

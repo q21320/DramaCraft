@@ -31,7 +31,7 @@
 //! 这里直接调它 —— 一套规则，两个地方用，不会各写一份各漏一处。
 
 use crate::error::{AppError, AppResult};
-use crate::models::{SourceDrama, SourceEpisode, SourceScan, StartOutcome};
+use crate::models::{HeaderLabel, SourceDrama, SourceEpisode, SourceScan, StartOutcome};
 use std::path::{Path, PathBuf};
 
 /// 扫描时最多往下看几层。素材包一般不会更深，太深多半是误选了一个大目录。
@@ -246,6 +246,7 @@ pub fn start_pipeline(
     stages: &[String],
     slice_ms: i64,
     model: &str,
+    header_label: Option<HeaderLabel>,
 ) -> AppResult<StartOutcome> {
     let scan = scan_source(root)?;
     let run_id = crate::db::create_pipeline_run(
@@ -305,7 +306,7 @@ pub fn start_pipeline(
         for stage in stages {
             for (media_id, group) in &media_groups {
                 let Some(payload) =
-                    stage_payload(stage, *media_id, &drama_out, slice_ms, model, group)?
+                    stage_payload(stage, *media_id, &drama_out, slice_ms, model, group, header_label.as_ref())?
                 else {
                     continue;
                 };
@@ -382,6 +383,7 @@ pub fn stage_payload(
     slice_ms: i64,
     model: &str,
     group: &str,
+    label: Option<&HeaderLabel>,
 ) -> AppResult<Option<String>> {
     let here = out_dir.join(group);
     let value = match stage {
@@ -407,7 +409,10 @@ pub fn stage_payload(
         "dedup" => serde_json::json!({
             "mediaId": media_id,
             "intensity": "medium",
+            // options 留空 → 用按序号生成的确定性预设，每片各不相同
             "options": serde_json::Value::Null,
+            // 片头标识**叠加**在预设之上：它是合规开关，和"怎么去重"是两件事
+            "headerLabel": label,
         }),
         "export" => serde_json::json!({
             "mediaId": media_id,
@@ -915,6 +920,7 @@ mod tests {
             &stages,
             10_000,
             "small",
+            None,
         )
         .expect("起流水线失败");
 
@@ -985,10 +991,10 @@ mod tests {
         // 于是后面的集把前面的全覆盖了 —— 27 片只剩最后 3 片，
         // 数据库里还显示"有"（路径确实存在，内容却是别人的）。
         let out = Path::new("D:/二创/某剧");
-        let a = stage_payload("slice", 1, out, 40_000, "small", "某剧-第01集")
+        let a = stage_payload("slice", 1, out, 40_000, "small", "某剧-第01集", None)
             .unwrap()
             .unwrap();
-        let b = stage_payload("slice", 2, out, 40_000, "small", "某剧-第02集")
+        let b = stage_payload("slice", 2, out, 40_000, "small", "某剧-第02集", None)
             .unwrap()
             .unwrap();
         let dir_a: serde_json::Value = serde_json::from_str(&a).unwrap();
@@ -1015,7 +1021,7 @@ mod tests {
         let out = Path::new("D:/二创/某剧");
         let group = "某剧-第01集";
         for stage in ["slice", "export", "package"] {
-            let raw = stage_payload(stage, 1, out, 40_000, "small", group)
+            let raw = stage_payload(stage, 1, out, 40_000, "small", group, None)
                 .unwrap()
                 .unwrap();
             let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -1054,7 +1060,7 @@ mod tests {
         // 32 个切片任务全废，还连累了后面的画面处理。
         let mut checked = 0;
         for (stage, _, _, _) in STAGES {
-            let payload = stage_payload(stage, 7, Path::new("E:/out"), 40_000, "small", "第01集")
+            let payload = stage_payload(stage, 7, Path::new("E:/out"), 40_000, "small", "第01集", None)
                 .unwrap_or_else(|e| panic!("{stage} 生成参数失败：{e}"));
             let Some(payload) = payload else {
                 continue; // 这一步没配就不排任务，正常
@@ -1114,6 +1120,7 @@ mod tests {
             &["slice".to_string()],
             10_000,
             "",
+            None,
         )
         .expect("一部坏的素材不该让整条流水线起不来");
 
@@ -1208,16 +1215,47 @@ mod tests {
     }
 
     #[test]
-    fn proof_stage_is_skipped_rather_than_queued_to_fail() {
-        // 证明图要有模板和字段坐标才谈得上生成，没配就跳过 ——
+    fn label_reaches_the_dedup_payload() {
+        // 合规开关必须真的进到任务参数里。
+        // 之前踩过一次同类坑：payload 字段名写错，编译期查不出、入队也不报，
+        // 要跑到那个任务才炸。
+        let label = HeaderLabel::default();
+        let raw = stage_payload(
+            "dedup",
+            7,
+            Path::new("E:/out"),
+            40_000,
+            "small",
+            "第01集",
+            Some(&label),
+        )
+        .unwrap()
+        .expect("dedup 应当产出参数");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["headerLabel"]["text"], "AI创作");
+        assert_eq!(v["headerLabel"]["seconds"], 3.0);
+        assert_eq!(v["headerLabel"]["position"], "topLeft");
+        // 参数本身要能过队列的校验
+        crate::queue::validate_payload("transform", &raw).expect("参数过不了队列校验");
+
+        // 没配就是 null，不能凭空加标识
+        let raw2 = stage_payload("dedup", 7, Path::new("E:/out"), 40_000, "small", "第01集", None)
+            .unwrap()
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&raw2).unwrap();
+        assert!(v2["headerLabel"].is_null());
+    }
+
+    #[test]
+    fn proof_stage_is_skipped_rather_than_queued_to_fail() {        // 证明图要有模板和字段坐标才谈得上生成，没配就跳过 ——
         // 排一个注定失败的任务只会让流水线卡在最后一步
-        let got = stage_payload("proof", 1, Path::new("E:/o"), 10_000, "", "第01集").unwrap();
+        let got = stage_payload("proof", 1, Path::new("E:/o"), 10_000, "", "第01集", None).unwrap();
         assert!(got.is_none());
     }
 
     #[test]
     fn unknown_stage_is_rejected() {
-        let err = stage_payload("nonsense", 1, Path::new("E:/o"), 10_000, "", "第01集")
+        let err = stage_payload("nonsense", 1, Path::new("E:/o"), 10_000, "", "第01集", None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("不认识的步骤"), "{err}");

@@ -9,7 +9,7 @@
 //! 3. 每个片段只重编码一次，临时文件 + 原子重命名。
 
 use crate::error::{AppError, AppResult};
-use crate::models::TransformOptions;
+use crate::models::{HeaderLabel, LabelPosition, TransformOptions};
 use crate::proc::{no_window, tail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,12 +52,21 @@ pub fn normalize(raw: &TransformOptions) -> TransformOptions {
         noise: raw.noise.min(NOISE_MAX),
         speed: clamp_finite(raw.speed, SPEED_MIN, SPEED_MAX, 1.0),
         volume: clamp_finite(raw.volume, VOLUME_MIN, VOLUME_MAX, 1.0),
+        // 标识在这里不夹数值：文字要按绘图规则清洗、字号要按画面高度算，
+        // 那两件事都在 build_label_filter 里做（这里拿不到画面尺寸）
+        header_label: raw.header_label.clone(),
     }
 }
 
 /// 是否为"什么都不做"。
 pub fn is_noop(raw: &TransformOptions) -> bool {
     let o = normalize(raw);
+    // 有标识文字就算"要做点什么" —— 哪怕其它参数全是中性值
+    let no_label = o
+        .header_label
+        .as_ref()
+        .map(|l| sanitize_label_text(&l.text).is_empty())
+        .unwrap_or(true);
     !o.mirror
         && o.crop_ratio <= EPS
         && (o.scale_ratio - 1.0).abs() <= EPS
@@ -67,6 +76,123 @@ pub fn is_noop(raw: &TransformOptions) -> bool {
         && o.noise == 0
         && (o.speed - 1.0).abs() <= EPS
         && (o.volume - 1.0).abs() <= EPS
+        && no_label
+}
+
+// ---------------- 片头标识（合规） ----------------
+
+/// 常见中文字体，按优先级排。
+///
+/// `drawtext` 必须拿到**具体字体文件**，系统默认字体不一定有中文字形
+/// （拿不到就会画出一串方框）。这几款在中文 Windows 上必然存在。
+const CJK_FONTS: [&str; 6] = [
+    r"C:\Windows\Fonts\msyh.ttc",   // 微软雅黑（系统默认界面字体）
+    r"C:\Windows\Fonts\msyhbd.ttc", // 微软雅黑 Bold
+    r"C:\Windows\Fonts\simhei.ttf", // 黑体
+    r"C:\Windows\Fonts\Deng.ttf",   // 等线
+    r"C:\Windows\Fonts\simsun.ttc", // 宋体
+    r"C:\Windows\Fonts\simkai.ttf", // 楷体
+];
+
+/// 找一个能画中文的字体。找不到就返回 `None`。
+pub fn find_cjk_font() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("DRAMADIST_LABEL_FONT") {
+        let p = PathBuf::from(custom);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    CJK_FONTS
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+}
+
+/// 把路径放进滤镜选项里。
+///
+/// ffmpeg 要过**两层**解析：滤镜描述层先吃掉一次转义，选项层再吃一次。
+/// 所以 Windows 路径里的 `C:` 必须写成 `C\\:`（两个反斜杠）——
+/// 少一个就会变成「选项名附近没有名字」那种报错。这是实测出来的，不是猜的。
+fn escape_filter_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").replace(':', r"\\:")
+}
+
+/// 把文字放进 `text=` 里。
+///
+/// 同样要过两层。这里只用**安全字符**：中文、字母、数字、空格和常见标点。
+/// 其余（引号、反斜杠、冒号、百分号、方括号、逗号）一律换成空格 ——
+/// 与其猜转义规则猜错，不如不让它们进去。标识本来就该是短标签。
+fn sanitize_label_text(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() || "·-—".contains(c) {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let squeezed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    squeezed.chars().take(16).collect()
+}
+
+/// 标识字号 = 画面高度 × 比例，夹到一个合理区间。
+fn label_font_size(height: i64, ratio: f64) -> i64 {
+    let r = if ratio.is_finite() {
+        ratio.clamp(0.015, 0.09)
+    } else {
+        0.034
+    };
+    ((height as f64 * r).round() as i64).clamp(18, 200)
+}
+
+/// 构造片头标识的 drawtext 段。返回 `None` 表示不加（没字、或找不到字体）。
+///
+/// `size` 是画面尺寸 —— 字号和边距都要按它算，否则 480p 上会糊成一片、
+/// 4K 上会小得看不见。
+pub fn build_label_filter(label: &HeaderLabel, size: (i64, i64)) -> AppResult<String> {
+    let text = sanitize_label_text(&label.text);
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    let font = find_cjk_font().ok_or_else(|| {
+        AppError::Msg(format!(
+            "要加片头标识但找不到中文字体。找过这些：{}。\
+             可以用环境变量 DRAMADIST_LABEL_FONT 指定一个 .ttf/.ttc。",
+            CJK_FONTS.join("、")
+        ))
+    })?;
+
+    let seconds = if label.seconds.is_finite() {
+        label.seconds.clamp(0.5, 15.0)
+    } else {
+        3.0
+    };
+    let size_px = label_font_size(size.1, label.size_ratio);
+    // 边距跟着字号走，不同分辨率下观感一致
+    let margin = (size_px as f64 * 0.9).round() as i64;
+    let (x, y) = match label.position {
+        LabelPosition::TopLeft => (format!("{margin}"), format!("{margin}")),
+        LabelPosition::TopRight => (format!("w-tw-{margin}"), format!("{margin}")),
+        LabelPosition::BottomLeft => (format!("{margin}"), format!("h-th-{margin}")),
+        LabelPosition::BottomRight => (format!("w-tw-{margin}"), format!("h-th-{margin}")),
+        LabelPosition::TopCenter => ("(w-tw)/2".to_string(), format!("{margin}")),
+        LabelPosition::BottomCenter => ("(w-tw)/2".to_string(), format!("h-th-{margin}")),
+    };
+
+    // 加个半透明底衬：白字压在浅色画面上会看不清，
+    // 而这是个披露义务，看不清等于没标。
+    Ok(format!(
+        "drawtext=fontfile={}:text={}:fontcolor=white:fontsize={}:box=1:boxcolor=black@0.55:boxborderw={}:x={}:y={}:enable=lt(t\\,{:.2})",
+        escape_filter_path(&font),
+        text,
+        size_px,
+        (size_px / 5).max(6),
+        x,
+        y,
+        seconds
+    ))
 }
 
 // ---------------- 滤镜构造（纯函数） ----------------
@@ -87,7 +213,7 @@ fn even(value: f64) -> u32 {
 /// `target` 是源画面的宽高。**已知尺寸时一律用精确像素值缩放**：
 /// 如果走 `scale=trunc(iw/keep/2)*2` 这种相对表达式，裁切与放大两次取整
 /// 会让画面每次处理缩水 1~2 像素，反复处理会越缩越小。
-pub fn build_video_filter(raw: &TransformOptions, target: Option<(u32, u32)>) -> String {
+pub fn build_video_filter(raw: &TransformOptions, target: Option<(u32, u32)>) -> AppResult<String> {
     let o = normalize(raw);
     let mut parts: Vec<String> = Vec::new();
 
@@ -152,7 +278,17 @@ pub fn build_video_filter(raw: &TransformOptions, target: Option<(u32, u32)>) ->
         parts.push(format!("setpts=PTS/{:.4}", o.speed));
     }
 
-    parts.join(",")
+    // 片头标识放在**最后**：它要压在最终画面上。
+    // 放前面的话，后面的裁切/缩放会把标识一起变形。
+    if let Some(label) = &o.header_label {
+        let size = target.map(|(w, h)| (w as i64, h as i64)).unwrap_or((1080, 1920));
+        let seg = build_label_filter(label, size)?;
+        if !seg.is_empty() {
+            parts.push(seg);
+        }
+    }
+
+    Ok(parts.join(","))
 }
 
 /// 音频滤镜串。变速必须与视频一致，否则音画不同步。
@@ -306,6 +442,9 @@ pub fn preset_for(level: Intensity, index: usize) -> TransformOptions {
         noise: rng.range_u32(r.noise.0, r.noise.1),
         speed: rng.range(r.speed.0, r.speed.1),
         volume: rng.range(r.volume.0, r.volume.1),
+        // 片头标识是**合规开关**，由用户显式要求；随机预设不擅自加，
+        // 也不能擅自加 —— 内容是 AI 生成的才需要标，标错了是另一种不实。
+        header_label: None,
     }
 }
 
@@ -363,7 +502,7 @@ pub fn apply(
         )));
     }
 
-    let video = build_video_filter(opts, target);
+    let video = build_video_filter(opts, target)?;
     let audio = build_audio_filter(opts);
     let temp = temp_path(out)?;
 
@@ -428,6 +567,11 @@ pub fn apply(
 
 #[cfg(test)]
 mod tests {
+    /// 测试里绝大多数断言只关心滤镜串本身，这里把 Result 拆掉。
+    fn vf(o: &TransformOptions, target: Option<(u32, u32)>) -> String {
+        build_video_filter(o, target).expect("滤镜构造失败")
+    }
+
     use super::*;
 
     fn opts() -> TransformOptions {
@@ -437,7 +581,7 @@ mod tests {
     #[test]
     fn defaults_are_a_noop() {
         assert!(is_noop(&opts()));
-        assert_eq!(build_video_filter(&opts(), None), "");
+        assert_eq!(vf(&opts(), None), "");
         assert_eq!(build_audio_filter(&opts()), "");
     }
 
@@ -463,7 +607,7 @@ mod tests {
     fn crop_keeps_the_bottom_edge() {
         let mut o = opts();
         o.crop_ratio = 0.05;
-        let f = build_video_filter(&o, Some((1080, 1920)));
+        let f = vf(&o, Some((1080, 1920)));
         // 贴底裁：y 用 ih - 裁后高度
         assert!(
             f.contains("ih-"),
@@ -479,11 +623,249 @@ mod tests {
     fn crop_without_target_size_is_also_bottom_anchored() {
         let mut o = opts();
         o.crop_ratio = 0.04;
-        let f = build_video_filter(&o, None);
+        let f = vf(&o, None);
         assert!(
             f.contains("ih-trunc"),
             "不知道源尺寸时也要贴底，实际滤镜：{f}"
         );
+    }
+
+    // ---------------- 片头标识（合规） ----------------
+
+    fn label() -> HeaderLabel {
+        HeaderLabel::default()
+    }
+
+    #[test]
+    fn label_filter_draws_text_only_for_the_first_seconds() {
+        if find_cjk_font().is_none() {
+            eprintln!("跳过：本机没有中文字体");
+            return;
+        }
+        let mut o = opts();
+        o.header_label = Some(label());
+        let f = vf(&o, Some((1080, 1920)));
+
+        assert!(f.contains("drawtext="), "实际滤镜：{f}");
+        assert!(f.contains("AI创作"), "实际滤镜：{f}");
+        // 只在前 3 秒显示 —— 逗号必须转义，否则会被当成滤镜分隔符
+        assert!(
+            f.contains(r"enable=lt(t\,3.00)"),
+            "时间范围没写对，实际滤镜：{f}"
+        );
+        // 白字要有底衬，否则压在浅色画面上看不清
+        assert!(f.contains("box=1"), "实际滤镜：{f}");
+        // 字号按画面高度算：1920 × 0.034 ≈ 65
+        assert!(f.contains("fontsize=65"), "实际滤镜：{f}");
+    }
+
+    #[test]
+    fn label_font_size_follows_the_frame_height() {
+        assert_eq!(label_font_size(1920, 0.034), 65);
+        assert_eq!(label_font_size(480, 0.034), 18); // 夹到最小值，太小看不见
+        // 比例被夹住，防止有人传 5.0 让字号盖满全屏
+        assert!(label_font_size(1920, 5.0) <= 200);
+        // NaN 退回默认而不是崩
+        assert_eq!(label_font_size(1920, f64::NAN), 65);
+    }
+
+    #[test]
+    fn label_text_is_sanitized_not_escaped_by_guesswork() {
+        // 这些字符在滤镜里都有特殊含义。与其猜转义规则猜错，
+        // 不如不让它们进去 —— 标识本来就该是短标签。
+        assert_eq!(sanitize_label_text("AI创作"), "AI创作");
+        assert_eq!(sanitize_label_text("AI:创作"), "AI 创作");
+        assert_eq!(sanitize_label_text("a'b\\c%d[e]f,g;h"), "a b c d e f g h");
+        // 换行/多余空格压成一个
+        assert_eq!(sanitize_label_text("  AI   创作  "), "AI 创作");
+        // 太长截断
+        assert_eq!(sanitize_label_text(&"字".repeat(40)).chars().count(), 16);
+    }
+
+    #[test]
+    fn empty_label_text_means_no_label_at_all() {
+        let mut o = opts();
+        o.header_label = Some(HeaderLabel {
+            text: "   ".to_string(),
+            ..label()
+        });
+        assert!(is_noop(&o), "标识文字是空的就该当成不加标识");
+        assert_eq!(vf(&o, Some((1080, 1920))), "");
+    }
+
+    #[test]
+    fn label_alone_still_makes_the_filter_non_empty() {
+        let mut o = opts();
+        o.header_label = Some(label());
+        assert!(!is_noop(&o), "只加标识也是要处理的");
+        assert!(!vf(&o, Some((1080, 1920))).is_empty());
+    }
+
+    #[test]
+    fn label_goes_last_so_it_is_not_cropped_away() {
+        if find_cjk_font().is_none() {
+            eprintln!("跳过：本机没有中文字体");
+            return;
+        }
+        let mut o = opts();
+        o.crop_ratio = 0.05;
+        o.header_label = Some(label());
+        let f = vf(&o, Some((1080, 1920)));
+        let crop_at = f.find("crop=").expect("应当有裁切");
+        let label_at = f.find("drawtext=").expect("应当有标识");
+        assert!(
+            label_at > crop_at,
+            "标识必须排在裁切之后，否则会被一起裁掉：{f}"
+        );
+    }
+
+    #[test]
+    fn label_positions_map_to_different_corners() {
+        if find_cjk_font().is_none() {
+            eprintln!("跳过：本机没有中文字体");
+            return;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for pos in [
+            LabelPosition::TopLeft,
+            LabelPosition::TopRight,
+            LabelPosition::BottomLeft,
+            LabelPosition::BottomRight,
+            LabelPosition::TopCenter,
+            LabelPosition::BottomCenter,
+        ] {
+            let f = build_label_filter(
+                &HeaderLabel {
+                    position: pos,
+                    ..label()
+                },
+                (1080, 1920),
+            )
+            .unwrap();
+            // 取出 x= / y= 部分作为这个位置的指纹
+            let key = f
+                .split(':')
+                .filter(|s| s.starts_with("x=") || s.starts_with("y="))
+                .collect::<Vec<_>>()
+                .join("|");
+            assert!(seen.insert(key.clone()), "位置 {pos:?} 和别的重合了：{key}");
+        }
+    }
+
+    #[test]
+    fn label_seconds_are_clamped() {
+        if find_cjk_font().is_none() {
+            eprintln!("跳过：本机没有中文字体");
+            return;
+        }
+        let f = build_label_filter(
+            &HeaderLabel {
+                seconds: 999.0,
+                ..label()
+            },
+            (1080, 1920),
+        )
+        .unwrap();
+        assert!(f.contains(r"lt(t\,15.00)"), "上限应当是 15 秒：{f}");
+
+        let f = build_label_filter(
+            &HeaderLabel {
+                seconds: -5.0,
+                ..label()
+            },
+            (1080, 1920),
+        )
+        .unwrap();
+        assert!(f.contains(r"lt(t\,0.50)"), "下限应当是 0.5 秒：{f}");
+    }
+
+    /// 在**真实素材**上加标识，产出留给人工/OCR 复核。
+    ///
+    /// 需要环境变量：
+    /// - `DRAMADIST_TEST_FFMPEG`
+    /// - `DRAMADIST_TEST_REAL_SLICE`：一个真实的切片文件
+    /// - `DRAMADIST_KEEP_TEST_ARTIFACTS`：设了就把产物留在临时目录里
+    ///
+    /// 为什么单独做这一条：单测只能证明"滤镜串长得对"，
+    /// 证明不了"字真的画上去了、中文字形没变成方框"。
+    /// 这一路踩的坑几乎都属于后者。
+    #[test]
+    fn label_renders_on_real_material() {
+        let (Some(ffmpeg), Ok(slice)) = (
+            std::env::var("DRAMADIST_TEST_FFMPEG")
+                .ok()
+                .map(PathBuf::from)
+                .filter(|p| p.is_file()),
+            std::env::var("DRAMADIST_TEST_REAL_SLICE"),
+        ) else {
+            eprintln!("跳过：未设置 DRAMADIST_TEST_FFMPEG / DRAMADIST_TEST_REAL_SLICE");
+            return;
+        };
+        let input = PathBuf::from(&slice);
+        if !input.is_file() {
+            eprintln!("跳过：找不到 {slice}");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join("dramadist_label_e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("labeled.mp4");
+
+        let o = TransformOptions {
+            header_label: Some(HeaderLabel {
+                seconds: 3.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply(&ffmpeg, &input, &out, &o, Some((1080, 1920))).expect("加标识失败");
+        assert!(out.is_file(), "没有产出文件");
+
+        let size = std::fs::metadata(&out).unwrap().len();
+        assert!(size > 1000, "产出文件太小：{size} 字节");
+
+        // 抽第 1 秒那一帧，留给 OCR 复核（这里只保证抽出来了）
+        let frame = dir.join("t1.png");
+        let st = crate::proc::no_window(
+            Command::new(&ffmpeg).args(["-hide_banner", "-loglevel", "error", "-y", "-ss", "1"]),
+        )
+        .arg("-i")
+        .arg(&out)
+        .args(["-frames:v", "1"])
+        .arg(&frame)
+        .status()
+        .expect("抽帧失败");
+        assert!(st.success() && frame.is_file(), "抽帧没出来");
+
+        // 第 5 秒应当已经没有标识了
+        let frame5 = dir.join("t5.png");
+        let _ = crate::proc::no_window(
+            Command::new(&ffmpeg).args(["-hide_banner", "-loglevel", "error", "-y", "-ss", "5"]),
+        )
+        .arg("-i")
+        .arg(&out)
+        .args(["-frames:v", "1"])
+        .arg(&frame5)
+        .status();
+
+        if std::env::var("DRAMADIST_KEEP_TEST_ARTIFACTS").is_ok() {
+            eprintln!("产物留在这里：{}", dir.display());
+        } else {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn generated_presets_never_add_a_label() {
+        for level in [Intensity::Light, Intensity::Medium, Intensity::Strong] {
+            for index in 0..50 {
+                assert!(
+                    preset_for(level, index).header_label.is_none(),
+                    "{level:?} 档第 {index} 组偷偷加了标识"
+                );
+            }
+        }
     }
 
     #[test]
@@ -498,6 +880,7 @@ mod tests {
             noise: 999,
             speed: 0.0,
             volume: 100.0,
+            header_label: None,
         };
         let n = normalize(&wild);
         assert_eq!(n.crop_ratio, CROP_MAX);
@@ -532,28 +915,28 @@ mod tests {
     fn individual_switches_produce_expected_filters() {
         let mut o = opts();
         o.mirror = true;
-        assert_eq!(build_video_filter(&o, None), "hflip");
+        assert_eq!(vf(&o, None), "hflip");
 
         let mut o = opts();
         o.noise = 5;
-        assert_eq!(build_video_filter(&o, None), "noise=alls=5:allf=t+u");
+        assert_eq!(vf(&o, None), "noise=alls=5:allf=t+u");
 
         let mut o = opts();
         o.speed = 1.05;
-        assert_eq!(build_video_filter(&o, None), "setpts=PTS/1.0500");
+        assert_eq!(vf(&o, None), "setpts=PTS/1.0500");
         assert_eq!(build_audio_filter(&o), "atempo=1.0500");
 
         let mut o = opts();
         o.volume = 0.9;
         assert_eq!(build_audio_filter(&o), "volume=0.900");
-        assert_eq!(build_video_filter(&o, None), "", "只改音量不该动画面");
+        assert_eq!(vf(&o, None), "", "只改音量不该动画面");
     }
 
     #[test]
     fn crop_is_followed_by_scale_back_to_original_size() {
         let mut o = opts();
         o.crop_ratio = 0.05;
-        let f = build_video_filter(&o, None);
+        let f = vf(&o, None);
         assert!(f.starts_with("crop=trunc(iw*0.9000/2)*2:trunc(ih*0.9000/2)*2"), "{f}");
         assert!(f.contains("scale=trunc(iw/0.9000/2)*2:trunc(ih/0.9000/2)*2"), "{f}");
         // 偶数对齐，避免 libx264 因奇数尺寸报错
@@ -566,7 +949,7 @@ mod tests {
         o.brightness = 0.02;
         o.contrast = 1.01;
         o.saturation = 0.99;
-        let f = build_video_filter(&o, None);
+        let f = vf(&o, None);
         assert_eq!(f, "eq=brightness=0.020:contrast=1.010:saturation=0.990");
     }
 
@@ -579,7 +962,7 @@ mod tests {
         o.brightness = 0.01;
         o.noise = 3;
         o.speed = 1.02;
-        let f = build_video_filter(&o, None);
+        let f = vf(&o, None);
         let order = ["crop=", "scale=", "hflip", "eq=", "noise=", "setpts="];
         let mut last = 0usize;
         for token in order {
@@ -594,7 +977,7 @@ mod tests {
         let mut o = opts();
         o.scale_ratio = 1.0 + 1e-9;
         o.brightness = 1e-9;
-        assert_eq!(build_video_filter(&o, None), "");
+        assert_eq!(vf(&o, None), "");
         assert!(is_noop(&o));
     }
 
@@ -667,7 +1050,7 @@ mod tests {
         o.crop_ratio = 0.05; // keep = 0.9
         // 横向居中、纵向贴底：字幕在底部，居中裁会切到它
         assert_eq!(
-            build_video_filter(&o, Some((1080, 1920))),
+            vf(&o, Some((1080, 1920))),
             "crop=972:1728:(iw-972)/2:ih-1728,scale=1080:1920"
         );
     }
@@ -678,7 +1061,7 @@ mod tests {
         o.scale_ratio = 1.03;
         // 1081×1.03 = 1113.43 → 1113 → 偶数 1112；1921×1.03 = 1978.63 → 1979 → 偶数 1978
         assert_eq!(
-            build_video_filter(&o, Some((1081, 1921))),
+            vf(&o, Some((1081, 1921))),
             "scale=1112:1978"
         );
     }
@@ -779,6 +1162,7 @@ mod tests {
             noise: 3,
             speed: 1.1,
             volume: 0.95,
+            header_label: None,
         };
         let out = processed_path(&input);
         // 已知源尺寸 → 精确缩放，裁切后必须严格回到 320x240

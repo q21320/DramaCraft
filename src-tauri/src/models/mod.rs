@@ -92,6 +92,47 @@ pub struct Segment {
 ///
 /// 越界数值会在 [`crate::transform::normalize`] 里被夹到安全范围，
 /// 不会把用户输入原样拼进命令行。
+/// 片头标识的位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LabelPosition {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    TopCenter,
+    BottomCenter,
+}
+
+/// 片头标识：**合规功能，不是去重手段**。
+///
+/// 《人工智能生成合成内容标识办法》要求 AI 生成 / 合成的内容显著标识。
+/// 画面经过 AI 处理（去字幕、AI 生成封面或文案等）后发布，应当标识。
+///
+/// 这和「改画面躲审核」方向正相反 —— 它是**主动披露**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeaderLabel {
+    /// 显示的文字，默认「AI创作」
+    pub text: String,
+    /// 片头显示多少秒
+    pub seconds: f64,
+    pub position: LabelPosition,
+    /// 字号 = 画面高度 × 这个比例
+    pub size_ratio: f64,
+}
+
+impl Default for HeaderLabel {
+    fn default() -> Self {
+        Self {
+            text: "AI创作".to_string(),
+            seconds: 3.0,
+            position: LabelPosition::TopLeft,
+            size_ratio: 0.034,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransformOptions {
@@ -113,6 +154,9 @@ pub struct TransformOptions {
     pub speed: f64,
     /// 音量（0.80 ~ 1.20）
     pub volume: f64,
+    /// 片头标识；`None` 表示不加
+    #[serde(default)]
+    pub header_label: Option<HeaderLabel>,
 }
 
 impl Default for TransformOptions {
@@ -129,6 +173,7 @@ impl Default for TransformOptions {
             noise: 0,
             speed: 1.0,
             volume: 1.0,
+            header_label: None,
         }
     }
 }

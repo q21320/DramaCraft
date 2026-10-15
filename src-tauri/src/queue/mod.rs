@@ -1,4 +1,4 @@
-//! 任务队列：把长任务排成一队顺序跑，可暂停、可停止、**重启后能接着跑**。
+﻿//! 任务队列：把长任务排成一队顺序跑，可暂停、可停止、**重启后能接着跑**。
 //!
 //! ## 为什么需要它
 //!
@@ -23,7 +23,9 @@
 //! 半途杀掉编码进程只会留下半个文件，得不偿失。界面上也是这么写的。
 
 use crate::error::{AppError, AppResult};
-use crate::models::{ExportOptions, Job, OcrOptions, QueueReport, SliceMode, TransformOptions};
+use crate::models::{
+    ExportOptions, HeaderLabel, Job, OcrOptions, QueueReport, SliceMode, TransformOptions,
+};
 use crate::{commands, db, AppState};
 use serde::Deserialize;
 use std::sync::atomic::Ordering;
@@ -74,6 +76,9 @@ struct TransformPayload {
     media_id: i64,
     intensity: String,
     options: Option<TransformOptions>,
+    /// 片头标识（合规开关），叠加在预设之上
+    #[serde(default)]
+    header_label: Option<HeaderLabel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,7 +205,7 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         "transform" => {
             let p: TransformPayload = parse_payload(job)?;
             let report =
-                commands::transform_segments(state, p.media_id, p.intensity, p.options).await?;
+                commands::transform_segments(state, p.media_id, p.intensity, p.options, p.header_label).await?;
             Ok(format!(
                 "处理 {} 个片段（失败 {}）",
                 report.processed, report.failed

@@ -1,4 +1,4 @@
-export interface Project {
+﻿export interface Project {
   id: number;
   name: string;
   rootDir: string;
@@ -153,6 +153,31 @@ export interface OutputEpisode {
   width: number;
   height: number;
   slices: OutputSlice[];
+}
+
+/** 片头标识的位置 */
+export type LabelPosition =
+  | "topLeft"
+  | "topRight"
+  | "bottomLeft"
+  | "bottomRight"
+  | "topCenter"
+  | "bottomCenter";
+
+/**
+ * 片头标识：**合规功能，不是去重手段**。
+ *
+ * 《人工智能生成合成内容标识办法》要求 AI 生成 / 合成的内容显著标识。
+ * 画面经过 AI 处理（去字幕、AI 生成封面或文案等）后发布，应当标识。
+ *
+ * 这和「改画面躲审核」方向正相反 —— 它是主动披露。
+ */
+export interface HeaderLabel {
+  text: string;
+  seconds: number;
+  position: LabelPosition;
+  /** 字号 = 画面高度 × 这个比例 */
+  sizeRatio: number;
 }
 
 // ---------------- 用户自备素材库 ----------------

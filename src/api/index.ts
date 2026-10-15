@@ -27,6 +27,7 @@ import type {
   PlatformOption,
   Project,
   PipelineRun,
+  HeaderLabel,
   OutputEpisode,
   PipelineStageOption,
   ProofLayout,
@@ -262,12 +263,14 @@ export const api = {
     stages: string[],
     sliceSeconds: number,
     model: string,
+    headerLabel?: HeaderLabel | null,
   ) =>
     call<PipelineRun>("pipeline_start", {
       root,
       outDir,
       stages,
       sliceSeconds,
+      headerLabel: headerLabel ?? null,
       model,
     }),
   pipelineList: (limit?: number) => call<PipelineRun[]>("pipeline_list", { limit: limit ?? 20 }),

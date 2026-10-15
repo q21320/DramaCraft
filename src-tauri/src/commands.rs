@@ -6,7 +6,7 @@ use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, Asset, AssetApplyReport, AssetImportReport, AssetKindOption,
     AssetSummary, CloudConfigView, CloudTestResult, CloudTranscribeReport, CostDocRequest, Cue,
     DiscoveredAsset, DocxReport, EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome,
-    IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
+    HeaderLabel, IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
     PipelineStage, PlatformOption, Project,
     ProofLayout, ProofPreview, ProofRenderReport, PublishAccount, PublishClipEntry,
     PublishPackageReport, PublishPlan, QueueState, ResplitReport, RuntimeStatus, Segment,
@@ -688,7 +688,7 @@ pub fn transform_preview(
         Some(raw) => {
             let normalized = transform::normalize(&raw);
             Ok(TransformPreview {
-                video_filter: transform::build_video_filter(&normalized, target),
+                video_filter: transform::build_video_filter(&normalized, target)?,
                 audio_filter: transform::build_audio_filter(&normalized),
                 samples: vec![normalized],
             })
@@ -699,7 +699,7 @@ pub fn transform_preview(
                 .collect();
             let first = samples[0].clone();
             Ok(TransformPreview {
-                video_filter: transform::build_video_filter(&first, target),
+                video_filter: transform::build_video_filter(&first, target)?,
                 audio_filter: transform::build_audio_filter(&first),
                 samples,
             })
@@ -714,6 +714,7 @@ pub async fn transform_segments(
     media_id: i64,
     intensity: String,
     options: Option<TransformOptions>,
+    header_label: Option<HeaderLabel>,
 ) -> AppResult<TransformReport> {
     let (ffmpeg, segments, target) = {
         let configured = lock_tools(&state)?.clone();
@@ -742,14 +743,21 @@ pub async fn transform_segments(
     let total = segments.len() as i64;
 
     // 给了 options 就所有片段用同一组；否则按序号生成确定性预设，每片各不相同
+    //
+    // 片头标识**叠加**在两者之上：它是一条合规开关，和"怎么去重"无关。
+    // 放在这里而不是塞进预设，是为了让预设保持纯粹（好测、好复现）。
+    let label = header_label.clone();
     let plan: Vec<(i64, String, String, TransformOptions)> = segments
         .iter()
         .enumerate()
         .map(|(index, seg)| {
-            let opts = match &options {
+            let mut opts = match &options {
                 Some(raw) => transform::normalize(raw),
                 None => transform::preset_for(level, index),
             };
+            if let Some(l) = &label {
+                opts.header_label = Some(l.clone());
+            }
             let input = PathBuf::from(&seg.out_path);
             let out = transform::processed_path(&input);
             (
@@ -1763,6 +1771,7 @@ pub fn pipeline_start(
     stages: Vec<String>,
     slice_seconds: Option<f64>,
     model: Option<String>,
+    header_label: Option<HeaderLabel>,
 ) -> AppResult<PipelineRun> {
     let root_path = PathBuf::from(root.trim());
     if root_path.as_os_str().is_empty() {
@@ -1805,6 +1814,7 @@ pub fn pipeline_start(
         &enabled,
         slice_ms,
         &asr_model,
+        header_label,
     )?;
 
     if !outcome.skipped.is_empty() {
