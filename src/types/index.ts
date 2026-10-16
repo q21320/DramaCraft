@@ -1,4 +1,4 @@
-﻿export interface Project {
+export interface Project {
   id: number;
   name: string;
   rootDir: string;
@@ -273,6 +273,8 @@ export interface RunLog {
   /** info | ok | warn | error */
   level: string;
   message: string;
+  /** 这一行对应的产出文件（空串 = 没有）。有的话这一行能点开播。 */
+  artifact: string;
   createdAt: string;
 }
 // ---------------- 封面生成 ----------------

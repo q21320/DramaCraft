@@ -854,6 +854,12 @@ pub struct RunLog {
     /// info | ok | warn | error
     pub level: String,
     pub message: String,
+    /// 这一行对应的产出文件（没有就是空串）。
+    ///
+    /// 用户的想法：「产出的内容在日志里尽量能直接点击播放」——
+    /// 对。产出不该是另一个列表，它就该长在产生它的那一行上。
+    #[serde(default)]
+    pub artifact: String,
     pub created_at: String,
 }
 

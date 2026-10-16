@@ -541,6 +541,37 @@ pub async fn run(app: AppHandle, max_jobs: Option<i64>) -> AppResult<QueueReport
     outcome
 }
 
+/// 这个任务产出了哪个文件（能点的那个）。
+///
+/// 用户的想法：「产出的内容在日志里尽量能直接点击播放」——
+/// 对。产出不该是另一个列表，它就该长在产生它的那一行上。
+///
+/// 只给一个**能播的**文件：
+/// - 整集去重：一集一个文件，就是它
+/// - 切片：一集好几片，给第一片（日志里已经写明"切出 N 片"）
+/// - 别的步骤：没有可播的单文件，就不给（那一行也就不可点）
+fn artifact_of(conn: &rusqlite::Connection, job: &Job) -> Option<String> {
+    let media_id = job.media_id?;
+    match job.kind.as_str() {
+        "dedup" => {
+            let m = db::get_media(conn, media_id).ok()?;
+            if !m.processed_path.trim().is_empty()
+                && std::path::Path::new(&m.processed_path).is_file()
+            {
+                Some(m.processed_path)
+            } else {
+                None
+            }
+        }
+        "slice" => db::list_segments(conn, media_id)
+            .ok()?
+            .into_iter()
+            .find(|s| s.status == "ok" && std::path::Path::new(&s.out_path).is_file())
+            .map(|s| s.out_path),
+        _ => None,
+    }
+}
+
 /// 队列同时跑几个任务。
 ///
 /// 每个任务是一个独立的 ffmpeg 进程，而 ffmpeg 自己已经多线程
@@ -702,7 +733,9 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                     .unwrap_or_default();
                 match &outcome {
                     Ok(summary) => {
-                        db::append_log(
+                        // 有产出文件的那种，这一行界面上能直接点开播
+                        let artifact = artifact_of(&conn, &job).unwrap_or_default();
+                        db::append_log_with_file(
                             &conn,
                             run_id,
                             Some(drama_id),
@@ -712,6 +745,7 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                                 kind_label(&job.kind),
                                 crate::proc::tail(summary)
                             ),
+                            &artifact,
                         );
                         db::update_pipeline_drama(
                             &conn,

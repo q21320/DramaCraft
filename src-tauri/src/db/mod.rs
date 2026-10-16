@@ -203,8 +203,17 @@ const SCHEMA_V11: &str = r#"
 ALTER TABLE media ADD COLUMN processed_path TEXT NOT NULL DEFAULT '';
 "#;
 
+/// v12：日志行记住「这一行对应哪个产出文件」。
+///
+/// 用户的想法：「产出的内容在日志里尽量能直接点击播放」——
+/// 对。产出不该是另一个列表，它就该长在产生它的那一行上：
+/// 点那行就能看，不用切 tab、不用再找一遍。
+const SCHEMA_V12: &str = r#"
+ALTER TABLE run_log ADD COLUMN artifact TEXT NOT NULL DEFAULT '';
+"#;
+
 /// 当前 schema 版本。加表/加列时递增，并在 `migrate` 里补一段。
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
@@ -252,6 +261,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     }
     if version < 11 {
         conn.execute_batch(SCHEMA_V11)?;
+    }
+    if version < 12 {
+        conn.execute_batch(SCHEMA_V12)?;
     }
     if version < SCHEMA_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -1321,10 +1333,26 @@ pub fn append_log(
     level: &str,
     message: &str,
 ) {
+    append_log_with_file(conn, run_id, drama_id, level, message, "");
+}
+
+/// 写一行**带产出文件**的日志。
+///
+/// 有文件的那种，界面上这一行能直接点开播 ——
+/// 产出不该是另一个列表，它就该长在产生它的那一行上。
+/// 用户原话：「产出的内容在日志里尽量能直接点击播放」。
+pub fn append_log_with_file(
+    conn: &Connection,
+    run_id: Option<i64>,
+    drama_id: Option<i64>,
+    level: &str,
+    message: &str,
+    artifact: &str,
+) {
     let _ = conn.execute(
-        "INSERT INTO run_log(run_id, drama_id, level, message, created_at)
-         VALUES(?1, ?2, ?3, ?4, ?5)",
-        params![run_id, drama_id, level, message, now()],
+        "INSERT INTO run_log(run_id, drama_id, level, message, artifact, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![run_id, drama_id, level, message, artifact, now()],
     );
 }
 
@@ -1358,7 +1386,7 @@ pub fn list_logs(
     match run_id {
         Some(id) => {
             let mut stmt = conn.prepare(
-                "SELECT id, run_id, drama_id, level, message, created_at FROM run_log
+                "SELECT id, run_id, drama_id, level, message, artifact, created_at FROM run_log
                   WHERE run_id = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
             )?;
             let rows = stmt.query_map(params![id, after_id, limit], row_to_run_log)?;
@@ -1368,7 +1396,7 @@ pub fn list_logs(
         }
         None => {
             let mut stmt = conn.prepare(
-                "SELECT id, run_id, drama_id, level, message, created_at FROM run_log
+                "SELECT id, run_id, drama_id, level, message, artifact, created_at FROM run_log
                   WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![after_id, limit], row_to_run_log)?;
@@ -1387,7 +1415,8 @@ fn row_to_run_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunLog> {
         drama_id: row.get(2)?,
         level: row.get(3)?,
         message: row.get(4)?,
-        created_at: row.get(5)?,
+        artifact: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
@@ -2464,6 +2493,32 @@ mod tests {
 
         assert_eq!(prune_missing_media(&conn, project.id).unwrap(), 0, "有任务在跑就别动它");
         assert!(get_media(&conn, m.id).is_ok());
+    }
+
+    /// 日志行能带上「这一行对应哪个产出文件」。
+    ///
+    /// 用户的想法：「产出的内容在日志里尽量能直接点击播放」——
+    /// 对。产出不该是另一个列表，它就该长在产生它的那一行上。
+    #[test]
+    fn log_lines_can_carry_the_artifact_they_produced() {
+        let conn = mem();
+        append_log(&conn, Some(1), None, "info", "===== 整集去重 =====");
+        append_log_with_file(
+            &conn,
+            Some(1),
+            Some(7),
+            "ok",
+            "✓ 第01集.mp4 整集去重：去重完成（56.0 MB）",
+            "D:/二创/某剧/去重/第01集_去重.mp4",
+        );
+
+        let rows = list_logs(&conn, Some(1), 0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        // 标题行没有文件 —— 界面上那一行就不可点
+        assert_eq!(rows[0].artifact, "", "标题行不该带文件");
+        // 明细行有文件 —— 那一行能点开播
+        assert_eq!(rows[1].artifact, "D:/二创/某剧/去重/第01集_去重.mp4");
+        assert!(rows[1].message.contains("第01集.mp4"));
     }
 
     /// 步骤标题是**分节**，一次运行里一个步骤只出现一次。
