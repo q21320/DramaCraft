@@ -682,6 +682,16 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             // 失败时整部剧标失败 —— 一步没成，后面的步骤继续跑没有意义。
             if let Some(drama_id) = job.pipeline_drama_id {
                 let run_id = db::run_id_of_drama(&conn, Some(drama_id)).unwrap_or(None);
+                // **每行要能认出是哪一集。**
+                //
+                // 61 集跑下来就是 61 行明细，如果都长成
+                // 「✓ 整集去重：去重完成（57.0 MB）」—— 认不出谁是谁，
+                // 没法对账。带上集名才叫「每个任务打印一次」。
+                let who = job
+                    .media_id
+                    .and_then(|m| db::get_media(&conn, m).ok())
+                    .map(|m| format!("{} ", m.name))
+                    .unwrap_or_default();
                 match &outcome {
                     Ok(summary) => {
                         db::append_log(
@@ -689,7 +699,11 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                             run_id,
                             Some(drama_id),
                             "ok",
-                            &format!("✓ {}：{}", kind_label(&job.kind), crate::proc::tail(summary)),
+                            &format!(
+                                "✓ {who}{}：{}",
+                                kind_label(&job.kind),
+                                crate::proc::tail(summary)
+                            ),
                         );
                         db::update_pipeline_drama(
                             &conn,
@@ -719,7 +733,11 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                             run_id,
                             Some(drama_id),
                             "error",
-                            &format!("✗ {}：{}", kind_label(&job.kind), crate::proc::tail(&e.to_string())),
+                            &format!(
+                                "✗ {who}{}：{}",
+                                kind_label(&job.kind),
+                                crate::proc::tail(&e.to_string())
+                            ),
                         );
                         db::update_pipeline_drama(
                             &conn,
