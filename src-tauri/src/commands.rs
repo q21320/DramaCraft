@@ -1827,11 +1827,19 @@ pub fn pipeline_default_out_dir(root: String) -> AppResult<String> {
 
 /// 开始一条流水线。
 ///
-/// 做三件事：给这次运行建一条记录、把每部剧的每一集导入素材库、
-/// 然后**按步骤顺序**把任务排进队列（不是按剧排——先把所有剧都切完，
-/// 再统一起字幕，批量处理时更顺）。
+/// 做四件事：
+/// 1. 扫描源目录（快）
+/// 2. **如果勾了「AI 改剧名简介」，先调 AI 拿到新剧名** ——
+///    必须在建目录、排任务**之前**做完，否则输出路径就得事后改名
+/// 3. 建工程、导入素材
+/// 4. 按步骤顺序把任务排进队列
+///
+/// 顺序很关键：真实软件是「AI重写简介 → AI重写剧名 → 整剧重组 → …」，
+/// 前两步跑完，后面所有步骤用的都是新剧名。我一开始把「改剧名」做成了
+/// 队列里的一个任务 —— 而任务是**一次性全部排好**的，排的时候还不知道新名字，
+/// 结果就得事后改目录名、改 payload 里的路径，绕了一大圈。
 #[tauri::command]
-pub fn pipeline_start(
+pub async fn pipeline_start(
     state: tauri::State<'_, AppState>,
     root: String,
     out_dir: String,
@@ -1872,6 +1880,69 @@ pub fn pipeline_start(
         tools::require(&configured.ffprobe, "ffprobe")?
     };
 
+    // ---- 第 2 步：先在扫描结果上把剧名改好 ----
+    //
+    // 这一步**不持数据库锁**（要等网络），所以放在 lock_db 之前。
+    let mut renames: std::collections::HashMap<String, pipeline::NewName> =
+        std::collections::HashMap::new();
+    if enabled.iter().any(|s| s == "rewrite") {
+        let scan = pipeline::scan_source(&root_path)?;
+        let provider = {
+            let conn = lock_db(&state)?;
+            ai::usable_provider(&conn)?
+        };
+        match provider {
+            None => {
+                log_line(
+                    &state,
+                    "warn",
+                    "勾了「AI 改剧名简介」但没有可用的 AI 服务（或用途开关没开），本次跳过改剧名",
+                );
+            }
+            Some(p) => {
+                for drama in &scan.dramas {
+                    if drama.synopsis.trim().is_empty() {
+                        log_line(
+                            &state,
+                            "warn",
+                            &format!("「{}」没找到简介，跳过改剧名", drama.name),
+                        );
+                        continue;
+                    }
+                    // **失败不中断整条流水线** —— 用原剧名继续跑，
+                    // 总比因为一次网络抖动就什么都出不来强。
+                    match ai::rewrite_title_and_synopsis(&p, &drama.name, &drama.synopsis).await {
+                        Ok((new_title, new_synopsis)) => {
+                            log_line(
+                                &state,
+                                "ok",
+                                &format!(
+                                    "改剧名：「{}」→「{new_title}」（{} 字简介）",
+                                    drama.name,
+                                    new_synopsis.chars().count()
+                                ),
+                            );
+                            renames.insert(
+                                drama.name.clone(),
+                                pipeline::NewName {
+                                    title: new_title,
+                                    synopsis: new_synopsis,
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            log_line(
+                                &state,
+                                "warn",
+                                &format!("「{}」改剧名失败，用原名继续：{e}", drama.name),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let conn = lock_db(&state)?;
     let outcome = pipeline::start_pipeline(
         &conn,
@@ -1882,6 +1953,7 @@ pub fn pipeline_start(
         slice_ms,
         &asr_model,
         header_label,
+        &renames,
     )?;
 
     if !outcome.skipped.is_empty() {
@@ -2035,6 +2107,14 @@ pub fn ai_reset_preset(
         .ok_or_else(|| AppError::Msg("刚保存的服务商不见了".into()))?)
 }
 
+/// 往运行日志里写一行（没有 run 归属的那种，比如"开始前"的提示）。
+///
+/// 拿不到锁就静默跳过 —— 日志写不进去不该让主流程挂掉。
+fn log_line(state: &tauri::State<'_, AppState>, level: &str, message: &str) {
+    if let Ok(conn) = lock_db(state) {
+        db::append_log(&conn, None, None, level, message);
+    }
+}
 // ---------------- AI 改写剧名 / 简介 ----------------
 
 /// 改写剧名与简介。

@@ -20,6 +20,15 @@ const message = useMessage();
 
 const stages = ref<PipelineStageOption[]>([]);
 const picked = ref<string[]>([]);
+
+/**
+ * 勾了「AI 改剧名简介」吗？
+ *
+ * 勾了的话，点「开始流水线」会**先等 AI 返回新剧名**（十几秒），
+ * 然后用新剧名建目录、排任务 —— 所以按钮上要说明在等什么，
+ * 否则用户会以为卡死了。
+ */
+const willRewrite = computed(() => picked.value.includes("rewrite"));
 const root = ref("");
 const outDir = ref("");
 const sliceSeconds = ref(40);
@@ -357,9 +366,13 @@ onUnmounted(() => {
 
     <n-space>
       <n-button size="small" type="primary" :loading="starting" @click="start">
-        开始流水线
+        {{ starting && willRewrite ? "正在调 AI 起新剧名…" : "开始流水线" }}
       </n-button>
-      <span class="dd-muted">排完队会自动开跑；关掉应用再打开会接着跑</span>
+      <span v-if="willRewrite" class="dd-muted">
+        会先调 AI 改简介、起新剧名（约十几秒），<b>再用新剧名建目录、排任务</b>；
+        改失败了会用原剧名继续，不会卡住
+      </span>
+      <span v-else class="dd-muted">排完队会自动开跑；关掉应用再打开会接着跑</span>
     </n-space>
   </div>
 

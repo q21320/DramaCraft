@@ -278,6 +278,15 @@ pub fn stage_label(key: &str) -> String {
         .unwrap_or_else(|| key.to_string())
 }
 
+/// 改剧名那一步的产物：新的剧名和简介。
+///
+/// 它必须在**建目录、排任务之前**拿到 —— 见 `start_pipeline` 的说明。
+#[derive(Debug, Clone)]
+pub struct NewName {
+    pub title: String,
+    pub synopsis: String,
+}
+
 /// 起一条流水线：建记录 → 导入每一集 → 排任务。
 ///
 /// 抽成**普通函数**而不是写在命令里，是为了能测：
@@ -295,6 +304,7 @@ pub fn start_pipeline(
     slice_ms: i64,
     model: &str,
     header_label: Option<HeaderLabel>,
+    renames: &std::collections::HashMap<String, NewName>,
 ) -> AppResult<StartOutcome> {
     let scan = scan_source(root)?;
     let run_id = crate::db::create_pipeline_run(
@@ -337,6 +347,16 @@ pub fn start_pipeline(
     }
 
     for drama in &scan.dramas {
+        // **AI 改剧名在排任务之前就跑完了**（见 pipeline_start）。
+        //
+        // 所以这里直接用新名字建目录、建工程 —— 不需要事后改名，
+        // 也就不需要去改已经写死在 payload 里的路径。
+        let new_name = renames.get(&drama.name);
+        let display_name = new_name
+            .map(|n| n.title.clone())
+            .unwrap_or_else(|| drama.name.clone());
+        let safe = safe_drama_name(&display_name);
+
         // **复用已有工程，不重复建。**
         //
         // 原来每次跑都新建一个，同一批素材被导入好几遍：实测三个工程指向
@@ -346,19 +366,31 @@ pub fn start_pipeline(
                 reused_projects += 1;
                 existing
             }
-            None => crate::db::create_project(conn, &drama.name, &drama.dir)?,
+            None => crate::db::create_project(conn, &display_name, &drama.dir)?,
         };
-        let drama_out = out_root.join(&drama.name);
+        let drama_out = out_root.join(&safe);
         let drama_id = crate::db::add_pipeline_drama(
             conn,
             run_id,
-            &drama.name,
+            &display_name,
             &drama.dir,
             &drama_out.to_string_lossy(),
             drama.episode_count,
             Some(project.id),
         )?;
         drama_ids.push(drama_id);
+
+        // 把新剧名 / 新简介写进导出目录。
+        //
+        // 封面那一步会读 `剧名.txt`（画在封面上的是新剧名），
+        // 用户也能直接打开看改成了什么。放在这里写是因为**目录刚定下来**，
+        // 而新名字在排任务之前就已经拿到了。
+        if let Some(n) = new_name {
+            if std::fs::create_dir_all(&drama_out).is_ok() {
+                let _ = std::fs::write(drama_out.join("剧名.txt"), &n.title);
+                let _ = std::fs::write(drama_out.join("详细简介.txt"), &n.synopsis);
+            }
+        }
 
         // 日志：这部剧扫到了什么、是新建还是复用。
         // 用户回头看日志时，最想知道的就是「它到底认出了什么」。
@@ -430,8 +462,14 @@ pub fn start_pipeline(
         };
 
         for stage in stages {
-            // 整部剧一步的（改剧名、封面）：**只排一个任务**，不按集排。
-            // 60 集排 60 个「改剧名」= 调 120 次模型，钱白花。
+            // 改剧名**不是队列里的一步** —— 它在 pipeline_start 里、
+            // 排任务之前就跑完了（那时才知道新剧名，输出路径也才定得下来）。
+            // 走到这里说明它已经在 renames 里生效了，跳过即可。
+            if stage == "rewrite" {
+                continue;
+            }
+            // 整部剧一步的（封面、成本报告等）：**只排一个任务**，不按集排。
+            // 60 集排 60 个「生成封面」= 白跑 60 次。
             if is_drama_level(stage) {
                 match drama_payload(stage, drama, &drama_out, &media_ids, total_ms)? {
                     Some(payload) => {
@@ -1273,6 +1311,11 @@ mod tests {
         assert!(status.success(), "生成测试视频失败");
     }
 
+    /// 大多数测试不关心改剧名，给个空的映射。
+    fn no_renames() -> std::collections::HashMap<String, NewName> {
+        std::collections::HashMap::new()
+    }
+
     #[test]
     fn end_to_end_starts_a_pipeline_and_queues_jobs_in_stage_order() {
         let (Some(ffmpeg), Some(ffprobe)) =
@@ -1303,6 +1346,7 @@ mod tests {
             10_000,
             "small",
             None,
+            &no_renames(),
         )
         .expect("起流水线失败");
 
@@ -1435,6 +1479,88 @@ mod tests {
         assert_eq!(safe_dir_name("a/b.mp4"), "b");
     }
 
+    /// **导出目录用 AI 生成的新剧名，不是源目录那个名字。**
+    ///
+    /// 这条是用户要的。关键在于新名字必须在**排任务之前**就拿到 ——
+    /// 否则输出路径已经写死在 payload 里，就得事后改目录、改路径，绕一大圈。
+    #[test]
+    fn output_folder_uses_the_ai_generated_title() {
+        let (Some(ffmpeg), Some(ffprobe)) =
+            (env_path("DRAMADIST_TEST_FFMPEG"), env_path("DRAMADIST_TEST_FFPROBE"))
+        else {
+            eprintln!("跳过：需要 DRAMADIST_TEST_FFMPEG 与 DRAMADIST_TEST_FFPROBE");
+            return;
+        };
+
+        let t = TempTree::new("newtitle");
+        let src = t.path().join("青丝谷桑蚕记");
+        make_video(&ffmpeg, &src.join("第01集.mp4"), 2);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate_for_tests(&conn).unwrap();
+
+        let mut renames = std::collections::HashMap::new();
+        renames.insert(
+            "青丝谷桑蚕记".to_string(),
+            NewName {
+                title: "白毛狼引桑蚕守家园".to_string(),
+                synopsis: "一段改过的新简介".to_string(),
+            },
+        );
+
+        let out_root = t.path().join("二创");
+        let outcome = start_pipeline(
+            &conn,
+            &ffprobe,
+            t.path(),
+            &out_root,
+            &["dedup".to_string()],
+            10_000,
+            "",
+            None,
+            &renames,
+        )
+        .expect("起流水线失败");
+
+        // 剧目记录用的是新名字
+        let dramas = crate::db::list_pipeline_dramas(&conn, outcome.run_id).unwrap();
+        assert_eq!(dramas.len(), 1);
+        assert_eq!(dramas[0].name, "白毛狼引桑蚕守家园");
+        assert!(
+            dramas[0].out_dir.ends_with("白毛狼引桑蚕守家园"),
+            "导出目录该是新剧名：{}",
+            dramas[0].out_dir
+        );
+
+        // 目录真的建了，新剧名和新简介也写进去了
+        let dir = std::path::PathBuf::from(&dramas[0].out_dir);
+        assert!(dir.is_dir(), "导出目录该已经建好：{}", dir.display());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("剧名.txt")).unwrap().trim(),
+            "白毛狼引桑蚕守家园"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("详细简介.txt")).unwrap().trim(),
+            "一段改过的新简介"
+        );
+
+        // **所有任务的输出路径都得是新剧名** —— 一个旧路径都不能漏
+        let jobs = crate::db::list_jobs(&conn, 20).unwrap();
+        assert!(!jobs.is_empty());
+        for j in &jobs {
+            assert!(
+                j.payload.contains("白毛狼引桑蚕守家园"),
+                "任务参数里该是新剧名的路径：{}",
+                j.payload
+            );
+            assert!(
+                !j.payload.contains("青丝谷桑蚕记"),
+                "不该残留旧剧名的路径：{}",
+                j.payload
+            );
+        }
+    }
+
     #[test]
     fn running_twice_does_not_duplicate_projects_or_media() {
         // 实测踩到的：每次跑流水线都新建工程、重新导入素材，
@@ -1457,13 +1583,13 @@ mod tests {
         let out = t.path().join("二创");
         let stages = vec!["slice".to_string()];
 
-        let first = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None)
+        let first = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames())
             .expect("第一次跑失败");
         assert_eq!(first.imported, 2);
         assert_eq!(first.reused_projects, 0);
         assert_eq!(first.reused_media, 0);
 
-        let second = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None)
+        let second = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames())
             .expect("第二次跑失败");
 
         // 第二次一条都不该新建
@@ -1507,6 +1633,7 @@ mod tests {
             10_000,
             "",
             None,
+            &no_renames(),
         )
         .expect("起流水线失败");
 
@@ -1630,6 +1757,11 @@ mod tests {
         };
         let mut checked = 0;
         for (stage, _, _, _) in STAGES {
+            // **改剧名不是队列里的一步** —— 它在排任务之前就跑完了，
+            // 所以它不该有对应的队列类型。
+            if stage == "rewrite" {
+                continue;
+            }
             let kind = stage_to_job_kind(stage);
             if is_drama_level(stage) {
                 // 整部剧一步：参数里带齐简介和封面，否则会被跳过（那也算正常）
@@ -1751,6 +1883,7 @@ mod tests {
             10_000,
             "",
             None,
+            &no_renames(),
         )
         .expect("一部坏的素材不该让整条流水线起不来");
 
@@ -1903,6 +2036,10 @@ mod tests {
         }
         // 队列认得的类型才排得进去
         for (key, _, _, _) in STAGES {
+            // 改剧名在排任务之前就跑完了，不是队列步骤
+            if key == "rewrite" {
+                continue;
+            }
             let kind = stage_to_job_kind(key);
             assert!(
                 crate::queue::is_known_kind(kind),

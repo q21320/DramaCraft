@@ -386,6 +386,31 @@ pub async fn test_provider(provider: &AiProvider) -> AiTestResult {
     }
 }
 
+/// 改简介 → 按新简介起剧名。
+///
+/// **这两步的顺序不能反**：反过来的话剧名是根据旧简介起的，两者对不上。
+/// 抽成一个函数是因为有两个调用方 —— 「AI 服务」页上的手工试改，
+/// 和流水线开始前的那一次（必须在建目录、排任务之前跑完）。
+pub async fn rewrite_title_and_synopsis(
+    provider: &AiProvider,
+    title: &str,
+    synopsis: &str,
+) -> AppResult<(String, String)> {
+    let (sys1, user1) = synopsis_prompt(title, synopsis);
+    let new_synopsis = clean_synopsis(&chat(provider, &sys1, &user1).await?);
+    if new_synopsis.is_empty() {
+        return Err(AppError::Msg("模型返回了空简介".into()));
+    }
+
+    let (sys2, user2) = title_prompt(&new_synopsis);
+    let new_title = clean_title(&chat(provider, &sys2, &user2).await?);
+    if new_title.is_empty() {
+        return Err(AppError::Msg("模型返回了空剧名".into()));
+    }
+
+    Ok((new_title, new_synopsis))
+}
+
 /// 让视觉模型描述一张图的画面内容 —— 用来反推分镜。
 ///
 /// 真实软件就是这么做的：日志里有「Ark 语言模型[分镜反推]：…（附图 5 张）」。

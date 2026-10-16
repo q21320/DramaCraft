@@ -32,9 +32,10 @@ use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager};
 
 /// 队列支持的任务类型：(key, 中文名)
-pub const KINDS: [(&str, &str); 16] = [
-    // 顺序照着真实软件的流水线来
-    ("rewrite", "AI 改剧名简介"),
+pub const KINDS: [(&str, &str); 15] = [
+    // 顺序照着真实软件的流水线来。
+    // **没有 "rewrite"** —— 改剧名在排任务**之前**就跑完了
+    // （见 commands::pipeline_start），它不是队列里的一步。
     ("regroup", "整剧重组"),
     ("dedup", "整集去重"),
     ("desubtitle", "AI 去字幕"),
@@ -140,17 +141,6 @@ fn default_shots_per_sheet() -> i64 {
     2
 }
 
-/// 整部剧一步：改剧名 / 简介。
-///
-/// 它不挂在某一集上 —— 结果写进导出目录的 `剧名.txt`，后面的步骤去读。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RewritePayload {
-    title: String,
-    synopsis: String,
-    out_dir: String,
-}
-
 /// 整部剧一步：生成封面。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -237,7 +227,6 @@ pub fn validate_payload(kind: &str, payload: &str) -> AppResult<()> {
         // 参数只要是个 JSON 对象就够（校验太严会把它挡在入队之前，
         // 用户就看不到那条说明了）
         "regroup" | "desubtitle" => check::<serde_json::Map<String, serde_json::Value>>(kind, payload),
-        "rewrite" => check::<RewritePayload>(kind, payload),
         "cover" => check::<CoverPayload>(kind, payload),
         "slice" => check::<SlicePayload>(kind, payload),
         "transform" => check::<TransformPayload>(kind, payload),
@@ -380,40 +369,6 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         }
         // 整部剧第一步：改简介 → 按新简介起剧名。
         // 结果写进导出目录的 `剧名.txt`，封面那一步会去读。
-        "rewrite" => {
-            let p: RewritePayload = parse_payload(job)?;
-            let outcome = commands::ai_rewrite(state, p.title, p.synopsis, Some(p.out_dir)).await?;
-
-            // 改完剧名，把导出目录和**还没跑的任务**一起换成新名字。
-            //
-            // 真实软件把「后续任务将使用新剧名」写在日志里，它跑的是脚本，
-            // 改个变量就行。我们这边路径在入队时就写死在 payload 里了，
-            // 所以得显式换 —— 否则产物还是落在旧剧名的目录里。
-            let mut renamed = 0i64;
-            if let Some(drama_id) = job.pipeline_drama_id {
-                let safe = crate::pipeline::safe_drama_name(&outcome.new_title);
-                // 上面那次调用已经拿走了 state，这里从 app 再取一个句柄
-                let st = app.state::<AppState>();
-                let conn = st
-                    .db
-                    .lock()
-                    .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
-                renamed = db::rename_drama_output(&conn, drama_id, &safe)?;
-            }
-
-            if renamed > 0 {
-                Ok(format!(
-                    "新剧名「{}」；导出目录已改名，{renamed} 个待跑任务的路径跟着换",
-                    outcome.new_title
-                ))
-            } else {
-                Ok(format!(
-                    "新剧名「{}」（{} 字简介）",
-                    outcome.new_title,
-                    outcome.new_synopsis.chars().count()
-                ))
-            }
-        }
         // 整部剧倒数第二步：封面。
         // 用 rewrite 写下的新剧名；读不到就退回原剧名 —— 别因为缺一个文件就整条卡住。
         "cover" => {
