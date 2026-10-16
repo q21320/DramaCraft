@@ -196,8 +196,16 @@ pub const STAGES: [(&str, &str, bool, &str); 8] = [
     (
         "regroup",
         "整剧重组",
-        true,
-        "把零碎源片段按时间轴拼成 60~90 秒的「集」（源已经是整集时会跳过）",
+        // **默认关。**
+        //
+        // 它会**改变集数**：把源片段拼起来按 75 秒重切。源目录里本来就是
+        // 完整剧集时，这一步会把原本的集数边界打乱 —— 实测 6 集会变成 7 集，
+        // 用户看到「应该只有 6 集啊」。
+        //
+        // 它只对「源目录里是一堆零碎片段」有意义（真实软件面对的是
+        // 55 个约 40 秒的碎片）。所以做成**要用才勾**，而不是默认开。
+        false,
+        "把零碎源片段拼成 60~90 秒的集。**会改变集数** —— 源已经是整集时别开",
     ),
     (
         "dedup",
@@ -518,6 +526,21 @@ pub fn start_pipeline(
         let project = match crate::db::find_project_by_root(conn, &drama.dir)? {
             Some(existing) => {
                 reused_projects += 1;
+                // 复用的工程可能积着历史残留 —— 源目录内容换过之后，
+                // 旧素材记录一直在，界面上会显示成"68 集"（实际只有 6 集）。
+                // 只清**原片真的不在了**的那些，有任务在跑的也不动。
+                match crate::db::prune_missing_media(conn, existing.id) {
+                    Ok(n) if n > 0 => {
+                        crate::db::append_log(
+                            conn,
+                            Some(run_id),
+                            None,
+                            "info",
+                            &format!("清掉 {n} 条原片已不在的旧素材记录"),
+                        );
+                    }
+                    _ => {}
+                }
                 existing
             }
             None => crate::db::create_project(conn, &display_name, &drama.dir)?,
@@ -1841,7 +1864,7 @@ mod tests {
 
         let run_b = crate::db::create_pipeline_run(&conn, src, "D:/out", &["slice".into()]).unwrap();
         let proj_b = crate::db::create_project(&conn, "某剧", src).unwrap();
-        let _drama_b = crate::db::add_pipeline_drama(
+        let drama_b = crate::db::add_pipeline_drama(
             &conn, run_b, "某剧", src, "D:/out/某剧", 3, Some(proj_b.id),
         )
         .unwrap();
@@ -1854,8 +1877,10 @@ mod tests {
             size_bytes: 10,
             format_name: "mp4".into(),
         };
+        // **判据是「这次运行的任务碰过哪些素材」**，所以要连任务一起造 ——
+        // 光有素材不算"这次运行处理过"。
         for n in 1..=2 {
-            crate::db::add_media(
+            let m = crate::db::add_media(
                 &conn,
                 proj_a.id,
                 &format!("{src}/第0{n}集.mp4"),
@@ -1863,14 +1888,30 @@ mod tests {
                 &probe,
             )
             .unwrap();
+            crate::db::enqueue_job_for(
+                &conn,
+                Some(m.id),
+                "dedup",
+                &format!(r#"{{"mediaId":{},"outDir":"D:/out"}}"#, m.id),
+                Some(drama_a),
+            )
+            .unwrap();
         }
         for n in 1..=3 {
-            crate::db::add_media(
+            let m = crate::db::add_media(
                 &conn,
                 proj_b.id,
                 &format!("{src}/第0{n}集.mp4"),
                 &format!("第0{n}集.mp4"),
                 &probe,
+            )
+            .unwrap();
+            crate::db::enqueue_job_for(
+                &conn,
+                Some(m.id),
+                "dedup",
+                &format!(r#"{{"mediaId":{},"outDir":"D:/out"}}"#, m.id),
+                Some(drama_b),
             )
             .unwrap();
         }

@@ -1028,53 +1028,35 @@ pub fn run_outputs(conn: &Connection, run_id: i64) -> AppResult<Vec<OutputEpisod
     let mut out = Vec::new();
 
     for drama in dramas {
-        // 按**本次运行自己的工程**查，不再靠源目录猜。
+        // **按「这次运行的任务碰过哪些素材」查。**
         //
-        // 同一个源目录跑过多次时，靠源目录关联会把几次运行的数据全捞出来
-        // （实测 163 行里只有 65 个不同文件，界面上同一集出现两三次）。
-        // v9 之前的老记录没存 project_id，这时退回用源目录匹配 —— 不精确，
-        // 但至少还能看，总比空白强。
-        let medias: Vec<(i64, String, i64, i64, i64)> = match drama.project_id {
-            Some(pid) => {
-                let mut stmt = conn.prepare(
-                    "SELECT m.id, m.name, m.duration_ms, m.width, m.height
-                       FROM media m WHERE m.project_id = ?1 ORDER BY m.id ASC",
-                )?;
-                let rows = stmt
-                    .query_map(params![pid], |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                rows
-            }
-            None => {
-                let mut stmt = conn.prepare(
-                    "SELECT m.id, m.name, m.duration_ms, m.width, m.height
-                       FROM media m
-                       JOIN project p ON p.id = m.project_id
-                      WHERE p.root_dir = ?1
-                      ORDER BY m.id ASC",
-                )?;
-                let rows = stmt
-                    .query_map(params![drama.src_dir], |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                rows
-            }
-        };
+        // 这是最准的判据：任务表上带着 `pipeline_drama_id` 和 `media_id`，
+        // 谁被这次运行处理过一清二楚。
+        //
+        // 踩过的两个坑：
+        // - 按源目录关联：同一目录跑过多次就把几次的数据全捞出来
+        // - 按工程关联：工程是**跨运行复用**的，会把历史残留一起带出来
+        //   （实测工程里积了 68 条素材、55 条原片早删了，界面显示"68 集"）
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.name, m.duration_ms, m.width, m.height
+               FROM media m
+              WHERE m.id IN (
+                    SELECT DISTINCT j.media_id FROM job j
+                     WHERE j.pipeline_drama_id = ?1 AND j.media_id IS NOT NULL
+              )
+              ORDER BY m.id ASC",
+        )?;
+        let medias: Vec<(i64, String, i64, i64, i64)> = stmt
+            .query_map(params![drama.id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         for (media_id, name, duration_ms, width, height) in medias {
             let mut seg_stmt = conn.prepare(
@@ -1145,6 +1127,43 @@ pub fn run_outputs(conn: &Connection, run_id: i64) -> AppResult<Vec<OutputEpisod
 }
 
 // ---------- 运行日志（run_log） ----------
+
+/// 清掉这个工程里「原片已经不在了、而且没有任务在跑」的素材。
+///
+/// 工程是**跨运行复用**的（同源目录不重复建），源目录内容换掉之后，
+/// 旧的素材记录会一直留着。实测一个工程积了 68 条，其中 55 条原片早删了 ——
+/// 界面上显示成「68 集」，用户看着莫名其妙。
+///
+/// **只删文件真的不在的**：网盘/移动硬盘临时断线时不该把有效记录清掉。
+/// **有任务在跑的也不删** —— 那会让正在跑的任务撞外键（这个坑踩过）。
+pub fn prune_missing_media(conn: &Connection, project_id: i64) -> AppResult<i64> {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, path FROM media WHERE project_id = ?1")?;
+        let r = stmt
+            .query_map(params![project_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        r
+    };
+
+    let mut removed = 0i64;
+    for (id, path) in rows {
+        if std::path::Path::new(&path).is_file() {
+            continue;
+        }
+        // 还有待跑/正在跑的任务挂着就先留着
+        let busy: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM job WHERE media_id = ?1 AND status IN ('pending','running')",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if busy > 0 {
+            continue;
+        }
+        remove_media(conn, id)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
 
 /// 某部剧属于哪次运行。日志要按运行过滤，而任务只带 drama_id。
 pub fn run_id_of_drama(conn: &Connection, drama_id: Option<i64>) -> AppResult<Option<i64>> {
@@ -2183,6 +2202,73 @@ mod tests {
     const OK_SLICE: &str =
         r#"{"mediaId":1,"mode":{"mode":"equalParts","parts":3},"outDir":"E:/o"}"#;
     const OK_OCR: &str = r#"{"mediaId":2}"#;
+    /// 复用的工程里，原片已经不在的素材记录要清掉。
+    ///
+    /// 实测：一个工程积了 68 条素材，其中 55 条原片早删了，
+    /// 界面上显示成「68 集」，用户看着莫名其妙（实际只有 6 集）。
+    #[test]
+    fn stale_media_records_are_pruned_but_live_ones_are_kept() {
+        let conn = mem();
+        let project = create_project(&conn, "某剧", "D:/某剧").unwrap();
+        let probe = MediaProbe {
+            duration_ms: 1000,
+            width: 720,
+            height: 1280,
+            has_audio: true,
+            size_bytes: 10,
+            format_name: "mp4".into(),
+        };
+
+        // 造一个真的存在的文件，和一个不存在的
+        let dir = std::env::temp_dir().join("dramadist_prune");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let alive = dir.join("还在.mp4");
+        std::fs::write(&alive, b"x").unwrap();
+
+        let keep = add_media(&conn, project.id, &alive.to_string_lossy(), "还在.mp4", &probe)
+            .unwrap();
+        let gone = add_media(
+            &conn,
+            project.id,
+            &dir.join("已删除.mp4").to_string_lossy(),
+            "已删除.mp4",
+            &probe,
+        )
+        .unwrap();
+
+        let n = prune_missing_media(&conn, project.id).unwrap();
+        assert_eq!(n, 1, "只该清掉原片不在的那一条");
+        assert_eq!(list_media(&conn, project.id).unwrap().len(), 1);
+        assert!(get_media(&conn, keep.id).is_ok(), "原片还在的必须保留");
+        assert!(get_media(&conn, gone.id).is_err(), "原片不在的该清掉");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **有任务在跑的素材不能清** —— 删了会让正在跑的任务撞外键。
+    /// 这个坑真踩过（run#7 整条流水线报 FOREIGN KEY constraint failed）。
+    #[test]
+    fn pruning_never_touches_media_with_running_jobs() {
+        let conn = mem();
+        let project = create_project(&conn, "某剧", "D:/某剧").unwrap();
+        let probe = MediaProbe {
+            duration_ms: 1000,
+            width: 720,
+            height: 1280,
+            has_audio: true,
+            size_bytes: 10,
+            format_name: "mp4".into(),
+        };
+        let m = add_media(&conn, project.id, "D:/不存在的.mp4", "不存在的.mp4", &probe).unwrap();
+        let job = enqueue_job(&conn, Some(m.id), "dedup", r#"{"mediaId":1,"outDir":"D:/o"}"#)
+            .unwrap();
+        mark_job_running(&conn, job.id).unwrap();
+
+        assert_eq!(prune_missing_media(&conn, project.id).unwrap(), 0, "有任务在跑就别动它");
+        assert!(get_media(&conn, m.id).is_ok());
+    }
+
     /// 步骤标题是**分节**，不是每个任务的进度条。
     ///
     /// 每集都打一遍的话，61 集就是 61 行一模一样的 `===== 整集去重 =====` ——
