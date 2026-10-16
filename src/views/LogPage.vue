@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 /**
  * 运行日志页。
  *
@@ -44,7 +44,6 @@ const outputs = ref<OutputEpisode[]>([]);
 const openEpisodes = ref<number[]>([]);
 const playing = ref<{ path: string; title: string; cues: string[] } | null>(null);
 
-const lastId = computed(() => (logs.value.length ? logs.value[logs.value.length - 1].id : 0));
 const busy = computed(() => runs.value.some((r) => r.status === "running"));
 const totalSlices = computed(() => outputs.value.reduce((n, e) => n + e.slices.length, 0));
 
@@ -88,26 +87,66 @@ function fileUrl(path: string): string {
   }
 }
 
-/** 拉新日志。用 afterId 增量取，不重复搬已经看过的行。 */
+/**
+ * 拉新日志。用 afterId 增量取，不重复搬已经看过的行。
+ *
+ * **必须防并发。** 触发源有两个（轮询定时器 + `queue:progress` 事件），
+ * 并行跑任务时事件密集触发，于是好几个 pull 同时在飞：
+ * 它们各自读到**同一个** `lastId`、取回**同一批**数据、各追加一次 ——
+ * 日志页就把同一行渲染了 5 遍，看起来像"重复处理了 5 次"。
+ * 时间戳一模一样就是铁证：真跑 5 次时间不可能相同。
+ *
+ * 三层防护：拉取中不重入、按 id 去重、事件攒一下再拉。
+ */
+let pulling = false;
+/** 事件触发的合并定时器 */
+let coalesceTimer: number | null = null;
+
 async function pullLogs(reset = false) {
+  // 已经在拉了就别叠 —— 叠上去只会重复追加
+  if (pulling) return;
+  pulling = true;
   try {
     const rid = pickedRun.value === 0 ? null : pickedRun.value;
     if (reset) {
       logs.value = [];
     }
-    const fresh = await api.listLogs(rid, reset ? 0 : lastId.value, 800);
+    // 取值和请求放在同一段里，别跨 await
+    const since = reset ? 0 : logs.value.length ? logs.value[logs.value.length - 1].id : 0;
+    const fresh = await api.listLogs(rid, since, 800);
     if (fresh.length > 0) {
-      logs.value = [...logs.value, ...fresh];
-      // 日志太多时砍掉前面的，免得界面越用越卡
-      if (logs.value.length > 4000) logs.value = logs.value.slice(-3000);
-      if (autoScroll.value) {
-        await nextTick();
-        boxRef.value?.scrollTo({ top: boxRef.value.scrollHeight });
+      // 双保险：按 id 去重。并发窗口之外也可能有重复（比如切换运行时的竞态）
+      const seen = new Set(logs.value.map((l) => l.id));
+      const add = fresh.filter((l) => !seen.has(l.id));
+      if (add.length > 0) {
+        logs.value = [...logs.value, ...add];
+        // 日志太多时砍掉前面的，免得界面越用越卡
+        if (logs.value.length > 4000) logs.value = logs.value.slice(-3000);
+        if (autoScroll.value) {
+          await nextTick();
+          boxRef.value?.scrollTo({ top: boxRef.value.scrollHeight });
+        }
       }
     }
   } catch (e) {
     message.error((e as Error).message);
+  } finally {
+    pulling = false;
   }
+}
+
+/**
+ * 事件触发用的入口：**攒 300ms 再拉**。
+ *
+ * 一批 4 个任务并发跑，每个任务开始/结束都发事件 —— 一次刷十几条。
+ * 每条都拉一次既浪费又容易踩并发，合并成一次就够。
+ */
+function triggerPull() {
+  if (coalesceTimer !== null) return;
+  coalesceTimer = window.setTimeout(() => {
+    coalesceTimer = null;
+    void pullLogs();
+  }, 300);
 }
 
 async function refreshRuns() {
@@ -198,7 +237,7 @@ onMounted(async () => {
   startPolling();
   unlisten = await listen("queue:progress", () => {
     void refreshRuns();
-    if (tab.value === "log" && follow.value) void pullLogs();
+    if (tab.value === "log" && follow.value) triggerPull();
   });
 });
 
