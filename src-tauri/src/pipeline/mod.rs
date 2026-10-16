@@ -257,7 +257,12 @@ pub const STAGES: [(&str, &str, bool, &str); 8] = [
 pub fn is_drama_level(stage: &str) -> bool {
     matches!(
         stage,
-        "rewrite" | "regroup" | "desubtitle" | "storyboard" | "cover" | "cost"
+        // **`desubtitle` 不在这里。**
+        //
+        // 它是**按集**的（真实软件日志「并发 4」），而且只做前 4 集 ——
+        // 走这一支就会拿到一个整部剧级别的通用 payload，和它的执行器对不上。
+        // 真实撞到过：任务跑到那一步报「参数无法解析（missing field media_id）」。
+        "rewrite" | "regroup" | "storyboard" | "cover" | "cost"
     )
 }
 
@@ -877,9 +882,19 @@ fn drama_payload(
                 .to_string(),
             ))
         }
-        // 这两步的执行器会给出明确说明（见 queue::execute）——
-        // 排下去让用户看到原因，比悄悄跳过强
-        "regroup" | "desubtitle" => Ok(Some(
+        // 整剧重组的执行器会给出明确说明（见 queue::execute）——
+        // 排下去让用户看到原因，比悄悄跳过强。
+        //
+        // **`desubtitle` 从这里拿掉了**：它是**按集**的（真实软件「并发 4」），
+        // 只做前 4 集，现在走 `stage_payload`。
+        //
+        // 这个兜底坑过一次：`is_drama_level` 忘了把 desubtitle 摘出去，
+        // 于是排下去一个 `{dramaName, outDir}` 的通用 payload，
+        // 执行器要的却是 `{mediaId, outPath}` —— 跑到那一步才报
+        // 「参数无法解析（missing field media_id）」，用户一头雾水。
+        //
+        // **凡是排进队列的东西，形状必须和执行器对得上。**
+        "regroup" => Ok(Some(
             serde_json::json!({
                 "dramaName": drama.name,
                 "outDir": drama_out.to_string_lossy(),
@@ -2364,13 +2379,67 @@ mod tests {
         assert!(is_drama_level("cost"));
         assert!(is_drama_level("storyboard"));
         assert!(is_drama_level("regroup"));
-        assert!(is_drama_level("desubtitle"));
+        // **去字幕不在这一组** —— 它是按集的，见 desubtitle_is_per_episode... 那条测试
+        assert!(!is_drama_level("desubtitle"));
         assert!(!is_drama_level("slice"));
         // 去重是**按集**的（每集去重一次），不是整部剧一次 ——
         // 这正是「先去重整集再切片」的关键
         assert!(!is_drama_level("dedup"));
     }
 
+    /// **AI 去字幕是按集的，不是整部剧一步。**
+    ///
+    /// 真实软件：「AI去字幕（开拍 · 原视频第1～第4集）…（任务 videoscreenclear · 并发 4）」
+    /// —— 每集一个任务，队列同类最多同时 4 个。
+    ///
+    /// 这条是**为一个真实 bug 加的**：改按集的时候漏了把 `desubtitle` 从
+    /// `is_drama_level` 摘出去，于是它走了整部剧那条路，拿到一个
+    /// `{dramaName, outDir}` 的通用 payload，而执行器要的是 `{mediaId, outPath}`
+    /// —— 任务跑到那一步才报「参数无法解析（missing field media_id）」。
+    ///
+    /// **排进队列的东西，形状必须和执行器对得上。**
+    #[test]
+    fn desubtitle_is_per_episode_and_payload_matches_its_executor() {
+        assert!(
+            !is_drama_level("desubtitle"),
+            "去字幕是按集的 —— 走整部剧那条路会拿到形状不对的 payload"
+        );
+
+        let raw = stage_payload(
+            "desubtitle",
+            7,
+            Path::new("D:/二创/某剧"),
+            10_000,
+            "small",
+            "第01集",
+            None,
+        )
+        .unwrap()
+        .expect("去字幕该有 payload");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mediaId"], 7, "执行器要 mediaId：{raw}");
+        let out = v["outPath"].as_str().expect("执行器要 outPath");
+
+        // 切片那一步必须用**同一个路径**去找它 —— 两边算不一致的话，
+        // 切片会静默退回上一版行为（去重产物），看起来跑了其实没吃到。
+        let slice_raw = stage_payload(
+            "slice",
+            7,
+            Path::new("D:/二创/某剧"),
+            10_000,
+            "small",
+            "第01集",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let sv: serde_json::Value = serde_json::from_str(&slice_raw).unwrap();
+        assert_eq!(
+            sv["quzimuPath"].as_str().unwrap(),
+            out,
+            "去字幕和切片必须指向同一个文件"
+        );
+    }
     #[test]
     fn drama_level_stages_skip_cleanly_when_material_is_missing() {
         // 缺简介就跳过改剧名，缺封面就跳过封面 —— 但不能排一个注定失败的任务
