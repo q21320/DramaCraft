@@ -507,7 +507,7 @@ fn ranges(level: Intensity) -> Ranges {
             brightness: 0.010,
             contrast: 0.005,
             saturation: 0.005,
-            noise: (0, 2),
+            noise: (0, 1),
             speed: (0.99, 1.01),
             volume: (0.99, 1.01),
         },
@@ -517,7 +517,7 @@ fn ranges(level: Intensity) -> Ranges {
             brightness: 0.020,
             contrast: 0.010,
             saturation: 0.010,
-            noise: (1, 4),
+            noise: (1, 2),
             speed: (0.97, 1.03),
             volume: (0.98, 1.02),
         },
@@ -527,7 +527,7 @@ fn ranges(level: Intensity) -> Ranges {
             brightness: 0.040,
             contrast: 0.030,
             saturation: 0.030,
-            noise: (3, 8),
+            noise: (2, 4),
             speed: (0.95, 1.05),
             volume: (0.95, 1.05),
         },
@@ -623,10 +623,19 @@ pub fn preset_for(level: Intensity, index: usize, st: &Strengths) -> TransformOp
 
         // ---- 下面照真实软件那 13 项补齐 ----
         hue: signed(&mut rng, BASE_HUE * Strengths::factor(st.hue)),
-        sharpen: BASE_SHARPEN * Strengths::factor(st.sharpen),
-        // 帧混合：强度决定混几帧。**它是最狠的一招，画质代价也最大** ——
-        // 相邻帧叠在一起，运动画面会有拖影。真实软件拿它当主力（tmix=124）。
-        tmix: ((Strengths::factor(st.tmix) * 2.4).round() as u32).clamp(0, 3),
+        // 锐化减半：0.6 × 1.2 ≈ 0.72 在 720p 上已经能看出「数码味」，
+        // 降到 0.35 左右既有去重效果又不刺眼
+        sharpen: BASE_SHARPEN * Strengths::factor(st.sharpen) * 0.5,
+        // **帧混合默认关。**
+        //
+        // 我一开始把它当主力开了（强度 124 × 2.4 = 3 帧），结果成片
+        // **发灰、发闷，动起来三重拖影** —— 用户原话「看着有点晃眼啊我去」。
+        //
+        // 错在映射：真实软件日志里那个 `tmix=124` 是**强度序号**（115~125 那一套），
+        // 不是帧数。我把它乘成帧数，等于永远顶格，画质必然崩。
+        //
+        // 相邻帧叠加一定损画质，所以它必须由用户显式开，不能默认上。
+        tmix: 0,
         // **统一出 720p**：真实软件是 1080 进、720 出。省一半时间与空间，
         // 而平台本来也会重压一遍。
         max_height: 720,
