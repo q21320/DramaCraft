@@ -711,8 +711,10 @@ pub fn transform_preview(
             })
         }
         None => {
+            // 预览也摇一套强度 —— 预览看到的就是实际会跑出来的样子
+            let strengths = transform::Strengths::fresh();
             let samples: Vec<TransformOptions> = (0..3)
-                .map(|i| transform::normalize(&transform::preset_for(level, i)))
+                .map(|i| transform::normalize(&transform::preset_for(level, i, &strengths)))
                 .collect();
             let first = samples[0].clone();
             Ok(TransformPreview {
@@ -759,6 +761,11 @@ pub async fn transform_segments(
     let level = transform::Intensity::parse(&intensity);
     let total = segments.len() as i64;
 
+    // **一次运行摇一套强度**（各项 115~125），这一批片段共用。
+    // 真实软件也是这么做的：强度打一行日志说明，每片在此基础上
+    // 再随机自己的去头尾/变速/B 帧。
+    let strengths = transform::Strengths::fresh();
+
     // 给了 options 就所有片段用同一组；否则按序号生成确定性预设，每片各不相同
     //
     // 片头标识**叠加**在两者之上：它是一条合规开关，和"怎么去重"无关。
@@ -770,7 +777,7 @@ pub async fn transform_segments(
         .map(|(index, seg)| {
             let mut opts = match &options {
                 Some(raw) => transform::normalize(raw),
-                None => transform::preset_for(level, index),
+                None => transform::preset_for(level, index, &strengths),
             };
             if let Some(l) = &label {
                 opts.header_label = Some(l.clone());
@@ -2390,6 +2397,9 @@ pub async fn dedup_media(
     out_dir: Option<String>,
     // 产出文件的名字前缀（新剧名-第NN集）。空串就退回素材名。
     prefix: String,
+    // 强度种子。同一个种子结果相同 —— 队列把「这次运行」的种子传进来，
+    // 一部剧里每集共享一套强度。0 表示用当前时间（每次都不一样）。
+    seed: u64,
 ) -> AppResult<DedupReport> {
     let (ffmpeg, ffprobe, media) = {
         let configured = lock_tools(&state)?.clone();
@@ -2427,7 +2437,12 @@ pub async fn dedup_media(
     };
 
     let level = transform::Intensity::parse(intensity.as_deref().unwrap_or("strong"));
-    let mut opts = transform::preset_for(level, media_id as usize);
+    let strengths = if seed == 0 {
+        transform::Strengths::fresh()
+    } else {
+        transform::Strengths::from_seed(seed)
+    };
+    let mut opts = transform::preset_for(level, media_id as usize, &strengths);
     opts.header_label = header_label;
     // 先把「改了什么」记下来 —— opts 马上要 move 进闭包
     let changes = transform::describe(&opts);

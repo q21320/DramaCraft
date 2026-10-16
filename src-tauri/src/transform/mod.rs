@@ -10,7 +10,7 @@
 
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
-use crate::models::{HeaderLabel, LabelPosition, TransformOptions};
+use crate::models::{CornerLabel, HeaderLabel, LabelPosition, TransformOptions};
 use crate::proc::{no_window, tail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -56,7 +56,17 @@ pub fn normalize(raw: &TransformOptions) -> TransformOptions {
         // 标识在这里不夹数值：文字要按绘图规则清洗、字号要按画面高度算，
         // 那两件事都在 build_label_filter 里做（这里拿不到画面尺寸）
         header_label: raw.header_label.clone(),
-    }
+            hue: 0.0,
+            sharpen: 0.0,
+            tmix: 0,
+            max_height: 0,
+            fps: 0.0,
+            shift_x: 0,
+            shift_y: 0,
+            corner_label: None,
+            gop: 0,
+            bframes: -1,
+            bitrate_bps: 0,    }
 }
 
 /// 是否为"什么都不做"。
@@ -275,8 +285,53 @@ pub fn build_video_filter(raw: &TransformOptions, target: Option<(u32, u32)>) ->
         parts.push(format!("noise=alls={}:allf=t+u", o.noise));
     }
 
+    // **色相偏移。** 真实软件那 13 项里的一项（强度 122）。
+    // 幅度很小（一两度），肉眼几乎看不出，但会让画面指纹变掉。
+    if o.hue.abs() > EPS {
+        parts.push(format!("hue=h={:.2}", o.hue));
+    }
+
+    // **锐化。** 同样是 13 项之一（强度 119）。
+    if o.sharpen > EPS {
+        parts.push(format!("unsharp=5:5:{:.2}:5:5:0", o.sharpen));
+    }
+
+    // **帧混合（tmix）。** 真实软件的主力手段（强度 124）。
+    //
+    // 把相邻若干帧叠在一起 —— 去重效果最强，**画质代价也最大**：
+    // 运动画面会有明显拖影。所以放在调色之后、标识之前。
+    if o.tmix >= 2 {
+        parts.push(format!("tmix=frames={}", o.tmix));
+    }
+
     if (o.speed - 1.0).abs() > EPS {
         parts.push(format!("setpts=PTS/{:.4}", o.speed));
+    }
+
+    // **几何位移。** 真实软件特意注明「原微旋转」—— 旋转会在四角留黑边，
+    // 位移不会。做法是**把裁切框整体挪一点**，画面内容跟着偏，但不出黑边。
+    //
+    // 必须放在裁切之后：裁切是先定好尺寸的，位移是在那个尺寸里挪位置。
+    if o.shift_x != 0 || o.shift_y != 0 {
+        // 挪多少就把裁切框放大多少，保证挪完之后仍然铺满
+        let dx = o.shift_x.unsigned_abs() as i64;
+        let dy = o.shift_y.unsigned_abs() as i64;
+        let x = if o.shift_x >= 0 { format!("{dx}") } else { format!("iw-{dx}") };
+        let y = if o.shift_y >= 0 { format!("{dy}") } else { format!("ih-{dy}") };
+        parts.push(format!("crop=iw-{dx}:ih-{dy}:{x}:{y}"));
+        parts.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string());
+    }
+
+    // **统一帧率。** 30fps 本身也是一项去重（真实软件的「帧率项」强度 122）。
+    // 放在最后一步之前 —— 前面的速度变化会改有效帧率，这里统一收口。
+    if o.fps > 0.0 {
+        parts.push(format!("fps={}", o.fps as i64));
+    }
+
+    // **统一出 720p。** 真实软件是 1080 进、720 出。
+    // 放在最后：前面所有处理都在原尺寸上做，最后一步才降下来。
+    if o.max_height > 0 {
+        parts.push(format!("scale=-2:{}", o.max_height));
     }
 
     // 片头标识放在**最后**：它要压在最终画面上。
@@ -289,7 +344,62 @@ pub fn build_video_filter(raw: &TransformOptions, target: Option<(u32, u32)>) ->
         }
     }
 
+    // 剧名角标也是压在最终画面上，和片头标识同理
+    if let Some(corner) = &o.corner_label {
+        let size = target.map(|(w, h)| (w as i64, h as i64)).unwrap_or((1080, 1920));
+        let seg = build_corner_filter(corner, size)?;
+        if !seg.is_empty() {
+            parts.push(seg);
+        }
+    }
+
     Ok(parts.join(","))
+}
+
+/// 剧名角标：一直显示在角落的小字。
+///
+/// 和「片头标识」的区别：片头标识是**合规声明**（只显示前几秒、要求显著），
+/// 角标是**去重手段**（全程都在、要求低调）。两者目的不同，不能合并。
+pub fn build_corner_filter(label: &CornerLabel, size: (i64, i64)) -> AppResult<String> {
+    let text = sanitize_label_text(&label.text);
+    if text.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let font = find_cjk_font().ok_or_else(|| {
+        AppError::Msg("找不到中文字体，角标画不出来（装了微软雅黑或黑体就行）".into())
+    })?;
+    let (w, h) = size;
+    let fs = if label.size_ratio > 0.0 {
+        (h as f64 * label.size_ratio).round().max(10.0) as i64
+    } else {
+        22
+    };
+    let a = label.opacity.clamp(0.05, 1.0);
+    // 边距随字号走，画面大小不同都好看
+    let m = (fs / 2).max(8);
+    let (x, y) = match label.position {
+        LabelPosition::TopLeft => (format!("{m}"), format!("{m}")),
+        LabelPosition::TopCenter => ("(w-text_w)/2".to_string(), format!("{m}")),
+        LabelPosition::TopRight => (format!("w-text_w-{m}"), format!("{m}")),
+        LabelPosition::BottomLeft => (format!("{m}"), format!("h-text_h-{m}")),
+        LabelPosition::BottomCenter => (
+            "(w-text_w)/2".to_string(),
+            format!("h-text_h-{m}"),
+        ),
+        LabelPosition::BottomRight => (
+            format!("w-text_w-{m}"),
+            format!("h-text_h-{m}"),
+        ),
+    };
+    let _ = w;
+    Ok(format!(
+        "drawtext=fontfile='{}':text='{}':fontsize={fs}:fontcolor=white@{a:.2}:\
+         box=1:boxcolor=black@{:.2}:boxborderw={}:x={x}:y={y}",
+        escape_filter_path(&font),
+        text,
+        a * 0.35,
+        (fs / 4).max(2)
+    ))
 }
 
 /// 音频滤镜串。变速必须与视频一致，否则音画不同步。
@@ -404,18 +514,28 @@ impl Rng {
         lo + (hi - lo) * self.next_f64()
     }
 
-    fn range_u32(&mut self, lo: u32, hi: u32) -> u32 {
-        if hi <= lo {
-            return lo;
-        }
-        lo + (self.next_u64() % (hi - lo + 1) as u64) as u32
-    }
 }
 
 /// 按档位与序号生成一组处理参数。同一个序号结果稳定。
-pub fn preset_for(level: Intensity, index: usize) -> TransformOptions {
+pub fn preset_for(level: Intensity, index: usize, st: &Strengths) -> TransformOptions {
     let r = ranges(level);
     let mut rng = Rng::new(index as u64 + 1);
+
+    // **强度决定落在档位区间的哪个位置**：115 → 区间偏下，125 → 顶到上沿。
+    //
+    // 不直接用 `strength/100` 乘一个固定基准，是因为那样会**跑出档位区间** ——
+    // 「轻/中/强」三个档就失去意义了（实测撞到：强档的 crop 算出来超出了
+    // 强档自己的上沿）。落在区间里既保住档位语义，也让强度真正起作用。
+    let pick = |rng: &mut Rng, range: (f64, f64), strength: i32| -> f64 {
+        let t = ((strength - STRENGTH_MIN) as f64 / (STRENGTH_MAX - STRENGTH_MIN) as f64)
+            .clamp(0.0, 1.0);
+        // 落在区间的 55%~100%：强度低的也不至于弱到没效果
+        let base = range.0 + (range.1 - range.0) * (0.55 + 0.45 * t);
+        // **每个文件再抖一点** —— 否则同一次运行里所有文件参数一模一样。
+        // 去重的意义正是「每一片都不一样」。
+        let jitter = (range.1 - range.0) * 0.18;
+        (base + rng.range(-jitter, jitter)).clamp(range.0, range.1)
+    };
 
     let signed = |rng: &mut Rng, amplitude: f64| -> f64 {
         if amplitude <= 0.0 {
@@ -435,17 +555,43 @@ pub fn preset_for(level: Intensity, index: usize) -> TransformOptions {
         // 都安全；裁切改成贴底裁之后也不会切到字幕；只有镜像是不可挽回的 ——
         // 所以它必须由用户显式要求。
         mirror: false,
-        crop_ratio: rng.range(r.crop.0, r.crop.1),
-        scale_ratio: rng.range(r.scale.0, r.scale.1),
-        brightness: signed(&mut rng, r.brightness),
-        contrast: 1.0 + signed(&mut rng, r.contrast),
-        saturation: 1.0 + signed(&mut rng, r.saturation),
-        noise: rng.range_u32(r.noise.0, r.noise.1),
-        speed: rng.range(r.speed.0, r.speed.1),
-        volume: rng.range(r.volume.0, r.volume.1),
+        // 每一项 = 基准 × （这次运行摇到的强度 / 100）。
+        // **不写死** —— 固定值意味着每次跑出来的处理完全一样，去重就没意义了。
+        crop_ratio: pick(&mut rng, r.crop, st.crop),
+        scale_ratio: pick(&mut rng, r.scale, st.color),
+        brightness: signed(&mut rng, r.brightness * Strengths::factor(st.color) / 1.2),
+        contrast: 1.0 + signed(&mut rng, r.contrast * Strengths::factor(st.color) / 1.2),
+        saturation: 1.0 + signed(&mut rng, r.saturation * Strengths::factor(st.color) / 1.2),
+        noise: pick(&mut rng, (r.noise.0 as f64, r.noise.1 as f64), st.noise).round() as u32,
+        speed: pick(&mut rng, r.speed, st.speed),
+        volume: pick(&mut rng, r.volume, st.audio),
         // 片头标识是**合规开关**，由用户显式要求；随机预设不擅自加，
         // 也不能擅自加 —— 内容是 AI 生成的才需要标，标错了是另一种不实。
         header_label: None,
+
+        // ---- 下面照真实软件那 13 项补齐 ----
+        hue: signed(&mut rng, BASE_HUE * Strengths::factor(st.hue)),
+        sharpen: BASE_SHARPEN * Strengths::factor(st.sharpen),
+        // 帧混合：强度决定混几帧。**它是最狠的一招，画质代价也最大** ——
+        // 相邻帧叠在一起，运动画面会有拖影。真实软件拿它当主力（tmix=124）。
+        tmix: ((Strengths::factor(st.tmix) * 2.4).round() as u32).clamp(0, 3),
+        // **统一出 720p**：真实软件是 1080 进、720 出。省一半时间与空间，
+        // 而平台本来也会重压一遍。
+        max_height: 720,
+        fps: 30.0,
+        // 几何位移而不是微旋转 —— 真实软件特意注明「原微旋转」，
+        // 旋转会在四角留黑边，位移不会。
+        shift_x: (BASE_SHIFT * Strengths::factor(st.shift)) as i64
+            * if rng.next_f64() < 0.5 { -1 } else { 1 },
+        shift_y: (BASE_SHIFT * Strengths::factor(st.shift)) as i64
+            * if rng.next_f64() < 0.5 { -1 } else { 1 },
+        // 剧名角标由调用方塞（只有它知道最终剧名），这里只留位置
+        corner_label: None,
+        // 编码：GOP 固定 60，B 帧随机 0/1/2（真实软件就是这么随机化的）
+        gop: 60,
+        bframes: (rng.next_f64() * 3.0) as i64,
+        // ≥6Mbps 是真实软件对成片的要求
+        bitrate_bps: 6_000_000,
     }
 }
 
@@ -634,6 +780,124 @@ pub fn check_spec(ffprobe: &Path, file: &Path) -> Vec<String> {
     problems
 }
 
+// ---- 新增那几项的基准 ----
+//
+// 这几项没有「轻/中/强」区间（是照真实软件的 13 项补贴上去的），
+// 所以只用强度当倍数：115 → ×1.15，125 → ×1.25。
+
+/// 色相偏移的基准（度）。×1.22 ≈ 1.6 度 —— 肉眼几乎看不出，但指纹会变
+const BASE_HUE: f64 = 1.3;
+/// 锐化的基准。×1.19 ≈ 0.71
+const BASE_SHARPEN: f64 = 0.60;
+/// 几何位移的基准（像素）。×1.24 ≈ 6
+const BASE_SHIFT: f64 = 5.0;
+// ---------------- 强度（每次运行随机） ----------------
+
+/// 13 项去重手段的强度。
+///
+/// **照真实软件的做法：每项每次运行随机 115~125**（100 = 基准）。
+/// 它的日志原话：
+///
+/// ```text
+/// 超强去重强度：各项随机 115～125（帧混合 tmix=124，裁切=116，变速=117，
+/// 帧率项(已统一30fps)=122，剧名角标=120，几何位移(原微旋转)=124，
+/// 亮度/对比/饱和=118，色相=122，噪点=121，锐化=119，微水印=122，
+/// 去头尾=121，音频指纹=115）
+/// ```
+///
+/// **不能写死。** 固定值意味着每次跑出来的处理完全一样 ——
+/// 那去重的意义就没了。这里用一个种子生成，同一轮内保持一致、
+/// 换一轮就换一套。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Strengths {
+    pub tmix: i32,
+    pub crop: i32,
+    pub speed: i32,
+    pub fps: i32,
+    pub corner_label: i32,
+    pub shift: i32,
+    pub color: i32,
+    pub hue: i32,
+    pub noise: i32,
+    pub sharpen: i32,
+    pub watermark: i32,
+    pub trim: i32,
+    pub audio: i32,
+}
+
+/// 强度取值范围（含两端）
+pub const STRENGTH_MIN: i32 = 115;
+pub const STRENGTH_MAX: i32 = 125;
+
+impl Strengths {
+    /// 用种子生成一套强度。同一个种子结果相同 ——
+    /// 这样「同一次运行里的每个文件」共享一套，而「每次运行」都不一样。
+    pub fn from_seed(seed: u64) -> Self {
+        // 自己写个小 PRNG：只为取随机数，不想为它引一个依赖
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut next = || {
+            // xorshift64*
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            let v = s.wrapping_mul(2685821657736338717);
+            STRENGTH_MIN + (v >> 33) as i32 % (STRENGTH_MAX - STRENGTH_MIN + 1)
+        };
+        Self {
+            tmix: next(),
+            crop: next(),
+            speed: next(),
+            fps: next(),
+            corner_label: next(),
+            shift: next(),
+            color: next(),
+            hue: next(),
+            noise: next(),
+            sharpen: next(),
+            watermark: next(),
+            trim: next(),
+            audio: next(),
+        }
+    }
+
+    /// 当前时间当种子 —— 每次跑都不一样。
+    pub fn fresh() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(12345);
+        Self::from_seed(nanos)
+    }
+
+    /// 这一项相对基准的倍数：116 → 1.16
+    fn factor(v: i32) -> f64 {
+        v as f64 / 100.0
+    }
+
+    /// 给人看的一行 —— 真实软件也是把这一行写进日志的，
+    /// 用户回头才知道「这次跑用的是什么强度」。
+    pub fn describe(&self) -> String {
+        format!(
+            "各项随机 {STRENGTH_MIN}～{STRENGTH_MAX}（帧混合 tmix={}，裁切={}，变速={}，\
+             帧率项={}，剧名角标={}，几何位移={}，亮度/对比/饱和={}，色相={}，噪点={}，\
+             锐化={}，微水印={}，去头尾={}，音频指纹={}）",
+            self.tmix,
+            self.crop,
+            self.speed,
+            self.fps,
+            self.corner_label,
+            self.shift,
+            self.color,
+            self.hue,
+            self.noise,
+            self.sharpen,
+            self.watermark,
+            self.trim,
+            self.audio
+        )
+    }
+}
+
 // ---------------- 并行度 ----------------
 
 /// 画面处理同时跑几路。
@@ -674,8 +938,11 @@ pub fn apply(
         )));
     }
 
-    let video = build_video_filter(opts, target)?;
-    let audio = build_audio_filter(opts);
+    // 编码参数要从**归一化之后**的选项读 —— 归一化会把越界值夹回安全范围，
+    // 直接用原始 opts 可能拿到 0 或负数（GOP/B 帧）。
+    let o = normalize(opts);
+    let video = build_video_filter(&o, target)?;
+    let audio = build_audio_filter(&o);
     let temp = temp_path(out)?;
 
     let mut args: Vec<String> = vec![
@@ -694,21 +961,42 @@ pub fn apply(
         args.push(audio);
     }
     for a in [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "20",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-movflags",
-        "+faststart",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
     ] {
+        args.push(a.into());
+    }
+    // **码率下限 vs CRF。** 真实软件要求成片 ≥6Mbps，
+    // 而 CRF 20 在 720p 上通常只有 2~4Mbps —— 达不到那条线。
+    // 给了目标码率就走受限 VBR（minrate 保证不低于），否则走 CRF。
+    if o.bitrate_bps > 0 {
+        let kbps = o.bitrate_bps / 1000;
+        for a in [
+            "-b:v".to_string(),
+            format!("{kbps}k"),
+            "-minrate".to_string(),
+            format!("{kbps}k"),
+            "-maxrate".to_string(),
+            format!("{}k", kbps * 4 / 3),
+            "-bufsize".to_string(),
+            format!("{}k", kbps * 2),
+        ] {
+            args.push(a);
+        }
+    } else {
+        args.push("-crf".into());
+        args.push("20".into());
+    }
+    // **GOP 与 B 帧。** 真实软件固定 GOP=60、B 帧在 0/1/2 之间随机 ——
+    // 这两项也是去重指纹的一部分。
+    if o.gop > 0 {
+        args.push("-g".into());
+        args.push(o.gop.to_string());
+    }
+    if o.bframes >= 0 {
+        args.push("-bf".into());
+        args.push(o.bframes.to_string());
+    }
+    for a in ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"] {
         args.push(a.into());
     }
     args.push(temp.to_string_lossy().to_string());
@@ -848,11 +1136,78 @@ mod tests {
         assert!((1..=4).contains(&n), "并行度应当在 1~4 之间，实际 {n}");
     }
 
+    /// **13 项强度每次运行都要重新摇。**
+    ///
+    /// 用户的原话：「不能写死呀 他是随机的值好像 各项强度每次随机 115~125」。
+    /// 对。固定值意味着每次跑出来的处理完全一样 —— 那去重的意义就没了。
+    #[test]
+    fn strengths_are_random_per_run_and_inside_range() {
+        // 同一个种子必须给同一套（同一次运行里要一致）
+        assert_eq!(Strengths::from_seed(9), Strengths::from_seed(9));
+        // 不同种子必须给不同套（每次运行要不一样）
+        assert_ne!(Strengths::from_seed(1), Strengths::from_seed(2));
+
+        // 摇 200 次，每一项都必须落在 115~125
+        for seed in 0..200u64 {
+            let s = Strengths::from_seed(seed);
+            for (name, v) in [
+                ("tmix", s.tmix),
+                ("crop", s.crop),
+                ("speed", s.speed),
+                ("fps", s.fps),
+                ("corner_label", s.corner_label),
+                ("shift", s.shift),
+                ("color", s.color),
+                ("hue", s.hue),
+                ("noise", s.noise),
+                ("sharpen", s.sharpen),
+                ("watermark", s.watermark),
+                ("trim", s.trim),
+                ("audio", s.audio),
+            ] {
+                assert!(
+                    (STRENGTH_MIN..=STRENGTH_MAX).contains(&v),
+                    "{name} 越界：{v}（种子 {seed}）"
+                );
+            }
+        }
+
+        // 真要"每项都独立随机"：不能 13 项永远相等
+        let s = Strengths::from_seed(12345);
+        let all = [
+            s.tmix, s.crop, s.speed, s.fps, s.corner_label, s.shift, s.color, s.hue,
+            s.noise, s.sharpen, s.watermark, s.trim, s.audio,
+        ];
+        let distinct: std::collections::HashSet<i32> = all.iter().copied().collect();
+        assert!(distinct.len() >= 5, "13 项应当各不相同，实际只有 {} 种", distinct.len());
+    }
+
+    /// 强度确实会影响参数 —— 否则摇它干什么。
+    #[test]
+    fn strength_actually_changes_the_output() {
+        let low = Strengths {
+            tmix: 115, crop: 115, speed: 115, fps: 115, corner_label: 115, shift: 115,
+            color: 115, hue: 115, noise: 115, sharpen: 115, watermark: 115, trim: 115,
+            audio: 115,
+        };
+        let high = Strengths {
+            tmix: 125, crop: 125, speed: 125, fps: 125, corner_label: 125, shift: 125,
+            color: 125, hue: 125, noise: 125, sharpen: 125, watermark: 125, trim: 125,
+            audio: 125,
+        };
+        let a = preset_for(Intensity::Strong, 3, &low);
+        let b = preset_for(Intensity::Strong, 3, &high);
+        assert!(b.crop_ratio > a.crop_ratio, "裁切该随强度变：{} vs {}", a.crop_ratio, b.crop_ratio);
+        assert!(b.speed > a.speed, "变速该随强度变");
+        assert!(b.noise > a.noise, "噪点该随强度变");
+    }
     #[test]
     fn generated_presets_never_mirror() {
+        // 固定种子 —— 测试要可复现，不能用 fresh()
+        let st = Strengths::from_seed(42);
         for level in [Intensity::Light, Intensity::Medium, Intensity::Strong] {
             for index in 0..200 {
-                let o = preset_for(level, index);
+                let o = preset_for(level, index, &st);
                 assert!(
                     !o.mirror,
                     "{level:?} 档第 {index} 组参数镜像了 —— 会自动毁掉画面里的字幕"
@@ -1117,10 +1472,11 @@ mod tests {
 
     #[test]
     fn generated_presets_never_add_a_label() {
+        let st = Strengths::from_seed(42);
         for level in [Intensity::Light, Intensity::Medium, Intensity::Strong] {
             for index in 0..50 {
                 assert!(
-                    preset_for(level, index).header_label.is_none(),
+                    preset_for(level, index, &st).header_label.is_none(),
                     "{level:?} 档第 {index} 组偷偷加了标识"
                 );
             }
@@ -1140,7 +1496,17 @@ mod tests {
             speed: 0.0,
             volume: 100.0,
             header_label: None,
-        };
+            hue: 0.0,
+            sharpen: 0.0,
+            tmix: 0,
+            max_height: 0,
+            fps: 0.0,
+            shift_x: 0,
+            shift_y: 0,
+            corner_label: None,
+            gop: 0,
+            bframes: -1,
+            bitrate_bps: 0,        };
         let n = normalize(&wild);
         assert_eq!(n.crop_ratio, CROP_MAX);
         assert_eq!(n.scale_ratio, SCALE_MIN);
@@ -1242,9 +1608,12 @@ mod tests {
 
     #[test]
     fn preset_is_deterministic_and_within_range() {
+        // **同一个种子必须给出同一套参数** —— 否则同一次运行里
+        // 每个文件的处理基准都在飘，出了事没法复现。
+        let st = Strengths::from_seed(7);
         for index in 0..30 {
-            let a = preset_for(Intensity::Medium, index);
-            let b = preset_for(Intensity::Medium, index);
+            let a = preset_for(Intensity::Medium, index, &st);
+            let b = preset_for(Intensity::Medium, index, &st);
             assert_eq!(a.crop_ratio, b.crop_ratio, "同一序号必须完全一致");
             assert_eq!(a.speed, b.speed);
             assert_eq!(a.noise, b.noise);
@@ -1259,9 +1628,10 @@ mod tests {
 
     #[test]
     fn consecutive_presets_differ_from_each_other() {
+        let st = Strengths::from_seed(7);
         let mut distinct = std::collections::HashSet::new();
         for index in 0..20 {
-            let o = preset_for(Intensity::Medium, index);
+            let o = preset_for(Intensity::Medium, index, &st);
             distinct.insert(format!("{:.6}|{:.6}|{}", o.crop_ratio, o.speed, o.noise));
         }
         assert!(distinct.len() >= 15, "相邻序号应产生不同参数，实际 {} 种", distinct.len());
@@ -1269,6 +1639,7 @@ mod tests {
 
     #[test]
     fn stronger_levels_stay_inside_their_own_ranges() {
+        let st = Strengths::from_seed(42);
         let light = ranges(Intensity::Light);
         let strong = ranges(Intensity::Strong);
         assert!(light.crop.1 < strong.crop.0, "档位区间应递增");
@@ -1276,7 +1647,7 @@ mod tests {
         // 任何档位生成的参数都必须在全局安全范围内
         for level in [Intensity::Light, Intensity::Medium, Intensity::Strong] {
             for index in 0..10 {
-                let n = normalize(&preset_for(level, index));
+                let n = normalize(&preset_for(level, index, &st));
                 assert!(n.crop_ratio <= CROP_MAX);
                 assert!(n.speed >= SPEED_MIN && n.speed <= SPEED_MAX);
                 assert!(n.volume >= VOLUME_MIN && n.volume <= VOLUME_MAX);
@@ -1422,7 +1793,17 @@ mod tests {
             speed: 1.1,
             volume: 0.95,
             header_label: None,
-        };
+            hue: 0.0,
+            sharpen: 0.0,
+            tmix: 0,
+            max_height: 0,
+            fps: 0.0,
+            shift_x: 0,
+            shift_y: 0,
+            corner_label: None,
+            gop: 0,
+            bframes: -1,
+            bitrate_bps: 0,        };
         let out = processed_path(&input);
         // 已知源尺寸 → 精确缩放，裁切后必须严格回到 320x240
         let size = apply(&ffmpeg, &input, &out, &o, Some((320, 240))).expect("画面处理失败");

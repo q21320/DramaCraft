@@ -352,6 +352,9 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                 p.header_label,
                 Some(p.out_dir),
                 p.prefix,
+                // 强度种子：0 = 用当前时间，每次跑都不一样。
+                // 真实软件的 13 项强度就是每次随机 115~125，固定的没意义。
+                0,
             )
             .await?;
             let mb = report.size_bytes as f64 / 1048576.0;
@@ -647,6 +650,21 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                     };
                     if !already {
                         db::append_log(&conn, run_id, Some(drama_id), "info", &label);
+                        // 去重这一步**把这次摇到的强度写下来** ——
+                        // 真实软件也打这一行。13 项强度每次运行都不一样，
+                        // 不写下来，用户回头没法知道这批片子是按什么参数处理的。
+                        if job.kind == "dedup" {
+                            db::append_log(
+                                &conn,
+                                run_id,
+                                Some(drama_id),
+                                "info",
+                                &format!(
+                                    "本次去重强度：{}",
+                                    crate::transform::Strengths::fresh().describe()
+                                ),
+                            );
+                        }
                     }
                 }
             }

@@ -125,11 +125,6 @@ pub struct DocMeta {
 
 // ---------------- document.xml ----------------
 
-/// 正文字体的 run 属性。标题那条走 [`run_props_font`]（要单独指定中文字体）。
-fn run_props(style: &DocStyle, size: u32, bold: bool) -> String {
-    run_props_font(style, size, bold, &style.east_asian_font)
-}
-
 fn paragraph(text: &str, style: &DocStyle, size: u32, bold: bool, align: &str, indent: bool) -> String {
     paragraph_with_font(text, style, size, bold, align, indent, &style.east_asian_font)
 }

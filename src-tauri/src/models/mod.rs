@@ -161,6 +161,82 @@ pub struct TransformOptions {
     /// 片头标识；`None` 表示不加
     #[serde(default)]
     pub header_label: Option<HeaderLabel>,
+
+    // ---------------- 下面这些照着真实软件那 13 项去重手段补的 ----------------
+    //
+    // 它的日志把每一项的强度都写出来了：
+    //   帧混合 tmix=124，裁切=116，变速=117，帧率项=122，剧名角标=120，
+    //   几何位移=124，亮度/对比/饱和=118，色相=122，噪点=121，锐化=119，
+    //   微水印=122，去头尾=121，音频指纹=115
+    //
+    // 每一项都加上，用户才有得选；强度随机是为了让每一片都不一样。
+
+    /// 色相偏移（度，约 -10~10）
+    #[serde(default)]
+    pub hue: f64,
+    /// 锐化强度（0~1.5，0 = 关）
+    #[serde(default)]
+    pub sharpen: f64,
+    /// 帧混合帧数（0 = 关，2~3 有效）。**画质代价明显**，但确实是最强的去重手段之一
+    #[serde(default)]
+    pub tmix: u32,
+    /// 输出最大高度（0 = 不缩放）。真实软件统一出 720p —— 省一半时间与空间
+    #[serde(default)]
+    pub max_height: i64,
+    /// 统一帧率（0 = 不变）。统一到 30fps 本身也是一项去重
+    #[serde(default)]
+    pub fps: f64,
+    /// 几何位移（像素）。正数往右/下移。
+    ///
+    /// 真实软件注明是「几何位移(原微旋转)」—— 它原来用微旋转，后来换成位移。
+    /// 旋转会在四角留黑边，位移不会。这里也用位移。
+    #[serde(default)]
+    pub shift_x: i64,
+    #[serde(default)]
+    pub shift_y: i64,
+    /// 剧名角标（一直显示在角落），和「片头标识」是两回事
+    #[serde(default)]
+    pub corner_label: Option<CornerLabel>,
+
+    // ---- 编码参数 ----
+    /// 关键帧间隔（0 = 用编码器默认）。真实软件固定 60
+    #[serde(default)]
+    pub gop: i64,
+    /// B 帧数（-1 = 用编码器默认）。真实软件在 0/1/2 之间随机
+    #[serde(default = "default_bframes")]
+    pub bframes: i64,
+    /// 目标码率（bps，0 = 走 CRF）。真实软件要求成片 ≥6Mbps
+    #[serde(default)]
+    pub bitrate_bps: i64,
+}
+
+fn default_bframes() -> i64 {
+    -1
+}
+
+/// 画在角落的剧名角标。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CornerLabel {
+    pub text: String,
+    #[serde(default = "default_corner_position")]
+    pub position: LabelPosition,
+    /// 字号占画面高度的比例
+    #[serde(default = "default_corner_size")]
+    pub size_ratio: f64,
+    /// 不透明度 0~1。角标要低调，默认半透明
+    #[serde(default = "default_corner_opacity")]
+    pub opacity: f64,
+}
+
+fn default_corner_position() -> LabelPosition {
+    LabelPosition::BottomRight
+}
+fn default_corner_size() -> f64 {
+    0.022
+}
+fn default_corner_opacity() -> f64 {
+    0.55
 }
 
 impl Default for TransformOptions {
@@ -178,7 +254,17 @@ impl Default for TransformOptions {
             speed: 1.0,
             volume: 1.0,
             header_label: None,
-        }
+            hue: 0.0,
+            sharpen: 0.0,
+            tmix: 0,
+            max_height: 0,
+            fps: 0.0,
+            shift_x: 0,
+            shift_y: 0,
+            corner_label: None,
+            gop: 0,
+            bframes: -1,
+            bitrate_bps: 0,        }
     }
 }
 
