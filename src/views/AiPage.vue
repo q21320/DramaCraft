@@ -1,4 +1,4 @@
-/**
+﻿/**
  * AI 服务配置页。
  *
  * 单独一页的理由：Key、Base URL、模型、用途开关散在各个功能页里，
@@ -21,8 +21,9 @@ import {
   NTag,
   useMessage,
 } from "naive-ui";
+import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/api";
-import type { AiConfigView, AiProvider, AiUsage } from "@/types";
+import type { AiConfigView, AiProvider, AiUsage, RewriteOutcome } from "@/types";
 
 const message = useMessage();
 
@@ -33,8 +34,7 @@ const testing = ref<string | null>(null);
 const testResults = ref<Record<string, { ok: boolean; message: string }>>({});
 
 /** 界面上正在编辑的副本 */
-const providers = ref<AiProvider[]>([]);
-const active = ref("");
+const providers = ref<AiProvider[]>([]);const active = ref("");
 const usage = ref<AiUsage>({
   coverGeneration: false,
   titleRewrite: false,
@@ -44,6 +44,38 @@ const warnings = ref<string[]>([]);
 
 /** 每个服务商对应的 key 输入（空 = 不改动） */
 const keyDrafts = ref<Record<string, string>>({});
+
+// ---- 试改剧名/简介 ----
+const rwTitle = ref("");
+const rwSynopsis = ref("");
+const rwOutDir = ref("");
+const rwLoading = ref(false);
+const rwResult = ref<RewriteOutcome | null>(null);
+
+async function pickOutDir() {
+  const p = await open({ directory: true, multiple: false, title: "选择写入目录" });
+  if (typeof p === "string") rwOutDir.value = p;
+}
+
+async function doRewrite() {
+  if (!rwSynopsis.value.trim()) {
+    message.warning("先填原简介 —— 改写要有素材");
+    return;
+  }
+  rwLoading.value = true;
+  try {
+    rwResult.value = await api.aiRewrite(
+      rwTitle.value,
+      rwSynopsis.value,
+      rwOutDir.value.trim() || null,
+    );
+    message.success(`新剧名：${rwResult.value.newTitle}`);
+  } catch (e) {
+    message.error((e as Error).message);
+  } finally {
+    rwLoading.value = false;
+  }
+}
 
 const usageItems: { key: keyof AiUsage; label: string; hint: string }[] = [
   {
@@ -253,6 +285,59 @@ onMounted(load);
   </div>
 
   <div class="dd-card">
+    <div class="dd-card-title">试改剧名 / 简介</div>
+    <div class="dd-card-desc">
+      先有原剧名和原简介，AI 重写简介，再<b>按新简介</b>起新剧名。
+      顺序不能反 —— 反过来的话剧名是根据旧简介起的，两者对不上。
+      <br />
+      结果可以只看看，也可以写进某个目录（会在那里生成
+      <code>剧名.txt</code> / <code>详细简介.txt</code>，并追加一行台账）。
+    </div>
+
+    <div class="dd-field">
+      <span class="dd-label">原剧名</span>
+      <n-input v-model:value="rwTitle" size="small" placeholder="从源目录扫出来的剧名" />
+    </div>
+    <div class="dd-field" style="align-items: flex-start">
+      <span class="dd-label" style="padding-top: 5px">原简介</span>
+      <n-input
+        v-model:value="rwSynopsis"
+        type="textarea"
+        size="small"
+        :rows="4"
+        placeholder="贴进 intro.txt 里的内容"
+      />
+    </div>
+    <div class="dd-field">
+      <span class="dd-label">写入目录</span>
+      <n-input v-model:value="rwOutDir" size="small" placeholder="留空则只在界面上看，不落盘" />
+      <n-button size="small" @click="pickOutDir">选择</n-button>
+    </div>
+
+    <n-space style="margin-top: 10px">
+      <n-button type="primary" size="small" :loading="rwLoading" @click="doRewrite">改写</n-button>
+      <span class="dd-muted" style="align-self: center">
+        会调用两次语言模型（改简介 + 起剧名），产生费用
+      </span>
+    </n-space>
+
+    <div v-if="rwResult" class="dd-rw">
+      <div class="dd-rw-row">
+        <span class="dd-muted">新剧名</span>
+        <b>{{ rwResult.newTitle }}</b>
+      </div>
+      <div class="dd-rw-row" style="align-items: flex-start">
+        <span class="dd-muted">新简介</span>
+        <span class="dd-wrap">{{ rwResult.newSynopsis }}</span>
+      </div>
+      <div v-if="rwResult.saved.length > 0" class="dd-rw-row" style="align-items: flex-start">
+        <span class="dd-muted">已写入</span>
+        <span class="dd-wrap" style="font-size: 12px">{{ rwResult.saved.join("、") }}</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="dd-card">
     <div class="dd-card-title">说明</div>
     <div class="dd-card-desc">
       <p style="margin: 0 0 6px">
@@ -288,6 +373,21 @@ onMounted(load);
   font-size: 12px;
   opacity: 0.72;
 }
+.dd-rw {
+  margin-top: 12px;
+  border-top: 1px solid rgba(128, 128, 128, 0.18);
+  padding-top: 10px;
+}
+.dd-rw-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.dd-rw-row .dd-muted {
+  width: 52px;
+  flex: none;
+}
+
 .dd-test {
   margin-top: 7px;
   font-size: 12px;

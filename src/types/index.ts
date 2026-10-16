@@ -1,4 +1,4 @@
-export interface Project {
+﻿export interface Project {
   id: number;
   name: string;
   rootDir: string;
@@ -224,6 +224,17 @@ export interface AiTestResult {
   message: string;
 }
 
+/** 改写剧名 / 简介的结果 */
+export interface RewriteOutcome {
+  originalTitle: string;
+  newTitle: string;
+  originalSynopsis: string;
+  newSynopsis: string;
+  /** 用的哪个服务商 */
+  provider: string;
+  /** 落在了哪些文件上 */
+  saved: string[];
+}
 // ---------------- 封面生成 ----------------
 
 export interface CoverRequest {

@@ -452,6 +452,23 @@ pub struct CoverReport {
     pub notes: Vec<String>,
 }
 
+/// 改写剧名 / 简介的结果。
+///
+/// 顺序照真实软件来：**先改简介，再按新简介起剧名** ——
+/// 反过来的话剧名是根据旧简介起的，两者对不上。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RewriteOutcome {
+    pub original_title: String,
+    pub new_title: String,
+    pub original_synopsis: String,
+    pub new_synopsis: String,
+    /// 用的哪个服务商（让用户知道花了谁的钱）
+    pub provider: String,
+    /// 落在了哪些文件上
+    pub saved: Vec<String>,
+}
+
 // ---------------- AI 服务配置 ----------------
 
 /// 一个 AI 服务商。Key 只存在本地设置里，发给前端时一律打码。

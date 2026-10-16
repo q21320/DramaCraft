@@ -289,6 +289,7 @@ pub fn run() {
             commands::ai_test,
             commands::render_cover,
             commands::ai_reset_preset,
+            commands::ai_rewrite,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 import type {
   AiConfigView,
   AiProvider,
@@ -16,6 +16,7 @@ import type {
   CloudTranscribeReport,
   CostDocRequest,
   CoverReport,
+  RewriteOutcome,
   CoverRequest,
   Cue,
   DiscoveredAsset,
@@ -297,6 +298,10 @@ export const api = {
   aiTest: (providerId: string) => call<AiTestResult>("ai_test", { providerId }),
   /** 把 Base URL / 模型恢复成内置预设；不动 Key */
   aiResetPreset: (providerId: string) => call<AiProvider>("ai_reset_preset", { providerId }),
+
+  /** 改写剧名/简介：先改简介，再按新简介起剧名。会调用两次模型。 */
+  aiRewrite: (title: string, synopsis: string, outDir: string | null) =>
+    call<RewriteOutcome>("ai_rewrite", { title, synopsis, outDir }),
 
   // 封面生成：配好 AI 走图生图，否则本地合成
   renderCover: (req: CoverRequest) => call<CoverReport>("render_cover", { req }),

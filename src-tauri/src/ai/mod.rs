@@ -386,6 +386,139 @@ pub async fn test_provider(provider: &AiProvider) -> AiTestResult {
     }
 }
 
+// ---------------- 剧名 / 简介改写 ----------------
+
+/// 从 OpenAI 兼容的 chat 返回体里取文本。
+///
+/// 火山方舟和 DashScope 的兼容模式都是这个形状，一套解析够用。
+pub fn extract_chat_text(body: &str) -> AppResult<String> {
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| AppError::Msg(format!("返回不是合法 JSON：{e}")))?;
+    if let Some(err) = v
+        .pointer("/error/message")
+        .and_then(|m| m.as_str())
+        .or_else(|| v.get("message").and_then(|m| m.as_str()))
+    {
+        if v.get("error").is_some() || v.get("code").is_some() {
+            return Err(AppError::Msg(format!("服务返回错误：{err}")));
+        }
+    }
+    let text = v
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::Msg(format!("返回里没有文本：{}", crate::proc::tail(body.trim())))
+        })?;
+    Ok(text)
+}
+
+/// 一次 chat 调用。
+pub async fn chat(provider: &AiProvider, system: &str, user: &str) -> AppResult<String> {
+    if let Some(early) = precheck(provider) {
+        return Err(AppError::Msg(early.message));
+    }
+    if provider.text_model.trim().is_empty() {
+        return Err(AppError::Msg(format!("「{}」没填语言模型", provider.label)));
+    }
+    let endpoint = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| AppError::Msg(format!("建不了 HTTP 客户端：{e}")))?;
+
+    let body = serde_json::json!({
+        "model": provider.text_model.trim(),
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ],
+        // 改写要的是多样性，不是稳定复读
+        "temperature": 0.9,
+    });
+
+    let resp = client
+        .post(&endpoint)
+        .header("Authorization", format!("Bearer {}", provider.api_key.trim()))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::Msg(format!("请求失败：{e}")))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        return Err(AppError::Msg(friendly_http(status, &text)));
+    }
+    extract_chat_text(&text)
+}
+
+/// 提示词：重写简介。
+///
+/// 明确写「不要逐句复述」—— 否则模型会把原文换个说法原样吐回来。
+pub fn synopsis_prompt(title: &str, original: &str) -> (String, String) {
+    let system = "你是短剧发行方的文案编辑。把剧情简介改写成更有悬念、\
+                  更适合短视频平台投放的版本。要求：1) 不逐句复述原文，重新组织语言；\
+                  2) 保留人物关系与核心冲突，不要编造原文没有的情节；\
+                  3) 100~140 字，一段话，不要小标题、不要分点、不要引号；\
+                  4) 只输出简介正文，不要任何解释或前后缀。"
+        .to_string();
+    let user = format!("原剧名：{title}\n原简介：{original}\n\n请输出改写后的简介：");
+    (system, user)
+}
+
+/// 提示词：根据简介起新剧名。
+pub fn title_prompt(synopsis: &str) -> (String, String) {
+    let system = "你是短剧发行方的编辑。根据剧情简介起一个有吸引力的新剧名。\
+                  要求：1) 4~12 个汉字；2) 能看出核心冲突或爽点，但不要剧透结局；\
+                  3) 不要书名号、引号、标点，不要「短剧」「全集」这类词；\
+                  4) 只输出剧名本身，不要任何解释。"
+        .to_string();
+    let user = format!("剧情简介：{synopsis}\n\n请输出新剧名：");
+    (system, user)
+}
+
+/// 把模型可能带出来的包装去掉。
+///
+/// 模型很爱加书名号、引号、「新剧名：」这类前缀 —— 提示词里说了不要也常加。
+/// 与其反复调提示词，不如在出口统一擦干净。
+pub fn clean_title(raw: &str) -> String {
+    let mut t = raw.trim().lines().next().unwrap_or("").trim().to_string();
+    for prefix in ["新剧名：", "新剧名:", "剧名：", "剧名:", "答案：", "答案:"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            t = rest.trim().to_string();
+        }
+    }
+    t = t
+        .trim_matches(|c| matches!(c, '《' | '》' | '"' | '\'' | '「' | '」'))
+        .trim()
+        .to_string();
+    // 标点一律去掉：剧名里不该有句号问号
+    t.retain(|c| {
+        !matches!(
+            c,
+            '。' | '！' | '？' | '，' | '、' | '；' | '：' | '.' | '!' | '?' | ',' | ';' | ':'
+        )
+    });
+    t.chars().take(20).collect::<String>().trim().to_string()
+}
+
+/// 简介清洗：去掉模型爱加的「简介：」前缀和包裹引号。
+pub fn clean_synopsis(raw: &str) -> String {
+    let mut t = raw.trim().to_string();
+    for prefix in ["改写后的简介：", "新简介：", "简介：", "简介:"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            t = rest.trim().to_string();
+        }
+    }
+    t.trim_matches(|c| matches!(c, '"' | '\'' | '「' | '」'))
+        .trim()
+        .chars()
+        .take(400)
+        .collect()
+}
+
 // ---------------- 封面生成（图生图） ----------------
 
 /// 封面提示词。
@@ -865,8 +998,54 @@ mod tests {
     }
 
     #[test]
-    fn probe_endpoints_match_each_provider() {
-        assert!(probe_endpoint("ark", "https://ark.cn-beijing.volces.com/api/v3").ends_with("/models"));
+    fn chat_text_is_extracted_from_both_shapes() {
+        // 火山方舟 / DashScope 兼容模式都是这个形状
+        let ark = r#"{"choices":[{"message":{"content":"  白毛狼引桑蚕守家园  "}}]}"#;
+        assert_eq!(extract_chat_text(ark).unwrap(), "白毛狼引桑蚕守家园");
+
+        // 报错要如实抛出来，不能当成"没找到文本"
+        let err = r#"{"error":{"message":"invalid api key"}}"#;
+        assert!(extract_chat_text(err).unwrap_err().to_string().contains("invalid api key"));
+
+        // 空 choices 也要有明确说法
+        let empty = r#"{"choices":[]}"#;
+        assert!(extract_chat_text(empty).is_err());
+    }
+
+    #[test]
+    fn titles_come_back_clean_no_matter_what_the_model_adds() {
+        // 提示词里说了不要书名号和前缀，模型还是常加 —— 在出口统一擦掉
+        assert_eq!(clean_title("《白毛狼引桑蚕守家园》"), "白毛狼引桑蚕守家园");
+        assert_eq!(clean_title("新剧名：白毛狼引桑蚕守家园"), "白毛狼引桑蚕守家园");
+        assert_eq!(clean_title("\"白毛狼引桑蚕守家园\""), "白毛狼引桑蚕守家园");
+        assert_eq!(clean_title("白毛狼引桑蚕守家园。"), "白毛狼引桑蚕守家园");
+        assert_eq!(clean_title("「白毛狼引桑蚕守家园」\n解释：……"), "白毛狼引桑蚕守家园");
+        assert_eq!(clean_title("  多余空格  "), "多余空格");
+        // 太长要截断，别让一个段落变成剧名
+        assert!(clean_title(&"字".repeat(60)).chars().count() <= 20);
+    }
+
+    #[test]
+    fn synopsis_is_cleaned_too() {
+        assert_eq!(clean_synopsis("简介：这是一段简介"), "这是一段简介");
+        assert_eq!(clean_synopsis("\"这是一段简介\""), "这是一段简介");
+        assert_eq!(clean_synopsis("改写后的简介：内容"), "内容");
+    }
+
+    #[test]
+    fn prompts_ask_for_the_right_shape() {
+        let (sys, user) = synopsis_prompt("原剧名", "原简介内容");
+        assert!(sys.contains("不逐句复述"), "得明确禁止复述：{sys}");
+        assert!(sys.contains("100~140 字"), "{sys}");
+        assert!(user.contains("原简介内容"));
+
+        let (sys2, user2) = title_prompt("一段简介");
+        assert!(sys2.contains("4~12 个汉字"));
+        assert!(user2.contains("一段简介"));
+    }
+
+    #[test]
+    fn probe_endpoints_match_each_provider() {        assert!(probe_endpoint("ark", "https://ark.cn-beijing.volces.com/api/v3").ends_with("/models"));
         assert!(probe_endpoint("dashscope", "https://dashscope.aliyuncs.com/api/v1").ends_with("/tasks"));
         // 探测端点也要归一化，别拼出双斜杠
         assert!(!probe_endpoint("ark", "https://a.com/v1/").contains("//models"));

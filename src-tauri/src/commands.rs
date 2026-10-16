@@ -1,4 +1,4 @@
-//! 前后端唯一边界。前端只认这里的命令名与参数形状。
+﻿//! 前后端唯一边界。前端只认这里的命令名与参数形状。
 
 use crate::db;
 use crate::error::{AppError, AppResult};
@@ -6,7 +6,7 @@ use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, Asset, AssetApplyReport, AssetImportReport, AssetKindOption,
     AssetSummary, CloudConfigView, CloudTestResult, CloudTranscribeReport, CostDocRequest, Cue,
     DiscoveredAsset, DocxReport, EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome,
-    AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage, CoverReport, CoverRequest, HeaderLabel,
+    AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage, RewriteOutcome, CoverReport, CoverRequest, HeaderLabel,
     IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
     PipelineStage, PlatformOption, Project,
     ProofLayout, ProofPreview, ProofRenderReport, PublishAccount, PublishClipEntry,
@@ -2024,6 +2024,94 @@ pub fn ai_reset_preset(
         .into_iter()
         .find(|p| p.id == provider_id)
         .ok_or_else(|| AppError::Msg("刚保存的服务商不见了".into()))?)
+}
+
+// ---------------- AI 改写剧名 / 简介 ----------------
+
+/// 改写剧名与简介。
+///
+/// 顺序和真实软件一致：**先改简介，再按新简介起新剧名** ——
+/// 反过来的话，剧名是根据旧简介起的，两者会对不上。
+///
+/// 结果写进 `out_dir` 的 `剧名.txt` / `详细简介.txt`，
+/// 并追加一行到 `处理过的数据.txt`（台账，避免同一部剧重复做）。
+#[tauri::command]
+pub async fn ai_rewrite(
+    state: tauri::State<'_, AppState>,
+    title: String,
+    synopsis: String,
+    out_dir: Option<String>,
+) -> AppResult<RewriteOutcome> {
+    let provider = {
+        let conn = lock_db(&state)?;
+        ai::usable_provider(&conn)?
+            .ok_or_else(|| AppError::Msg("还没有可用的 AI 服务，先到「AI 服务」页配好".into()))?
+    };
+
+    let original_title = title.trim().to_string();
+    let original_synopsis = synopsis.trim().to_string();
+    if original_synopsis.is_empty() {
+        return Err(AppError::Msg(
+            "没有原简介 —— 改写要先有素材。源目录里放一个 intro.txt 或简介.txt".into(),
+        ));
+    }
+
+    // 第一步：改简介
+    let (sys1, user1) = ai::synopsis_prompt(&original_title, &original_synopsis);
+    let new_synopsis = ai::clean_synopsis(&ai::chat(&provider, &sys1, &user1).await?);
+    if new_synopsis.is_empty() {
+        return Err(AppError::Msg("模型返回了空简介，没改成".into()));
+    }
+
+    // 第二步：按**新简介**起剧名
+    let (sys2, user2) = ai::title_prompt(&new_synopsis);
+    let new_title = ai::clean_title(&ai::chat(&provider, &sys2, &user2).await?);
+    if new_title.is_empty() {
+        return Err(AppError::Msg("模型返回了空剧名，没改成".into()));
+    }
+
+    // 落盘 + 记台账
+    let mut saved: Vec<String> = Vec::new();
+    if let Some(dir) = out_dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| AppError::Msg(format!("建不了输出目录：{e}")))?;
+        let title_file = dir.join("剧名.txt");
+        let syn_file = dir.join("详细简介.txt");
+        std::fs::write(&title_file, &new_title)
+            .map_err(|e| AppError::Msg(format!("写剧名失败：{e}")))?;
+        std::fs::write(&syn_file, &new_synopsis)
+            .map_err(|e| AppError::Msg(format!("写简介失败：{e}")))?;
+        saved.push(title_file.to_string_lossy().to_string());
+        saved.push(syn_file.to_string_lossy().to_string());
+
+        // 台账：一行一部剧，重复做的时候能查
+        let ledger = dir.join("处理过的数据.txt");
+        let line = format!(
+            "{}\t原剧名={}\t新剧名={}\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            original_title,
+            new_title
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&ledger)
+        {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+            saved.push(ledger.to_string_lossy().to_string());
+        }
+    }
+
+    Ok(RewriteOutcome {
+        original_title,
+        new_title,
+        original_synopsis,
+        new_synopsis,
+        provider: provider.label,
+        saved,
+    })
 }
 
 // ---------------- 封面生成 ----------------
