@@ -16,7 +16,13 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useRouter } from "vue-router";
 import { api } from "@/api";
-import type { LabelPosition, PipelineRun, PipelineStageOption, SourceScan } from "@/types";
+import type {
+  HeaderLabel,
+  LabelPosition,
+  PipelineRun,
+  PipelineStageOption,
+  SourceScan,
+} from "@/types";
 
 const message = useMessage();
 const router = useRouter();
@@ -71,6 +77,16 @@ const labelEnabled = ref(false);
 const labelText = ref("AI创作");
 const labelSeconds = ref(3);
 const labelPosition = ref<LabelPosition>("topLeft");
+/**
+ * 全程显示，还是只显示片头几秒？
+ *
+ * 用户问「要一直在视频左上方吧」—— 两种做法法规上都被认作「显著标识」：
+ * - **片头几秒**：对观感影响最小，是常见做法
+ * - **全程显示**：最保险，但一直压在画面上
+ *
+ * 选哪种是用户的事，工具不替他定。所以做成开关，默认沿用片头几秒。
+ */
+const labelAlways = ref(false);
 
 const labelPositions: { label: string; value: LabelPosition }[] = [
   { label: "左上角", value: "topLeft" },
@@ -175,12 +191,31 @@ async function start() {
   }
   starting.value = true;
   try {
+    // **片头标识要真的传下去。**
+    //
+    // 这里漏过一次：`api.pipelineStart` 的签名一直支持 headerLabel，
+    // 但调用时只传了前 5 个参数 —— 于是开关勾了、存了、界面也显示勾着，
+    // 后端收到的却是 `headerLabel: null`，成片上什么都没有。
+    // 用户的话：「我还是没看到…怎么一下都没看到呢？」
+    //
+    // 教训：**参数在签名里有，不等于调用处传了。** 中间少一环就是静默失效。
+    const headerLabel: HeaderLabel | null = labelEnabled.value
+      ? {
+          text: labelText.value.trim() || "AI创作",
+          // 0 = 全程显示（后端认这个语义）
+          seconds: labelAlways.value ? 0 : labelSeconds.value,
+          position: labelPosition.value,
+          sizeRatio: 0.03,
+        }
+      : null;
+
     const run = await api.pipelineStart(
       root.value.trim(),
       outDir.value.trim(),
       picked.value,
       sliceSeconds.value,
       model.value,
+      headerLabel,
     );
     activeRunId.value = run.id;
     await refreshRuns();
@@ -253,6 +288,7 @@ type UiForm = {
   labelText: string;
   labelSeconds: number;
   labelPosition: LabelPosition;
+  labelAlways: boolean;
 };
 
 function snapshot(): UiForm {
@@ -266,6 +302,7 @@ function snapshot(): UiForm {
     labelText: labelText.value,
     labelSeconds: labelSeconds.value,
     labelPosition: labelPosition.value,
+    labelAlways: labelAlways.value,
   };
 }
 
@@ -284,6 +321,7 @@ async function loadForm(): Promise<boolean> {
     if (typeof f.labelText === "string") labelText.value = f.labelText;
     if (typeof f.labelSeconds === "number") labelSeconds.value = f.labelSeconds;
     if (f.labelPosition) labelPosition.value = f.labelPosition;
+    if (typeof f.labelAlways === 'boolean') labelAlways.value = f.labelAlways;
     return true;
   } catch {
     // 记不住设置不该让页面打不开
@@ -325,7 +363,7 @@ onMounted(async () => {
   }
   // 任何一项变了就记下来
   watch(
-    [root, outDir, picked, sliceSeconds, model, labelEnabled, labelText, labelSeconds, labelPosition],
+    [root, outDir, picked, sliceSeconds, model, labelEnabled, labelText, labelSeconds, labelPosition, labelAlways],
     () => scheduleSave(),
     { deep: true },
   );
@@ -465,9 +503,23 @@ onUnmounted(() => {
       <div v-if="labelEnabled" class="dd-row" style="gap: 8px; margin: 8px 0 0 22px; flex-wrap: wrap">
         <span class="dd-muted">文字</span>
         <n-input v-model:value="labelText" size="small" style="width: 140px" maxlength="16" />
-        <span class="dd-muted">显示</span>
-        <n-input-number v-model:value="labelSeconds" size="small" :min="0.5" :max="15" :step="0.5" style="width: 100px" />
-        <span class="dd-muted">秒</span>
+        <!--
+          片头几秒 vs 全程显示，两者都算「显著标识」。
+          用户问过「要一直在视频左上方吧」—— 想要就一直显示，做成开关。
+        -->
+        <n-checkbox v-model:checked="labelAlways">全程显示</n-checkbox>
+        <template v-if="!labelAlways">
+          <span class="dd-muted">显示</span>
+          <n-input-number
+            v-model:value="labelSeconds"
+            size="small"
+            :min="0.5"
+            :max="15"
+            :step="0.5"
+            style="width: 100px"
+          />
+          <span class="dd-muted">秒</span>
+        </template>
         <span class="dd-muted">位置</span>
         <n-select
           v-model:value="labelPosition"

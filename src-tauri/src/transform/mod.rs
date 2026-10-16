@@ -210,7 +210,16 @@ pub fn build_label_filter(label: &HeaderLabel, size: (i64, i64)) -> AppResult<St
         ))
     })?;
 
-    let seconds = if label.seconds.is_finite() {
+    // **seconds = 0 表示全程显示。**
+    //
+    // 用户问「要一直在视频左上方吧」—— 片头 3 秒和全程显示是两种做法：
+    // - 片头几秒：常见的「显著标识」，对观感影响最小
+    // - 全程显示：最保险，但会一直压在画面上
+    // 法规要的是「显著」，两种都算；选哪种是用户的事，不该由工具替他定。
+    let always = label.seconds <= 0.0;
+    let seconds = if always {
+        0.0
+    } else if label.seconds.is_finite() {
         label.seconds.clamp(0.5, 15.0)
     } else {
         3.0
@@ -229,16 +238,21 @@ pub fn build_label_filter(label: &HeaderLabel, size: (i64, i64)) -> AppResult<St
 
     // 加个半透明底衬：白字压在浅色画面上会看不清，
     // 而这是个披露义务，看不清等于没标。
-    Ok(format!(
-        "drawtext=fontfile={}:text={}:fontcolor=white:fontsize={}:box=1:boxcolor=black@0.55:boxborderw={}:x={}:y={}:enable=lt(t\\,{:.2})",
+    let mut f = format!(
+        "drawtext=fontfile={}:text={}:fontcolor=white:fontsize={}:box=1:\
+         boxcolor=black@0.55:boxborderw={}:x={}:y={}",
         escape_filter_path(&font),
         text,
         size_px,
         (size_px / 5).max(6),
         x,
-        y,
-        seconds
-    ))
+        y
+    );
+    // 全程显示就**不加** enable 条件；否则限定在片头那几秒
+    if !always {
+        f.push_str(&format!(":enable=lt(t\\,{seconds:.2})"));
+    }
+    Ok(f)
 }
 
 // ---------------- 滤镜构造（纯函数） ----------------
@@ -1463,6 +1477,11 @@ mod tests {
         .unwrap();
         assert!(f.contains(r"lt(t\,15.00)"), "上限应当是 15 秒：{f}");
 
+        // **seconds <= 0 现在表示「全程显示」**（不加 enable 条件）。
+        //
+        // 用户问过「要一直在视频左上方吧」—— 片头几秒和全程显示是两种
+        // 做法，法规上都算「显著标识」，选哪种该由用户定。
+        // 所以这里不再是"夹到下限 0.5"，而是"0 及以下 = 一直显示"。
         let f = build_label_filter(
             &HeaderLabel {
                 seconds: -5.0,
@@ -1471,7 +1490,21 @@ mod tests {
             (1080, 1920),
         )
         .unwrap();
-        assert!(f.contains(r"lt(t\,0.50)"), "下限应当是 0.5 秒：{f}");
+        assert!(
+            !f.contains("enable="),
+            "seconds <= 0 应当全程显示、不加 enable 条件：{f}"
+        );
+
+        let f = build_label_filter(
+            &HeaderLabel {
+                seconds: 0.0,
+                ..label()
+            },
+            (1080, 1920),
+        )
+        .unwrap();
+        assert!(!f.contains("enable="), "0 也是全程显示：{f}");
+        assert!(f.starts_with("drawtext="), "还是要画出来：{f}");
     }
 
     /// 在**真实素材**上加标识，产出留给人工/OCR 复核。
