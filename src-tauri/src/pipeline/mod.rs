@@ -686,7 +686,20 @@ pub fn start_pipeline(
             total
         };
 
-        for stage in stages {
+        // **步骤顺序以 `STAGES` 为准，不信前端传来的数组顺序。**
+        //
+        // 用户报过一个真实的乱序：切片跑到了封面和成本报告**后面**。
+        // 根因是「记住流水线页填写状态」保存的是**用户点勾选框的顺序** ——
+        // 那个数组原样传进来，照着入队，于是切片的任务 id 排在封面/成本之后，
+        // 而 `next_pending_kind` 按 id 升序取，就先跑了封面和成本。
+        //
+        // **流水线顺序是流水线自己的事，不该由界面的数组顺序决定。**
+        let ordered: Vec<String> = STAGES
+            .iter()
+            .map(|(key, _, _, _)| key.to_string())
+            .filter(|key| stages.iter().any(|s| s == key))
+            .collect();
+        for stage in &ordered {
             // 改剧名和整剧重组**都不是队列里的一步** —— 它们必须在
             // 「导入素材、排任务」之前跑完（那时才知道新剧名、才有重组的集）。
             // 走到这里说明已经生效了，跳过即可。
@@ -731,7 +744,19 @@ pub fn start_pipeline(
             //
             // 它同时也是**按集并行**的（日志里写着「并发 4」）：
             // 队列同一类任务最多同时跑 4 个，所以这里排成每集一个任务。
-            let media_subset: Vec<(i64, String)> = if stage == "desubtitle" {
+            // **切片只切「去字幕产出的那几集」。**
+            //
+            // 用户报过：「切片不对啊 应该是 有几个去字幕视频就切几个去字幕的视频呀」
+            // —— 对。去字幕只做前 4 集（做证明图用），而切片切的是**去字幕的产物**，
+            // 那就不该切第 5、6 集：它们没有 quzimu 文件，切片会**静默退回**
+            // 去重产物，切出来的东西跟证明图那条链根本不是一回事。
+            //
+            // 判据和后端取源时一致：**切片跟着去字幕走**。
+            // 没勾去字幕时照旧切全部（那时没有 quzimu，切的就是去重产物）。
+            let desubtitled = stages.iter().any(|s| s == "desubtitle");
+            let media_subset: Vec<(i64, String)> = if stage == "desubtitle"
+                || (stage == "slice" && desubtitled)
+            {
                 media_groups
                     .iter()
                     .take(DESUBTITLE_EPISODES)
@@ -2371,6 +2396,59 @@ mod tests {
         );
     }
 
+    /// **步骤顺序以 `STAGES` 为准，不信前端传来的数组顺序。**
+    ///
+    /// 用户报过真实的乱序：切片跑到封面和成本报告后面去了。
+    /// 根因是「记住流水线页填写状态」保存的是**用户点勾选框的顺序** ——
+    /// 那个数组原样传进来照着入队，切片的任务 id 就排到了封面/成本之后，
+    /// 而 `next_pending_kind` 按 id 升序取。
+    ///
+    /// **流水线顺序是流水线自己的事。**
+    #[test]
+    fn stage_order_comes_from_the_pipeline_not_the_ui_array() {
+        // 模拟前端可能传来的任意顺序（用户点勾选框的顺序）
+        let from_ui = vec![
+            "rewrite".to_string(),
+            "dedup".to_string(),
+            "desubtitle".to_string(),
+            "cover".to_string(),
+            "cost".to_string(),
+            "slice".to_string(),
+        ];
+        let ordered: Vec<String> = STAGES
+            .iter()
+            .map(|(key, _, _, _)| key.to_string())
+            .filter(|key| from_ui.iter().any(|s| s == key))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec!["rewrite", "dedup", "desubtitle", "slice", "cover", "cost"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "切片必须排在去字幕之后、封面/成本之前"
+        );
+    }
+
+    /// **切片只切「去字幕产出的那几集」。**
+    ///
+    /// 用户报过：「有几个去字幕视频就切几个去字幕的视频呀」——
+    /// 去字幕只做前 4 集，切片却切了 6 集。那 2 集没有 quzimu 文件，
+    /// 切片会**静默退回去重产物**，切出来的东西跟证明图那条链不是一回事。
+    #[test]
+    fn slice_follows_the_desubtitle_subset() {
+        assert_eq!(DESUBTITLE_EPISODES, 4, "去字幕做前 4 集（照真实软件）");
+        // 勾了去字幕 → 切片也只看前 4 集
+        let stages_with = vec!["dedup".to_string(), "desubtitle".to_string(), "slice".to_string()];
+        let desubtitled = stages_with.iter().any(|s| s == "desubtitle");
+        assert!(desubtitled, "勾了去字幕时切片要跟着走");
+        // 没勾 → 照旧切全部
+        let stages_without = vec!["dedup".to_string(), "slice".to_string()];
+        assert!(
+            !stages_without.iter().any(|s| s == "desubtitle"),
+            "没勾去字幕时不该缩子集"
+        );
+    }
     #[test]
     fn drama_level_stages_are_queued_once_per_drama_not_per_episode() {
         // 改剧名、生成封面都是整部剧一步。按集排的话，60 集会调 120 次模型。
