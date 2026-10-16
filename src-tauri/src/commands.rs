@@ -1405,7 +1405,15 @@ pub async fn desubtitle_media(
             ffmpeg,
             python,
             worker_script(&app, "ocr_worker.py"),
-            PathBuf::from(&media.path),
+            // **取去重产物，不是原片。**
+            //
+            // 分镜证明是拿去**证明这条片子**的 —— 它该展示的是**实际发布
+            // 出去的那个画面**，不是源片。用源片的话，证明里的画面和发出去
+            // 的画面对不上（去重改过裁切、变速、调色，可能还有片头标识）。
+            //
+            // `media_source_path` 自己处理优先级：去重产物存在就用它，
+            // 没有（没跑去重）才退回原片。
+            PathBuf::from(db::media_source_path(&conn, media_id)?),
             media,
             out,
         )
