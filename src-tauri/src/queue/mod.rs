@@ -1055,7 +1055,6 @@ mod payload_shape_tests {
     /// 光断言 JSON 里有某个键是不够的（第 2 个 bug 就是这么漏过去的）——
     /// 必须**真的用消费端的结构体解一遍**。
     #[test]
-    #[test]
     fn every_payload_parses_into_its_executor() {
         // 只测**按集**的那几个 —— 整部剧级别的（storyboard/cover/cost）
         // 走的是 `pipeline::drama_payload`，不经过 `stage_payload`。

@@ -126,7 +126,6 @@ pub fn subtitle_band(frames: &[OcrFrame], frame_w: i64, frame_h: i64) -> Option<
     if kept.is_empty() {
         return None;
     }
-    let hit_frames = frames_with_hit.iter().filter(|h| **h).count();
 
     let x1 = kept.iter().map(|b| b.0).fold(f64::MAX, f64::min);
     let y1 = kept.iter().map(|b| b.1).fold(f64::MAX, f64::min);

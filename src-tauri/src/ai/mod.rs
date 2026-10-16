@@ -1,4 +1,4 @@
-﻿//! AI 服务配置：一页管住所有外部服务（Key、Base URL、模型、用途开关）。
+//! AI 服务配置：一页管住所有外部服务（Key、Base URL、模型、用途开关）。
 //!
 //! ## 为什么单独一层
 //!
@@ -444,6 +444,10 @@ pub async fn describe_frame(provider: &AiProvider, image: &std::path::Path) -> A
             ]
         }],
         "temperature": 0.3,
+        // 描述画面同样不需要推理 —— 和 chat 那边一样关掉思维链。
+        // 分镜反推一次要发 5 张图，开着思考更贵。
+        "thinking": { "type": "disabled" },
+        "max_tokens": 600,
     });
 
     let resp = client
@@ -514,8 +518,71 @@ pub async fn chat(provider: &AiProvider, system: &str, user: &str) -> AppResult<
         ],
         // 改写要的是多样性，不是稳定复读
         "temperature": 0.9,
+        // **关掉思维链。**
+        //
+        // `doubao-seed-2-0-mini` 是推理模型，默认会先生成一大段思考再回答。
+        // 实测（同一个起剧名的请求）：
+        //
+        //     默认：      completion_tokens=495，其中 reasoning_tokens=483  ← 98%
+        //     关掉思考：  completion_tokens=5，  其中 reasoning_tokens=0
+        //
+        // **495 → 5，省 99%**，而答案是「借来的"新车"」/「借车风波」，
+        // 质量没有变差 —— 起个剧名不需要推理。
+        //
+        // 改写简介、起剧名都是"要求明确、答案很短"的任务，思维链纯属浪费。
+        "thinking": { "type": "disabled" },
+        // 兜底上限：万一某个模型不认 `thinking`，至少别让它无限写下去。
+        // 简介要求 100~140 字（约 300 token），给到 800 足够宽裕。
+        "max_tokens": 800,
     });
 
+    let resp = client
+        .post(&endpoint)
+        .header("Authorization", format!("Bearer {}", provider.api_key.trim()))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::Msg(format!("请求失败：{e}")))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        // **有的服务商 / 模型不认 `thinking` 字段**，会直接 400。
+        // 那不该让整个功能挂掉 —— 去掉它重试一次：功能照旧，只是多花点 token。
+        if mentions_unknown_thinking(&text) {
+            return chat_without_thinking(provider, system, user).await;
+        }
+        return Err(AppError::Msg(friendly_http(status, &text)));
+    }
+    extract_chat_text(&text)
+}
+
+/// 报错里是不是在说「不认识 thinking 这个字段」。
+fn mentions_unknown_thinking(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    b.contains("thinking")
+        && (b.contains("invalid") || b.contains("unknown") || b.contains("unexpected"))
+}
+
+/// 去掉 `thinking` 再试一次。给不支持该字段的服务商用。
+async fn chat_without_thinking(
+    provider: &AiProvider,
+    system: &str,
+    user: &str,
+) -> AppResult<String> {
+    let endpoint = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| AppError::Msg(format!("建不了 HTTP 客户端：{e}")))?;
+    let body = serde_json::json!({
+        "model": provider.text_model.trim(),
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ],
+        "temperature": 0.9,
+        "max_tokens": 800,
+    });
     let resp = client
         .post(&endpoint)
         .header("Authorization", format!("Bearer {}", provider.api_key.trim()))
