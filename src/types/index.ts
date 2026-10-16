@@ -1,4 +1,4 @@
-export interface Project {
+﻿export interface Project {
   id: number;
   name: string;
   rootDir: string;
@@ -254,6 +254,13 @@ export interface StoryboardReport {
   usedAi: boolean;
   framesDir: string;
   notes: string[];
+}
+/** 账号目录里的一个模型。目录里有 ≠ 开通了。 */
+export interface AiModelInfo {
+  id: string;
+  /** 空串 = 正常，Retiring = 即将下线 */
+  state: string;
+  available: boolean;
 }
 // ---------------- 运行日志 ----------------
 

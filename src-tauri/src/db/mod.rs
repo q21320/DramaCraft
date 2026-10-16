@@ -1174,6 +1174,24 @@ pub fn append_log(
     );
 }
 
+/// 当前最大的日志 id —— 用来给「开始流水线」划一条线。
+pub fn max_log_id(conn: &Connection) -> AppResult<i64> {
+    Ok(conn.query_row("SELECT COALESCE(MAX(id), 0) FROM run_log", [], |r| r.get(0))?)
+}
+
+/// 把某条线之后写的、还没归属运行的日志挂到这次运行上。
+///
+/// 为什么需要：改剧名是在**建 run 记录之前**跑的（那时才知道新剧名），
+/// 所以它的日志没有 run_id。日志页按运行过滤时，用户就**看不到
+/// 「改剧名失败」这条** —— 明明失败了，界面上却像什么都没发生。
+pub fn attach_recent_logs_to_run(conn: &Connection, run_id: i64, mark: i64) -> AppResult<i64> {
+    let n = conn.execute(
+        "UPDATE run_log SET run_id = ?1 WHERE run_id IS NULL AND id > ?2",
+        params![run_id, mark],
+    )?;
+    Ok(n as i64)
+}
+
 /// 读日志。`after_id` 用来做增量拉取（前端轮询只要新行）。
 pub fn list_logs(
     conn: &Connection,

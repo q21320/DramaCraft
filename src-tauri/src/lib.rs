@@ -289,6 +289,7 @@ pub fn run() {
             commands::ai_config,
             commands::save_ai_config,
             commands::ai_test,
+            commands::ai_list_models,
             commands::render_cover,
             commands::ai_reset_preset,
             commands::ai_rewrite,

@@ -29,8 +29,29 @@ const picked = ref<string[]>([]);
  * 否则用户会以为卡死了。
  */
 const willRewrite = computed(() => picked.value.includes("rewrite"));
+
+/** 展开「导出到」输入框吗？默认收起 —— 默认位置在源目录旁边，一般不用改。 */
+const showOutDir = ref(false);
+
 const root = ref("");
 const outDir = ref("");
+
+/**
+ * 实际会导出到哪 —— 和后端 `pipeline::default_out_dir` 一个规则：
+ * 源目录旁边建一个「二创」。留空时就把这个算出来给用户看，
+ * 免得他到处找产出。
+ *
+ * 注意**必须声明在 root / outDir 之后**：写在前面虽然因为 computed 是
+ * 延迟求值而侥幸能用，但那是踩在暂时性死区的边上，没必要。
+ */
+const effectiveOutDir = computed(() => {
+  const r = root.value.trim();
+  if (outDir.value.trim()) return outDir.value.trim();
+  if (!r) return "";
+  // 跟着源目录的分隔符风格走，别混出 `D:/a\二创`
+  const sep = r.includes("/") && !r.includes("\\") ? "/" : "\\";
+  return r.replace(/[\\/]+$/, "") + sep + "二创";
+});
 const sliceSeconds = ref(40);
 const model = ref("small");
 
@@ -256,14 +277,28 @@ onUnmounted(() => {
       切片是它的下游（做证明图用）。反过来的话，同一部剧要多跑十几倍的去重。
     </div>
 
-    <div class="dd-row" style="margin-bottom: 10px">
+    <div class="dd-row" style="margin-bottom: 8px">
       <span class="dd-muted" style="width: 78px">源目录</span>
       <n-input v-model:value="root" size="small" style="width: 420px" placeholder="放着各部剧的文件夹" />
       <n-button size="small" @click="pickRoot">选择</n-button>
       <n-button size="small" :loading="scanning" @click="doScan">扫描</n-button>
     </div>
 
-    <div class="dd-row" style="margin-bottom: 14px">
+    <!--
+      导出目录默认就在源目录旁边，绝大多数情况不用改。
+      所以平时只留一行灰字说明「放哪」，需要改的时候才展开输入框 ——
+      摆一行空输入框只是占地方，还让人以为必须填。
+    -->
+    <div class="dd-row" style="margin-bottom: 14px; font-size: 12px">
+      <span style="width: 78px"></span>
+      <span class="dd-muted dd-wrap" style="flex: 1">
+        导出到 {{ effectiveOutDir || "（选好源目录后自动确定）" }}
+      </span>
+      <n-button text size="tiny" @click="showOutDir = !showOutDir">
+        {{ showOutDir ? "收起" : "改" }}
+      </n-button>
+    </div>
+    <div v-if="showOutDir" class="dd-row" style="margin-bottom: 14px">
       <span class="dd-muted" style="width: 78px">导出到</span>
       <n-input v-model:value="outDir" size="small" style="width: 420px" placeholder="留空则用源目录旁边的「二创」" />
       <n-button size="small" @click="pickOut">选择</n-button>

@@ -1,4 +1,4 @@
-//! AI 服务配置：一页管住所有外部服务（Key、Base URL、模型、用途开关）。
+﻿//! AI 服务配置：一页管住所有外部服务（Key、Base URL、模型、用途开关）。
 //!
 //! ## 为什么单独一层
 //!
@@ -30,7 +30,7 @@ pub const PRESETS: [(&str, &str, &str, &str, &str); 3] = [
         "火山方舟（豆包 Seedream）",
         "https://ark.cn-beijing.volces.com/api/v3",
         "doubao-seed-2-0-mini-260428",
-        "doubao-seedream-4-0-250828",
+        "doubao-seedream-5-0-260128",
     ),
     (
         "dashscope",
@@ -851,13 +851,126 @@ pub async fn generate_cover_image(
     Ok(bytes.to_vec())
 }
 
+/// 把 HTTP 错误翻译成人话。
+///
+/// **一定要带上服务端返回的内容。** 之前这里给 404 编了一句
+/// 「接口地址不对 —— 检查 Base URL」，结果真实原因是
+/// `ModelNotOpen`（账号没开通这个模型）—— 用户照着那句话去查地址，
+/// 查半天也查不出所以然。**猜原因比不给原因更糟。**
+///
+/// 火山方舟的错误码在 body 里，比状态码有用得多：
+/// - `ModelNotOpen`：模型存在，但账号没开通
+/// - `InvalidEndpointOrModel.NotFound`：模型名不存在，或没权限
 fn friendly_http(status: u16, body: &str) -> String {
-    match status {
-        401 | 403 => "Key 无效或没有权限（401/403）".to_string(),
-        404 => "接口地址不对（404）—— 检查 Base URL 有没有多写或少写 /v1".to_string(),
-        429 => "请求太频繁或额度用尽（429）".to_string(),
-        _ => format!("HTTP {status}：{}", crate::proc::tail(body.trim())),
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let code = parsed
+        .as_ref()
+        .and_then(|v| v.pointer("/error/code"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let detail = parsed
+        .as_ref()
+        .and_then(|v| v.pointer("/error/message"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| crate::proc::tail(body.trim()));
+
+    match code {
+        "ModelNotOpen" => format!(
+            "这个模型没开通（ModelNotOpen）。去火山方舟控制台的「开通管理」里开通它，\
+             或换一个已开通的模型。原始信息：{detail}"
+        ),
+        "InvalidEndpointOrModel.NotFound" => format!(
+            "模型名不存在，或账号没有权限用它 —— 检查模型名有没有写错。原始信息：{detail}"
+        ),
+        _ => match status {
+            401 | 403 => format!("Key 无效或没有权限（{status}）。原始信息：{detail}"),
+            404 => format!(
+                "接口返回 404。可能是 Base URL 不对，也可能是模型没开通 —— \
+                 两种都会返 404，得看原始信息。原始信息：{detail}"
+            ),
+            429 => format!("请求太频繁或额度用尽（429）。原始信息：{detail}"),
+            _ => format!("HTTP {status}：{detail}"),
+        },
     }
+}
+
+/// 从 `GET {base}/models` 拿账号能看到的模型列表。
+///
+/// 为什么需要：用户填的模型名常常是错的（比如写 `Doubao-Seedream-5.0-flash`，
+/// 而真名是 `doubao-seedream-5-0-260128`），或者账号根本没开通。
+/// 与其让他一次次试错，不如把列表摆出来让他选。
+///
+/// 返回的每一项带 `available` —— 目录里有不等于能用：
+/// 没开通的也在列表里，只是调用时会返 `ModelNotOpen`。
+pub async fn list_models(provider: &AiProvider) -> AppResult<Vec<ModelInfo>> {
+    if provider.api_key.trim().is_empty() {
+        return Err(AppError::Msg("还没填 API Key".into()));
+    }
+    let base = normalize_base_url(&provider.base_url);
+    if base.is_empty() {
+        return Err(AppError::Msg("还没填 Base URL".into()));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| AppError::Msg(format!("建不了 HTTP 客户端：{e}")))?;
+    let resp = client
+        .get(format!("{base}/models"))
+        .header("Authorization", format!("Bearer {}", provider.api_key.trim()))
+        .send()
+        .await
+        .map_err(|e| AppError::Msg(format!("请求失败：{e}")))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        return Err(AppError::Msg(friendly_http(status, &text)));
+    }
+
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| AppError::Msg(format!("返回不是合法 JSON：{e}")))?;
+    // 兼容两种形状：{"data":[…]} 和 […]
+    let arr = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .or_else(|| v.as_array())
+        .ok_or_else(|| AppError::Msg(format!("返回里没有模型列表：{}", crate::proc::tail(&text))))?;
+
+    let mut out: Vec<ModelInfo> = arr
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id").and_then(|i| i.as_str())?.to_string();
+            let state = m
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Shutdown 的明确不能用了，直接不列出来，免得用户选中才发现
+            if state == "Shutdown" {
+                return None;
+            }
+            Some(ModelInfo {
+                id,
+                state: state.clone(),
+                // 目录里有 ≠ 开通了。能直接用的是没标状态的那些；
+                // Retiring 是即将下线但当前还能用。
+                available: state.is_empty() || state == "Retiring",
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.available.cmp(&a.available).then(a.id.cmp(&b.id)));
+    Ok(out)
+}
+
+/// 账号目录里的一个模型。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub id: String,
+    /// 目录里标的状态：空串 = 正常，Retiring = 即将下线
+    pub state: String,
+    /// 能直接调用吗（目录里有不等于开通了）
+    pub available: bool,
 }
 
 /// 给某个服务商补上预设里缺失的字段（用户挑预设时用）。

@@ -23,7 +23,7 @@ import {
 } from "naive-ui";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/api";
-import type { AiConfigView, AiProvider, AiUsage, RewriteOutcome } from "@/types";
+import type { AiConfigView, AiModelInfo, AiProvider, AiUsage, RewriteOutcome } from "@/types";
 
 const message = useMessage();
 
@@ -178,6 +178,48 @@ async function resetPreset(id: string) {
   }
 }
 
+/**
+ * 拉一次账号里的模型列表。
+ *
+ * 为什么值得做：用户填的模型名常常是错的 ——
+ * 比如写 `Doubao-Seedream-5.0-flash`，而真名是 `doubao-seedream-5-0-260128`；
+ * 或者名字对了但账号没开通（调用时返 `ModelNotOpen`）。
+ * 与其让他一次次试错，不如把列表摆出来。
+ */
+const models = ref<Record<string, AiModelInfo[]>>({});
+const loadingModels = ref<string | null>(null);
+/** 刚点过哪个模型（给一点反馈） */
+const pickedModel = ref("");
+
+async function listModels(p: AiProvider) {
+  loadingModels.value = p.id;
+  try {
+    const list = await api.aiListModels(p.id);
+    models.value = { ...models.value, [p.id]: list };
+    if (list.length === 0) {
+      message.warning("账号里一个模型都没有 —— 先去火山方舟控制台开通");
+    } else {
+      message.success(`拿到 ${list.length} 个模型`);
+    }
+  } catch (e) {
+    message.error((e as Error).message);
+  } finally {
+    loadingModels.value = null;
+  }
+}
+
+/** 点列表里的模型 → 填进输入框。填哪个由「视觉 / 语言」决定。 */
+function useModel(p: AiProvider, modelId: string, kind: "text" | "image") {
+  const i = providers.value.findIndex((x) => x.id === p.id);
+  if (i < 0) return;
+  providers.value[i] = {
+    ...providers.value[i],
+    ...(kind === "text" ? { textModel: modelId } : { imageModel: modelId }),
+  };
+  pickedModel.value = modelId;
+  message.success(`已填入${kind === "text" ? "语言" : "生图"}模型：${modelId}（记得点保存）`);
+}
+
 onMounted(load);
 </script>
 
@@ -239,8 +281,42 @@ onMounted(load);
           </n-space>
           <n-space :size="8">
             <n-button size="tiny" :loading="testing === p.id" @click="test(p.id)">测试连接</n-button>
+            <n-button
+              size="tiny"
+              :loading="loadingModels === p.id"
+              :disabled="!p.hasKey"
+              @click="listModels(p)"
+            >
+              可用模型
+            </n-button>
             <n-button size="tiny" quaternary @click="resetPreset(p.id)">恢复预设</n-button>
           </n-space>
+        </div>
+
+        <!-- 模型列表：点了就填进对应的输入框 -->
+        <div v-if="models[p.id]" class="dd-models">
+          <div class="dd-muted" style="margin-bottom: 6px">
+            账号能看到的 {{ models[p.id].length }} 个模型（
+            <b>目录里有 ≠ 开通了</b> —— 没开通的调用时会报 ModelNotOpen）。
+            点一下填进去：
+          </div>
+          <div class="dd-model-list">
+            <n-tag
+              v-for="m in models[p.id]"
+              :key="m.id"
+              size="tiny"
+              :type="pickedModel === m.id ? 'primary' : m.available ? 'success' : 'warning'"
+              :bordered="false"
+              style="cursor: pointer; margin: 0 6px 6px 0"
+              @click="useModel(p, m.id, 'text')"
+              @contextmenu.prevent="useModel(p, m.id, 'image')"
+            >
+              {{ m.id }}<span v-if="m.state">{{ " · " + m.state }}</span>
+            </n-tag>
+          </div>
+          <div class="dd-muted" style="font-size: 12px">
+            左键填「语言模型」，右键填「生图模型」
+          </div>
         </div>
 
         <div v-if="testResults[p.id]" class="dd-test" :class="testResults[p.id].ok ? 'ok' : 'bad'">
@@ -373,6 +449,18 @@ onMounted(load);
   font-size: 12px;
   opacity: 0.72;
 }
+.dd-models {
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+  border: 1px solid rgba(128, 128, 128, 0.18);
+  border-radius: 6px;
+}
+.dd-model-list {
+  max-height: 190px;
+  overflow: auto;
+  margin-bottom: 4px;
+}
+
 .dd-rw {
   margin-top: 12px;
   border-top: 1px solid rgba(128, 128, 128, 0.18);

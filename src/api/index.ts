@@ -2,6 +2,7 @@
 import type {
   AiConfigView,
   AiProvider,
+  AiModelInfo,
   AiTestResult,
   AiUsage,
   AppInfo,
@@ -316,6 +317,9 @@ export const api = {
   /** 只发一次廉价探测，不触发生成、不产生费用 */
   aiTest: (providerId: string) => call<AiTestResult>("ai_test", { providerId }),
   /** 把 Base URL / 模型恢复成内置预设；不动 Key */
+  /** 列出账号能看到的模型（GET {base}/models）。名字写错/没开通都能在这里看出来。 */
+  aiListModels: (providerId: string) => call<AiModelInfo[]>("ai_list_models", { providerId }),
+
   aiResetPreset: (providerId: string) => call<AiProvider>("ai_reset_preset", { providerId }),
 
   /** 改写剧名/简介：先改简介，再按新简介起剧名。会调用两次模型。 */

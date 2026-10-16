@@ -1,4 +1,4 @@
-﻿//! 前后端唯一边界。前端只认这里的命令名与参数形状。
+//! 前后端唯一边界。前端只认这里的命令名与参数形状。
 
 use crate::db;
 use crate::error::{AppError, AppResult};
@@ -1883,6 +1883,13 @@ pub async fn pipeline_start(
     // ---- 第 2 步：先在扫描结果上把剧名改好 ----
     //
     // 这一步**不持数据库锁**（要等网络），所以放在 lock_db 之前。
+    // 但它写的日志属于「这次运行」，而 run 记录还没建 —— 所以先划一条线，
+    // 等 run 建好之后再把线之后的日志挂上去（attach_recent_logs_to_run）。
+    // 不挂的话，用户按运行过滤时看不到「改剧名失败」，像什么都没发生。
+    let log_mark = {
+        let conn = lock_db(&state)?;
+        db::max_log_id(&conn)?
+    };
     let mut renames: std::collections::HashMap<String, pipeline::NewName> =
         std::collections::HashMap::new();
     if enabled.iter().any(|s| s == "rewrite") {
@@ -1955,6 +1962,10 @@ pub async fn pipeline_start(
         header_label,
         &renames,
     )?;
+
+    // 把开始前写的那几条日志（扫描、改剧名成没成）挂到这次运行上。
+    // 用户按运行过滤时才看得到「改剧名失败了」。
+    let _ = db::attach_recent_logs_to_run(&conn, outcome.run_id, log_mark);
 
     if !outcome.skipped.is_empty() {
         // 读不出来的文件不能悄悄咽掉 —— 但要让它可查，而不是弹一堆错误
@@ -2114,6 +2125,25 @@ fn log_line(state: &tauri::State<'_, AppState>, level: &str, message: &str) {
     if let Ok(conn) = lock_db(state) {
         db::append_log(&conn, None, None, level, message);
     }
+}
+/// 列出账号能看到的模型。
+///
+/// 直接用 `GET {base}/models`。为什么值得做：用户填的模型名常常是错的
+/// （写 `Doubao-Seedream-5.0-flash`，真名是 `doubao-seedream-5-0-260128`），
+/// 或者账号根本没开通 —— 与其让他一次次试错，不如把列表摆出来让他选。
+#[tauri::command]
+pub async fn ai_list_models(
+    state: tauri::State<'_, AppState>,
+    provider_id: String,
+) -> AppResult<Vec<ai::ModelInfo>> {
+    let provider = {
+        let conn = lock_db(&state)?;
+        ai::load_providers(&conn)?
+            .into_iter()
+            .find(|p| p.id == provider_id)
+            .ok_or_else(|| AppError::Msg(format!("没有这个服务商：{provider_id}")))?
+    };
+    ai::list_models(&provider).await
 }
 // ---------------- AI 改写剧名 / 简介 ----------------
 
