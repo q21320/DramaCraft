@@ -88,6 +88,7 @@ def main() -> int:
             path = str(item.get("path") or "")
             time_ms = int(item.get("time_ms") or 0)
             text = ""
+            boxes = []
 
             if path:
                 try:
@@ -102,15 +103,38 @@ def main() -> int:
                             if score < min_confidence:
                                 continue
                             piece = str(line[1]).strip()
-                            if piece:
-                                parts.append(piece)
+                            if not piece:
+                                continue
+                            parts.append(piece)
+                            # **把坐标框也带上。**
+                            #
+                            # 原来只回文字、把框丢了 —— 于是"字幕在哪"只能靠猜。
+                            # 硬字幕修复（delogo / 局部重绘）必须先知道准确位置，
+                            # 框太大了会把画面本身糊掉。
+                            #
+                            # RapidOCR 的 line[0] 是四点多边形
+                            # [[x,y],[x,y],[x,y],[x,y]]，取外接矩形。
+                            box = line[0]
+                            if box:
+                                xs = [to_float(p[0]) for p in box if len(p) >= 2]
+                                ys = [to_float(p[1]) for p in box if len(p) >= 2]
+                                if xs and ys:
+                                    boxes.append(
+                                        {
+                                            "x1": min(xs),
+                                            "y1": min(ys),
+                                            "x2": max(xs),
+                                            "y2": max(ys),
+                                        }
+                                    )
                         text = " ".join(parts)
                 except Exception:
                     # 单帧失败（坏图 / 解码异常）跳过，继续下一帧
                     failed_frames += 1
                     text = ""
+                    boxes = []
 
-            collected.append({"time_ms": time_ms, "text": text})
+            collected.append({"time_ms": time_ms, "text": text, "boxes": boxes})
 
         response = {
             "ok": True,

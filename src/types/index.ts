@@ -1,4 +1,4 @@
-﻿export interface Project {
+export interface Project {
   id: number;
   name: string;
   rootDir: string;
@@ -261,6 +261,17 @@ export interface AiModelInfo {
   /** 空串 = 正常，Retiring = 即将下线 */
   state: string;
   available: boolean;
+}
+/** 本地去字幕的结果 */
+export interface DesubtitleReport {
+  /** 产出文件；没去成就是空串 */
+  outPath: string;
+  /** 找到的字幕带；没找到就是 null */
+  band: { x: number; y: number; w: number; h: number; hitFrames: number; totalFrames: number } | null;
+  sampledFrames: number;
+  engine: string;
+  removed: boolean;
+  note: string;
 }
 /** 成本配置比例情况报告里的一行（一部剧） */
 export interface CostReportRow {

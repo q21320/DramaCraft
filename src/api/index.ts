@@ -17,6 +17,7 @@ import type {
   CloudTranscribeReport,
   CostDocRequest,
   CostReportRow,
+  DesubtitleReport,
   CoverReport,
   DedupReport,
   RewriteOutcome,
@@ -143,6 +144,13 @@ export const api = {
     call<ProofPreview>("proof_preview", { layout, values }),
   proofRender: (layout: ProofLayout, values: Record<string, string>, outPath: string) =>
     call<ProofRenderReport>("proof_render", { layout, values, outPath }),
+
+  /**
+   * 本地去字幕：抽帧 OCR 找位置 → ffmpeg `delogo` 盖掉。
+   * 全本地，不依赖在线服务。
+   */
+  desubtitleMedia: (mediaId: number, outPath: string | null) =>
+    call<DesubtitleReport>("desubtitle_media", { mediaId, outPath, sampleFps: null }),
 
   // 界面上记住的东西（源目录、勾选…）
   loadUiState: (key: string) => call<string | null>("load_ui_state", { key }),

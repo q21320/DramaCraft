@@ -926,6 +926,21 @@ pub struct StoryboardReport {
 }
 // ---------------- 运行日志 ----------------
 
+/// 本地去字幕的结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesubtitleReport {
+    /// 产出文件。没去成就是空串。
+    pub out_path: String,
+    /// 找到的字幕带；没找到就是 `None`。
+    pub band: Option<crate::desubtitle::SubtitleBand>,
+    pub sampled_frames: i64,
+    pub engine: String,
+    /// 到底去没去
+    pub removed: bool,
+    /// 给人看的一句话
+    pub note: String,
+}
 /// 成本配置比例情况报告里的一行（一部剧）。
 ///
 /// 照 `zhengming/成本图表.docx` 那份模板的列定的：
@@ -1080,6 +1095,22 @@ pub struct ResplitReport {
 pub struct OcrFrame {
     pub time_ms: i64,
     pub text: String,
+    /// 这一帧识别到的文字外接框（像素坐标）。
+    ///
+    /// 原来只有文字、没有框 —— 于是「字幕在哪」只能靠猜。
+    /// 硬字幕修复必须先知道准确位置：框大了会把画面本身糊掉，框小了盖不住字。
+    #[serde(default)]
+    pub boxes: Vec<OcrBox>,
+}
+
+/// 一块被识别出文字的矩形区域。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrBox {
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

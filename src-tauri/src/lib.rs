@@ -10,6 +10,7 @@ mod cloud;
 mod commands;
 mod cover;
 mod db;
+mod desubtitle;
 mod docx;
 mod error;
 mod export;
@@ -290,6 +291,7 @@ pub fn run() {
             commands::reveal_in_explorer,
             commands::ai_config,
             commands::load_ui_state,
+            commands::desubtitle_media,
             commands::save_ui_state,
             commands::save_ai_config,
             commands::ai_test,

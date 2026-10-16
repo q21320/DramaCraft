@@ -718,7 +718,24 @@ pub fn start_pipeline(
                 }
                 continue;
             }
-            for (media_id, group) in &media_groups {
+            // **AI 去字幕只做前几集**（默认 4 集）。
+            //
+            // 真实软件的日志：「AI去字幕（开拍 · 原视频**第1～第4集**）」——
+            // 去字幕是为了做**分镜证明图**，证明材料只需要几集素材，
+            // 整部剧都去一遍纯属浪费（在线服务还要按量计费）。
+            //
+            // 它同时也是**按集并行**的（日志里写着「并发 4」）：
+            // 队列同一类任务最多同时跑 4 个，所以这里排成每集一个任务。
+            let media_subset: Vec<(i64, String)> = if stage == "desubtitle" {
+                media_groups
+                    .iter()
+                    .take(DESUBTITLE_EPISODES)
+                    .cloned()
+                    .collect()
+            } else {
+                media_groups.clone()
+            };
+            for (media_id, group) in &media_subset {
                 let Some(payload) =
                     stage_payload(stage, *media_id, &drama_out, slice_ms, model, group, header_label.as_ref())?
                 else {
@@ -887,6 +904,19 @@ fn drama_payload(
 fn episode_label(drama_name: &str, no: usize) -> String {
     format!("{drama_name}-第{no:02}集")
 }
+/// AI 去字幕产出的固定路径：`<剧目录>/quzimu/<组名>_quzimu.mp4`。
+///
+/// 去字幕和切片**必须用同一个函数算**，否则切片找不到产物，
+/// 会静默退回去重产物 —— 那种"看起来跑了其实没吃到"最难查。
+fn quzimu_path(out_dir: &Path, group: &str) -> PathBuf {
+    out_dir.join("quzimu").join(format!("{group}_quzimu.mp4"))
+}
+/// AI 去字幕做前几集（照真实软件：「原视频第1～第4集」）。
+///
+/// 做它是为了出**分镜证明图**，证明材料只要几集素材；
+/// 整部剧都去一遍纯属浪费（在线服务还按量计费）。
+pub const DESUBTITLE_EPISODES: usize = 4;
+
 /// 剧名 → 能当目录名的字符串。
 ///
 /// 和 [`safe_dir_name`] 的区别：**不去扩展名**。
@@ -941,6 +971,12 @@ pub fn stage_payload(
 ) -> AppResult<Option<String>> {
     let here = out_dir.join(group);
     let value = match stage {
+        // AI 去字幕（本地）。产出固定叫 `<剧目录>/quzimu/<组名>_quzimu.mp4` ——
+        // 切片那一步会用**同一个路径**去找它，两边必须一致。
+        "desubtitle" => serde_json::json!({
+            "mediaId": media_id,
+            "outPath": quzimu_path(out_dir, group).to_string_lossy(),
+        }),
         "slice" => serde_json::json!({
             "mediaId": media_id,
             // 形状要对：`mode` 这一层装的是 SliceMode，而 SliceMode 自己是
@@ -964,7 +1000,7 @@ pub fn stage_payload(
             //
             // 队列用这个目录 + 素材名拼出 `第N集_quzimu.mp4`，找得到就切它，
             // 找不到再退回去重产物（没配去字幕服务时就是这样）。
-            "quzimuDir": out_dir.join("quzimu").to_string_lossy(),
+            "quzimuPath": quzimu_path(out_dir, group).to_string_lossy(),
             // 切出来要能直接上传：源素材常是 HEVC，而平台要 H.264
             "compatible": true,
         }),

@@ -424,6 +424,8 @@ mod tests {
         OcrFrame {
             time_ms,
             text: text.to_string(),
+            // 这一组测试只关心文字合并，不关心坐标
+            boxes: Vec::new(),
         }
     }
 

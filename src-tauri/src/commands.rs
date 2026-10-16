@@ -6,7 +6,8 @@ use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, Asset, AssetApplyReport, AssetImportReport, AssetKindOption,
     AssetSummary, CloudConfigView, CloudTestResult, CloudTranscribeReport, CostDocRequest, Cue,
     DiscoveredAsset, DocxReport, EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome,
-    AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage, CostReportRow, DedupReport, RewriteOutcome, StoryboardReport, CoverReport, CoverRequest, HeaderLabel,
+    AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage, CostReportRow, DedupReport,
+    DesubtitleReport, RewriteOutcome, StoryboardReport, CoverReport, CoverRequest, HeaderLabel,
     IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
     PipelineStage, PlatformOption, Project,
     ProofLayout, ProofPreview, ProofRenderReport, PublishAccount, PublishClipEntry,
@@ -1361,6 +1362,150 @@ pub fn generate_cost_docx(request: CostDocRequest, out_path: String) -> AppResul
         &format!("{} - 成本明细表", request.drama_name.trim()),
         &out_path,
     )
+}
+
+/// 本地硬字幕去除：抽帧 OCR 找位置 → `delogo` 盖掉。
+///
+/// 真实软件走的是开拍 `videoscreenclear` 在线服务。那条路要接口文档 + 额度 +
+/// 网络；这条**全本地**，不依赖任何外部服务，也不用填坐标 —— 位置是扫出来的。
+///
+/// **找不到硬字幕就明确报出来**，不硬盖一块。盖错了比不盖更糟：
+/// 观众看到画面中间糊一块，会以为片子坏了。
+#[tauri::command]
+pub async fn desubtitle_media(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    out_path: Option<String>,
+    sample_fps: Option<f64>,
+) -> AppResult<DesubtitleReport> {
+    // 定位用不着那么密的采样：字幕一句停留 1 秒以上，0.5 帧/秒足够，
+    // 而抽帧 + OCR 是这一步的主要开销。
+    let fps = sample_fps.unwrap_or(0.5).clamp(0.1, 2.0);
+
+    let (ffmpeg, python, worker, input, media, out) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let python = tools::require(&configured.python, "python")?;
+        let conn = lock_db(&state)?;
+        let media = db::get_media(&conn, media_id)?;
+        let out = match out_path.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            Some(p) => PathBuf::from(p),
+            None => {
+                // 没给就放在源文件旁边：`第1集.mp4` → `第1集_quzimu.mp4`
+                let stem = Path::new(&media.path)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| media.name.clone());
+                Path::new(&media.path)
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(format!("{stem}_quzimu.mp4"))
+            }
+        };
+        (
+            ffmpeg,
+            python,
+            worker_script(&app, "ocr_worker.py"),
+            PathBuf::from(&media.path),
+            media,
+            out,
+        )
+    };
+
+    if !input.is_file() {
+        return Err(AppError::Msg(format!(
+            "素材文件不存在：{}",
+            input.to_string_lossy()
+        )));
+    }
+
+    let mut opts = ocr::default_options();
+    opts.sample_fps = fps;
+    // 只扫下半部分就够，而且能少误判画面内容
+    opts.bottom_ratio = 0.45;
+    opts.min_confidence = 0.6;
+
+    let frames_dir = std::env::temp_dir().join(format!("dramadist_desub_{media_id}"));
+    let _ = std::fs::remove_dir_all(&frames_dir);
+    std::fs::create_dir_all(&frames_dir)?;
+
+    let frames = ocr::extract_frames(&ffmpeg, &input, &frames_dir, &opts)?;
+    if frames.is_empty() {
+        let _ = std::fs::remove_dir_all(&frames_dir);
+        return Err(AppError::Msg("抽不出帧，无法定位字幕（素材可能损坏）".into()));
+    }
+    let sampled = frames.len() as i64;
+
+    let (ocr_frames, engine) = ocr::run_worker(&python, &worker, &frames, &opts, ocr::default_timeout())?;
+    let _ = std::fs::remove_dir_all(&frames_dir);
+
+    let band = crate::desubtitle::subtitle_band(&ocr_frames, media.width, media.height);
+    let Some(band) = band else {
+        // **找不到就说找不到。** 不硬盖一块 —— 那会毁掉画面。
+        return Ok(DesubtitleReport {
+            out_path: String::new(),
+            band: None,
+            sampled_frames: sampled,
+            engine,
+            removed: false,
+            note: "没找到硬字幕（下半部分没扫到稳定的文字）。片源可能本来就没硬字幕，\
+                   或者字幕位置比较特殊。"
+                .to_string(),
+        });
+    };
+
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let filter = crate::desubtitle::delogo_filter(&band);
+    let args: Vec<String> = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        input.to_string_lossy().to_string(),
+        "-vf".into(),
+        filter.clone(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "veryfast".into(),
+        "-crf".into(),
+        "18".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-c:a".into(),
+        "copy".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        out.to_string_lossy().to_string(),
+    ];
+    let mut cmd = std::process::Command::new(&ffmpeg);
+    proc::no_window(cmd.args(&args));
+    let output = cmd
+        .output()
+        .map_err(|e| AppError::Msg(format!("调 ffmpeg 失败：{e}")))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Msg(format!(
+            "去字幕失败：{}",
+            proc::tail(err.trim())
+        )));
+    }
+
+    Ok(DesubtitleReport {
+        out_path: out.to_string_lossy().to_string(),
+        band: Some(band),
+        sampled_frames: sampled,
+        engine,
+        removed: true,
+        note: format!(
+            "字幕带 {}×{} @ ({}, {})，扫了 {sampled} 帧命中 {} 帧",
+            band.w, band.h, band.x, band.y, band.hit_frames
+        ),
+    })
 }
 
 /// 生成「成本配置比例情况报告」。

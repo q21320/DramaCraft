@@ -66,6 +66,13 @@ pub fn is_known_kind(kind: &str) -> bool {
 
 // ---------------- 各任务的参数 ----------------
 
+/// AI 去字幕任务带的参数。
+#[derive(Debug, Deserialize)]
+struct DesubtitlePayload {
+    media_id: i64,
+    /// 产出路径（`<剧目录>/quzimu/<组名>_quzimu.mp4`），由 pipeline 算好。
+    out_path: String,
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SlicePayload {
@@ -82,7 +89,7 @@ struct SlicePayload {
     /// 所以前缀不用再承担"区分是哪一集"的职责，目录已经分开了。
     #[serde(default)]
     prefix: String,
-    /// AI 去字幕的产物目录（`<剧目录>/quzimu`）。
+    /// AI 去字幕产出的**完整路径**（`<剧目录>/quzimu/<组名>_quzimu.mp4`）。
     ///
     /// **切片切的是去字幕产物，不是去重产物** —— 真实软件的日志写得很清楚：
     /// 「视频切片（流水线 · AI去字幕结果）」，源是 `第N集_quzimu.mp4`。
@@ -91,9 +98,10 @@ struct SlicePayload {
     ///   整集去重 → 去重产物（发布用）
     ///   去字幕   → quzimu → 10秒切片 → 分镜证明图（证明材料用）
     ///
-    /// 没去字幕（比如没配服务）就退回上一版的行为（去重产物 → 原片）。
+    /// 没去字幕（没配 OCR 环境 / 找不到硬字幕）时这个文件不存在，
+    /// 就退回上一版行为（去重产物 → 原片）。
     #[serde(default)]
-    quzimu_dir: Option<String>,
+    quzimu_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,17 +310,34 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
     let state = app.state::<AppState>();
 
     match job.kind.as_str() {
-        // 整剧重组 / AI 去字幕：**跳过并说明**，不让整部剧失败。
+        // **AI 去字幕：本地做，不依赖任何在线服务。**
         //
-        // 这两步现在是默认勾选的（用户要「所有步骤都默认选中」），
-        // 如果返回 Err，一部剧会当场失败、后面的步骤全被取消，什么都出不来。
-        // 所以这里返回 Ok，但消息写清楚「跳过了 + 为什么」——
-        // 运行记录和运行日志里都看得到，不会被悄悄咽掉。
-        "desubtitle" => Ok(
-            "已跳过：AI 去字幕需要云服务的接口文档（真实软件用的是开拍 videoscreenclear）。\
-             没有该服务的 API 说明就没法实现 —— 需要 AccessKey / SecretKey 与接口格式。"
-                .to_string(),
-        ),
+        // 真实软件走的是开拍 `videoscreenclear`（日志里 `已提交异步任务 task_id=t_...`），
+        // 那条路要接口文档 + 额度 + 网络。这里改成**本地**：
+        // 抽帧 OCR 扫出字幕位置 → ffmpeg `delogo` 用周围像素盖掉。
+        //
+        // **扫不到就明说扫不到**，不硬盖一块 —— 画面中间糊一块比留着字幕更糟。
+        "desubtitle" => {
+            let p: DesubtitlePayload = parse_payload(job)?;
+            let report = commands::desubtitle_media(
+                app.clone(),
+                app.state::<AppState>(),
+                p.media_id,
+                Some(p.out_path),
+                None,
+            )
+            .await?;
+            if report.removed {
+                Ok(format!(
+                    "去字幕完成（{}）｜{}",
+                    crate::proc::tail(&report.out_path),
+                    report.note
+                ))
+            } else {
+                // 不是失败 —— 本来就没字幕是正常情况，不该让整部剧红掉
+                Ok(report.note)
+            }
+        }
         // 成本报告：出「成本配置比例情况报告」。
         //
         // 版式照用户指定那份模板（zhengming/成本图表.docx）：
@@ -431,23 +456,13 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
             // 证明材料的原料，两条支线互不相干。
             //
             // 没配去字幕服务时 quzimu 不存在，传 None 就退回上一版行为。
-            let quzimu = {
-                // 这里 state 是 `&AppState`（不是 Tauri 的 State），
-                // 直接用它的 db 锁 —— 和本文件别处一个写法。
-                let conn = state
-                    .db
-                    .lock()
-                    .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
-                let m = db::get_media(&conn, p.media_id)?;
-                p.quzimu_dir.as_ref().and_then(|dir| {
-                    let stem = std::path::Path::new(&m.name)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| m.name.clone());
-                    let c = std::path::Path::new(dir).join(format!("{stem}_quzimu.mp4"));
-                    c.is_file().then(|| c.to_string_lossy().to_string())
-                })
-            };
+            // 路径由 pipeline 那边算好（和去字幕用的是同一个函数），
+            // 这里只判断在不在 —— 文件不存在就退回上一版行为。
+            let quzimu = p
+                .quzimu_path
+                .as_ref()
+                .filter(|path| std::path::Path::new(path).is_file())
+                .cloned();
             let segments = commands::run_slice(
                 app.clone(),
                 state,
