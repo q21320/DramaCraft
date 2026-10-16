@@ -1381,9 +1381,11 @@ pub async fn desubtitle_media(
     // 保留参数以兼容旧调用；现在按素材时长固定抽 12 帧定位
     #[allow(unused)] sample_fps: Option<f64>,
 ) -> AppResult<DesubtitleReport> {
-    let (ffmpeg, python, worker, input, media, out) = {
+    let (ffmpeg, ffprobe, python, worker, input, media, out) = {
         let configured = lock_tools(&state)?.clone();
         let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        // 探实际文件的尺寸用 —— **不能用素材记录里的**，见下面 subtitle_band 那段
+        let ffprobe = configured.ffprobe.clone();
         let python = tools::require(&configured.python, "python")?;
         let conn = lock_db(&state)?;
         let media = db::get_media(&conn, media_id)?;
@@ -1403,6 +1405,7 @@ pub async fn desubtitle_media(
         };
         (
             ffmpeg,
+            ffprobe,
             python,
             worker_script(&app, "ocr_worker.py"),
             // **取去重产物，不是原片。**
@@ -1465,7 +1468,20 @@ pub async fn desubtitle_media(
     let (ocr_frames, engine) = ocr::run_worker(&python, &worker, &frames, &opts, ocr::default_timeout())?;
     let _ = std::fs::remove_dir_all(&frames_dir);
 
-    let band = crate::desubtitle::subtitle_band(&ocr_frames, media.width, media.height);
+    // **尺寸要从实际处理的这个文件探，不能用素材记录里的。**
+    //
+    // 踩过一次：去字幕改成吃「去重产物」之后又抓不到字幕了。原因是
+    // 去重产物被**缩到了 720p**（404×720），而素材记录里存的是源片的
+    // 1080×1920 —— OCR 在 720p 上量出来的字幕框 y≈453，被判成
+    // 「不在下半部分」（要求 y ≥ 1920×0.55 = 1056），全被滤掉。
+    //
+    // **手上正在处理哪个文件，就问哪个文件的尺寸。**
+    let probe = media::probe(&PathBuf::from(&ffprobe), &input)?;
+    let (fw, fh) = (probe.width, probe.height);
+    if fw <= 0 || fh <= 0 {
+        return Err(AppError::Msg("探不到画面尺寸，无法定位字幕".into()));
+    }
+    let band = crate::desubtitle::subtitle_band(&ocr_frames, fw, fh);
     let Some(band) = band else {
         // **找不到就说找不到。** 不硬盖一块 —— 那会毁掉画面。
         return Ok(DesubtitleReport {
