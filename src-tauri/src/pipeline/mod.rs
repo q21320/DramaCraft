@@ -1,4 +1,4 @@
-﻿//! 流水线：把「一个源目录」变成「一批做完的剧」。
+//! 流水线：把「一个源目录」变成「一批做完的剧」。
 //!
 //! ## 为什么要有这一层
 //!
@@ -190,14 +190,14 @@ pub const STAGES: [(&str, &str, bool, &str); 8] = [
     (
         "rewrite",
         "AI 改剧名简介",
-        false,
-        "先改简介，再按新简介起剧名（整部剧一次，需先在「AI 服务」配好）",
+        true,
+        "先改简介，再按新简介起剧名（整部剧一次，需先在「AI 服务」配好；没配会自动跳过）",
     ),
     (
         "regroup",
         "整剧重组",
-        false,
-        "把零碎源片段按时间轴拼成 60~90 秒的「集」（源已经是整集时不用开）",
+        true,
+        "把零碎源片段按时间轴拼成 60~90 秒的「集」（源已经是整集时会跳过）",
     ),
     (
         "dedup",
@@ -208,31 +208,31 @@ pub const STAGES: [(&str, &str, bool, &str); 8] = [
     (
         "desubtitle",
         "AI 去字幕",
-        false,
-        "擦掉硬字幕（只做前 4 集，用来做分镜证明图）",
+        true,
+        "擦掉硬字幕（只做前 4 集，用来做分镜证明图；没配服务会跳过）",
     ),
     (
         "slice",
         "视频切片",
-        false,
+        true,
         "把整集切成 10 秒一段（供做证明图，不是发布用）",
     ),
     (
         "storyboard",
         "分镜证明",
-        false,
+        true,
         "从切片抽帧 → 反推分镜 → 拼成报备用的证明图",
     ),
     (
         "cover",
         "封面生成",
-        false,
-        "用原封面 + 新剧名合成一张（整部剧一张）",
+        true,
+        "用原封面 + 新剧名合成一张（整部剧一张；没找到封面图会跳过）",
     ),
     (
         "cost",
         "成本报告",
-        false,
+        true,
         "按模板生成成本配置比例报告（报备用）",
     ),
 ];
@@ -608,31 +608,37 @@ fn drama_payload(
     }
 }
 
-/// 把文件名变成一个能当目录名的字符串。
+/// 剧名 → 能当目录名的字符串。
 ///
-/// 去掉扩展名，并把 Windows 不允许出现在路径里的字符换掉。
-fn safe_dir_name(file_name: &str) -> String {
-    let stem = Path::new(file_name)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| file_name.to_string());
-    let cleaned: String = stem
+/// 和 [`safe_dir_name`] 的区别：**不去扩展名**。
+/// 剧名里带点的时候（比如「复仇记 3.0」）`file_stem` 会把 `.0` 切掉，
+/// 出来变成「复仇记 3」—— 用户的剧名被改了还不知道为什么。
+pub fn safe_drama_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
         .chars()
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
             other => other,
         })
         .collect();
-    // 首尾的点都去掉：结尾的点 Windows 会丢，开头的点在 Unix 上会变隐藏目录，
-    // 两边都不是我们想要的。
-    // 注意 `.mp4` 这种情况 —— Rust 把它当成「隐藏文件、没有扩展名」，
-    // file_stem 原样返回 `.mp4`，去掉点之后就空了，落到「未命名」。
     let trimmed = cleaned.trim().trim_matches('.').trim().to_string();
     if trimmed.is_empty() {
         "未命名".to_string()
     } else {
-        trimmed
+        trimmed.chars().take(80).collect()
     }
+}
+
+/// 把文件名变成一个能当目录名的字符串。
+///
+/// 去掉扩展名，再把 Windows 不允许出现在路径里的字符换掉。
+fn safe_dir_name(file_name: &str) -> String {
+    let stem = Path::new(file_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_name.to_string());
+    safe_drama_name(&stem)
 }
 
 /// 某一步在某一集上要排什么任务。返回 `None` 表示这一步这集跳过。

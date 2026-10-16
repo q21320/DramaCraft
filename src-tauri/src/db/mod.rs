@@ -1144,7 +1144,81 @@ pub fn run_outputs(conn: &Connection, run_id: i64) -> AppResult<Vec<OutputEpisod
     Ok(out)
 }
 
-// ---------- run_log（运行日志） ----------
+/// 改剧名之后，把导出目录和**还没跑的任务**里的路径一起换成新名字。
+///
+/// 为什么需要这一步：任务在入队时就把输出路径写死在 `payload` 里了，
+/// 而新剧名要等 AI 跑完才知道 —— 这是先有鸡还是先有蛋。
+///
+/// 真实软件的做法是「后续任务将使用新剧名」（它跑的是脚本，改个变量就行）。
+/// 我们这边得显式换：目录改名 + 把该剧**待跑**任务 payload 里的路径前缀替换掉。
+/// 已经跑完的任务不动 —— 它们的产物就在旧路径下，改了就找不到了。
+///
+/// 返回改了几个任务的路径。
+pub fn rename_drama_output(
+    conn: &Connection,
+    drama_id: i64,
+    new_name: &str,
+) -> AppResult<i64> {
+    let (old_dir, old_name): (String, String) = conn.query_row(
+        "SELECT out_dir, name FROM pipeline_drama WHERE id = ?1",
+        params![drama_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+
+    if new_name.trim().is_empty() || new_name == old_name {
+        return Ok(0);
+    }
+
+    // 新目录 = 旧目录换掉最后一段。
+    //
+    // 这里**故意用字符串拼接**而不是 PathBuf::join：旧路径可能是正斜杠
+    // （数据库里存的是扫描时拼的），join 会混进反斜杠变成
+    // `D:/二创\新名字`。能用，但难看，而且和 payload 里的其他路径风格不一致。
+    let new_dir = match old_dir.rfind(['/', '\\']) {
+        Some(i) => format!("{}{}", &old_dir[..=i], new_name),
+        None => new_name.to_string(),
+    };
+
+    let old_path = std::path::PathBuf::from(&old_dir);
+    let new_path = std::path::PathBuf::from(&new_dir);
+
+    // 目录已经建了就改名；还没建（rewrite 是第一步，通常还没东西）就只改记录
+    if old_path.is_dir() && old_path != new_path {
+        if new_path.exists() {
+            // 目标已存在：不覆盖，留在旧目录继续跑，别把已有的东西搞丢
+            return Ok(0);
+        }
+        std::fs::rename(&old_path, &new_path)
+            .map_err(|e| crate::error::AppError::Msg(format!("导出目录改名失败：{e}")))?;
+    }
+
+    // 待跑任务的 payload 里，把旧路径前缀换成新的。
+    // 用参数化的 REPLACE，不拼 SQL。
+    let changed = conn.execute(
+        "UPDATE job
+            SET payload = REPLACE(payload, ?2, ?3)
+          WHERE pipeline_drama_id = ?1
+            AND status = 'pending'
+            AND payload LIKE '%' || ?2 || '%'",
+        params![drama_id, old_dir, new_dir],
+    )?;
+
+    conn.execute(
+        "UPDATE pipeline_drama SET name = ?2, out_dir = ?3 WHERE id = ?1",
+        params![drama_id, new_name, new_dir],
+    )?;
+
+    // 已经落库的去重产物路径也要跟着换（它可能已经跑过了）
+    conn.execute(
+        "UPDATE media SET processed_path = REPLACE(processed_path, ?1, ?2)
+          WHERE processed_path LIKE '%' || ?1 || '%'",
+        params![old_dir, new_dir],
+    )?;
+
+    Ok(changed as i64)
+}
+
+// ---------- 运行日志（run_log） ----------
 
 /// 某部剧属于哪次运行。日志要按运行过滤，而任务只带 drama_id。
 pub fn run_id_of_drama(conn: &Connection, drama_id: Option<i64>) -> AppResult<Option<i64>> {
@@ -2106,6 +2180,69 @@ mod tests {
         append_log(&conn, Some(1), None, "info", "这条写不进去");
         // 到这里没 panic 就算过
         assert!(list_logs(&conn, Some(1), 0, 10).is_err(), "读要如实报错");
+    }
+
+    /// 改剧名之后，导出目录和**待跑任务**的路径都要跟着换。
+    ///
+    /// 为什么必须测：任务在入队时就把输出路径写死在 payload 里了，
+    /// 而新剧名要等 AI 跑完才知道。不换的话，产物还是落在旧剧名的目录里 ——
+    /// 用户明明看到「新剧名：白毛狼引桑蚕守家园」，文件夹却还叫旧名字。
+    #[test]
+    fn renaming_a_drama_moves_dir_and_rewrites_pending_jobs() {
+        let conn = mem();
+        let run = create_pipeline_run(&conn, "D:/源", "D:/二创", &["dedup".into()]).unwrap();
+        let old_dir = "D:/二创/青丝谷桑蚕记";
+        let drama = add_pipeline_drama(&conn, run, "青丝谷桑蚕记", "D:/源", old_dir, 3, None)
+            .unwrap();
+
+        // 一个待跑的、一个已经跑完的 —— 只有待跑的该被改
+        let pending = enqueue_job_for(
+            &conn,
+            None,
+            "dedup",
+            &format!(r#"{{"mediaId":1,"outDir":"{old_dir}/去重"}}"#),
+            Some(drama),
+        )
+        .unwrap();
+        // 第二个用同样的类型造一个"已经跑完"的 —— 只有待跑的该被改
+        let done = enqueue_job_for(
+            &conn,
+            None,
+            "dedup",
+            &format!(r#"{{"mediaId":2,"outDir":"{old_dir}/切片"}}"#),
+            Some(drama),
+        )
+        .unwrap();
+        finish_job(&conn, done.id, JOB_DONE, "跑完了").unwrap();
+
+        let moved = rename_drama_output(&conn, drama, "白毛狼引桑蚕守家园").unwrap();
+        assert_eq!(moved, 1, "只该改那一个待跑的");
+
+        let d = list_pipeline_dramas(&conn, run)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == drama)
+            .expect("剧目该还在");
+        assert_eq!(d.name, "白毛狼引桑蚕守家园");
+        assert_eq!(d.out_dir, "D:/二创/白毛狼引桑蚕守家园");
+
+        let p = get_job(&conn, pending.id).unwrap();
+        assert!(p.payload.contains("白毛狼引桑蚕守家园"), "{}", p.payload);
+        assert!(!p.payload.contains("青丝谷桑蚕记"), "{}", p.payload);
+
+        // 跑完的不动 —— 它的产物就在旧路径下，改了就找不到了
+        let f = get_job(&conn, done.id).unwrap();
+        assert!(f.payload.contains("青丝谷桑蚕记"), "已完成的不能被改：{}", f.payload);
+    }
+
+    #[test]
+    fn renaming_to_the_same_name_changes_nothing() {
+        let conn = mem();
+        let run = create_pipeline_run(&conn, "D:/源", "D:/二创", &[]).unwrap();
+        let drama =
+            add_pipeline_drama(&conn, run, "某剧", "D:/源", "D:/二创/某剧", 1, None).unwrap();
+        assert_eq!(rename_drama_output(&conn, drama, "某剧").unwrap(), 0);
+        assert_eq!(rename_drama_output(&conn, drama, "  ").unwrap(), 0, "空名字要忽略");
     }
 
     /// 删素材 / 删工程必须连带清掉挂着的任务。

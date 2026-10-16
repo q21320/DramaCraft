@@ -284,18 +284,22 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
     let state = app.state::<AppState>();
 
     match job.kind.as_str() {
-        // 整剧重组 / AI 去字幕：先说清楚为什么还不能跑，
-        // 而不是排一个注定失败的任务让用户猜。
-        "regroup" => Err(AppError::Msg(
-            "整剧重组还没实现。它解决的是「源目录里是一堆零碎片段」的情况 —— \
-             把片段按时间轴拼成 60~90 秒的集。你的源目录已经是整集，这一步用不上。"
-                .into(),
-        )),
-        "desubtitle" => Err(AppError::Msg(
-            "AI 去字幕需要云服务的接口文档（真实软件用的是开拍 videoscreenclear）。\
+        // 整剧重组 / AI 去字幕：**跳过并说明**，不让整部剧失败。
+        //
+        // 这两步现在是默认勾选的（用户要「所有步骤都默认选中」），
+        // 如果返回 Err，一部剧会当场失败、后面的步骤全被取消，什么都出不来。
+        // 所以这里返回 Ok，但消息写清楚「跳过了 + 为什么」——
+        // 运行记录和运行日志里都看得到，不会被悄悄咽掉。
+        "regroup" => Ok(
+            "已跳过：整剧重组还没实现。它解决的是「源目录里是一堆零碎片段」的情况 —— \
+             把片段按时间轴拼成 60~90 秒的集。源目录已经是整集时用不上这一步。"
+                .to_string(),
+        ),
+        "desubtitle" => Ok(
+            "已跳过：AI 去字幕需要云服务的接口文档（真实软件用的是开拍 videoscreenclear）。\
              没有该服务的 API 说明就没法实现 —— 需要 AccessKey / SecretKey 与接口格式。"
-                .into(),
-        )),
+                .to_string(),
+        ),
         // 成本报告：按模板生成（报备用）
         "cost" => {
             let p: CostPayload = parse_payload(job)?;
@@ -379,11 +383,36 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         "rewrite" => {
             let p: RewritePayload = parse_payload(job)?;
             let outcome = commands::ai_rewrite(state, p.title, p.synopsis, Some(p.out_dir)).await?;
-            Ok(format!(
-                "新剧名「{}」（{} 字简介）",
-                outcome.new_title,
-                outcome.new_synopsis.chars().count()
-            ))
+
+            // 改完剧名，把导出目录和**还没跑的任务**一起换成新名字。
+            //
+            // 真实软件把「后续任务将使用新剧名」写在日志里，它跑的是脚本，
+            // 改个变量就行。我们这边路径在入队时就写死在 payload 里了，
+            // 所以得显式换 —— 否则产物还是落在旧剧名的目录里。
+            let mut renamed = 0i64;
+            if let Some(drama_id) = job.pipeline_drama_id {
+                let safe = crate::pipeline::safe_drama_name(&outcome.new_title);
+                // 上面那次调用已经拿走了 state，这里从 app 再取一个句柄
+                let st = app.state::<AppState>();
+                let conn = st
+                    .db
+                    .lock()
+                    .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
+                renamed = db::rename_drama_output(&conn, drama_id, &safe)?;
+            }
+
+            if renamed > 0 {
+                Ok(format!(
+                    "新剧名「{}」；导出目录已改名，{renamed} 个待跑任务的路径跟着换",
+                    outcome.new_title
+                ))
+            } else {
+                Ok(format!(
+                    "新剧名「{}」（{} 字简介）",
+                    outcome.new_title,
+                    outcome.new_synopsis.chars().count()
+                ))
+            }
         }
         // 整部剧倒数第二步：封面。
         // 用 rewrite 写下的新剧名；读不到就退回原剧名 —— 别因为缺一个文件就整条卡住。
