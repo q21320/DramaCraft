@@ -76,12 +76,24 @@ struct SlicePayload {
     /// 源素材常是 HEVC，而平台上传规范要 H.264。
     #[serde(default)]
     compatible: bool,
-    /// 文件名前缀（通常是集名）。
+    /// 文件名前缀。
     ///
-    /// 切片是按「这一集的第几片」编号的（001、002…），多集平铺在同一个
-    /// 目录里就会互相覆盖 —— 必须带上集名才唯一。
+    /// 现在是**一源一文件夹**（照真实软件：`qiepian\第1集_quzimu\分镜001.mp4`），
+    /// 所以前缀不用再承担"区分是哪一集"的职责，目录已经分开了。
     #[serde(default)]
     prefix: String,
+    /// AI 去字幕的产物目录（`<剧目录>/quzimu`）。
+    ///
+    /// **切片切的是去字幕产物，不是去重产物** —— 真实软件的日志写得很清楚：
+    /// 「视频切片（流水线 · AI去字幕结果）」，源是 `第N集_quzimu.mp4`。
+    /// 我原来挂在去重下面，错了：那是两条并行支线。
+    ///
+    ///   整集去重 → 去重产物（发布用）
+    ///   去字幕   → quzimu → 10秒切片 → 分镜证明图（证明材料用）
+    ///
+    /// 没去字幕（比如没配服务）就退回上一版的行为（去重产物 → 原片）。
+    #[serde(default)]
+    quzimu_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -412,8 +424,41 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         }
         "slice" => {
             let p: SlicePayload = parse_payload(job)?;
-            let segments =
-                commands::run_slice(app.clone(), state, p.media_id, p.mode, p.out_dir, Some(p.compatible), p.prefix).await?;
+            // **先看有没有 AI 去字幕的产物，有就切它。**
+            //
+            // 真实软件的日志：「视频切片（流水线 · AI去字幕结果）」——
+            // 源是 `第N集_quzimu.mp4`。去重产物是发布用的，切片只是
+            // 证明材料的原料，两条支线互不相干。
+            //
+            // 没配去字幕服务时 quzimu 不存在，传 None 就退回上一版行为。
+            let quzimu = {
+                // 这里 state 是 `&AppState`（不是 Tauri 的 State），
+                // 直接用它的 db 锁 —— 和本文件别处一个写法。
+                let conn = state
+                    .db
+                    .lock()
+                    .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
+                let m = db::get_media(&conn, p.media_id)?;
+                p.quzimu_dir.as_ref().and_then(|dir| {
+                    let stem = std::path::Path::new(&m.name)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| m.name.clone());
+                    let c = std::path::Path::new(dir).join(format!("{stem}_quzimu.mp4"));
+                    c.is_file().then(|| c.to_string_lossy().to_string())
+                })
+            };
+            let segments = commands::run_slice(
+                app.clone(),
+                state,
+                p.media_id,
+                p.mode,
+                p.out_dir,
+                Some(p.compatible),
+                p.prefix,
+                quzimu,
+            )
+            .await?;
             let failed = segments.iter().filter(|s| s.status != "ok").count();
             if failed > 0 {
                 Ok(format!("切出 {} 片，其中 {failed} 片失败", segments.len()))

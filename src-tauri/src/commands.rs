@@ -194,8 +194,11 @@ pub async fn run_slice(
     mode: SliceMode,
     out_dir: String,
     compatible: Option<bool>,
-    // 文件名前缀（通常传集名）。空串就用纯编号。
+    // 文件名前缀。空串就用纯编号。
     prefix: String,
+    // 指定源文件。给了就用它，否则按「去重产物 → 原片」自己找。
+    // 切片吃的是**去字幕产物**（quzimu），由队列算好传进来。
+    source_override: Option<String>,
 ) -> AppResult<Vec<Segment>> {
     let compatible = compatible.unwrap_or(false);
     let (input_path, plans, ffmpeg) = {
@@ -204,12 +207,18 @@ pub async fn run_slice(
         let conn = lock_db(&state)?;
         let target = db::get_media(&conn, media_id)?;
         let plans = media::plan::build_plan(target.duration_ms, &mode);
-        // **切去重产物，不是原片。**
+        // 源文件的优先级：
         //
-        // 真实软件的流程是「先去重整集、再切片」—— 去重产物才是发布用的，
-        // 切片只是它的下游（做证明图）。原来我切原片，等于去重白做了。
-        // 没去重过就退回原片（media_source_path 自己处理这个）。
-        let source = db::media_source_path(&conn, media_id)?;
+        // 1. **AI 去字幕产物**（`第N集_quzimu.mp4`）—— 真实软件就是切它
+        // 2. 去重产物（`media.processed_path`）
+        // 3. 原片
+        //
+        // 第 1 条由调用方算好传进来（它才知道剧目录在哪）；
+        // 第 2、3 条 `media_source_path` 自己处理。
+        let source = match source_override {
+            Some(p) if std::path::Path::new(&p).is_file() => p,
+            _ => db::media_source_path(&conn, media_id)?,
+        };
         (source, plans, ffmpeg)
     };
 
