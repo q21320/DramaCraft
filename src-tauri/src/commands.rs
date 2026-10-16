@@ -2511,7 +2511,16 @@ pub async fn build_storyboard(
         let conn = lock_db(&state)?;
         let provider = ai::usable_provider(&conn)?;
         // 剧名：rewrite 写过就用新的
+        // 剧名.txt 写在**剧目录**下，而分镜证明输出在 `<剧目录>/分镜证明/` ——
+        // 只找本级会读不到，产出就变成「未命名_分镜证明_01.jpg」。
+        // 两级都找一遍。
         let title = std::fs::read_to_string(out_dir.join("剧名.txt"))
+            .or_else(|_| {
+                out_dir
+                    .parent()
+                    .map(|p| std::fs::read_to_string(p.join("剧名.txt")))
+                    .unwrap_or(Err(std::io::Error::from(std::io::ErrorKind::NotFound)))
+            })
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())

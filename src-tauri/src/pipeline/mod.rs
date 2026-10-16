@@ -409,6 +409,8 @@ pub fn regroup_drama(
 
     // 拼出来的长片是中间产物，删掉免得占地方、也免得被当成一集导入
     let _ = std::fs::remove_file(&merged);
+    // 拼接清单同样是中间产物
+    let _ = std::fs::remove_file(&list);
 
     if made.len() < 2 {
         return Err(AppError::Msg(
@@ -826,7 +828,14 @@ fn drama_payload(
                 "title": drama.name,
                 "episodeCount": drama.episode_count,
                 "totalMs": total_ms,
-                "outPath": drama_out.join(format!("{}_成本报告.docx", drama.name)).to_string_lossy(),
+                // **文件名用新剧名**（从导出目录名取 —— 它已经是最终名字了）。
+// 用 drama.name 的话会写回源剧名，和文件夹对不上。
+                "outPath": drama_out
+                    .join(format!(
+                        "{}_成本报告.docx",
+                        drama_out.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                    ))
+                    .to_string_lossy(),
                 // 报备用的默认值：投资额由用户在报告里改
                 "investWan": 100.0,
                 "actorRatio": 30.0,
