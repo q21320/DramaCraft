@@ -106,6 +106,12 @@ struct DedupPayload {
     header_label: Option<HeaderLabel>,
     /// 去重产物放哪个目录
     out_dir: String,
+    /// 产出文件的名字前缀（新剧名-第NN集）。
+    ///
+    /// 用户要的：文件名用 AI 生成的**新名字**，不是源目录那套。
+    /// 空串就退回原来用素材名。
+    #[serde(default)]
+    prefix: String,
 }
 
 fn default_intensity() -> String {
@@ -357,6 +363,7 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                 Some(p.intensity),
                 p.header_label,
                 Some(p.out_dir),
+                p.prefix,
             )
             .await?;
             let mb = report.size_bytes as f64 / 1048576.0;

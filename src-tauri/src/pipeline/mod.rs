@@ -647,7 +647,7 @@ pub fn start_pipeline(
                 crate::db::find_media_by_path(conn, project.id, &episode.path)?
             {
                 media_ids.push(existing.id);
-                media_groups.push((existing.id, safe_dir_name(&episode.file_name)));
+                media_groups.push((existing.id, episode_label(&safe, media_ids.len())));
                 reused_media += 1;
                 continue;
             }
@@ -661,7 +661,7 @@ pub fn start_pipeline(
             let record =
                 crate::db::add_media(conn, project.id, &episode.path, &episode.file_name, &probe)?;
             media_ids.push(record.id);
-            media_groups.push((record.id, safe_dir_name(&episode.file_name)));
+            media_groups.push((record.id, episode_label(&safe, media_ids.len())));
             imported += 1;
         }
 
@@ -864,6 +864,20 @@ fn drama_payload(
     }
 }
 
+/// 产出文件的名字前缀：**新剧名 + 第几集**。
+///
+/// 用户两次提到同一件事：
+/// - 「导出二创文件夹里面 每一部的**文件名**是否可以使用生成的新名字来命名呢？」
+/// - 「ai生成的**文件名**不要固定呀」
+///
+/// 我一开始只改了**文件夹**名，文件还是源目录那套
+/// （`弟弟结婚…-第01集_去重.mp4`）—— 文件夹叫新名、文件叫旧名，对不上。
+///
+/// 现在统一成 `新剧名-第01集`，去重产物是 `<前缀>_去重.mp4`、
+/// 切片是 `<前缀>_001.mp4`。
+fn episode_label(drama_name: &str, no: usize) -> String {
+    format!("{drama_name}-第{no:02}集")
+}
 /// 剧名 → 能当目录名的字符串。
 ///
 /// 和 [`safe_dir_name`] 的区别：**不去扩展名**。
@@ -938,8 +952,10 @@ pub fn stage_payload(
             // 片头标识**叠加**在预设之上：它是合规开关，和"怎么去重"是两件事
             "headerLabel": label,
             // **平铺在一个「去重」目录里**（用户要的）。
-            // 文件名带原集名，天然唯一，不会互相覆盖。
             "outDir": out_dir.join("去重").to_string_lossy(),
+            // **文件名用新剧名**，不是源目录那套 —— 用户两次提到这一点。
+            // 带上集名，天然唯一，不会互相覆盖。
+            "prefix": group,
         }),
         // 「画面处理」是老的按切片做法，留给单步工具页用
         "transform" => serde_json::json!({
@@ -1788,8 +1804,26 @@ mod tests {
             "一段改过的新简介"
         );
 
-        // **所有任务的输出路径都得是新剧名** —— 一个旧路径都不能漏
+        // **产出文件的文件名也要用新名字**（用户两次提到这一点：
+        // 「每一部的文件名是否可以使用生成的新名字来命名」、
+        //  「ai生成的文件名不要固定呀」）。
+        //
+        // 只改文件夹名不改文件名的话，会变成文件夹叫新名、文件叫旧名，对不上。
         let jobs = crate::db::list_jobs(&conn, 20).unwrap();
+        for j in &jobs {
+            let v: serde_json::Value = serde_json::from_str(&j.payload).unwrap();
+            if let Some(prefix) = v["prefix"].as_str() {
+                assert!(
+                    prefix.starts_with("白毛狼引桑蚕守家园"),
+                    "{} 的文件名前缀该用新剧名，实际：{prefix}",
+                    j.kind
+                );
+                assert!(
+                    !prefix.contains("青丝谷桑蚕记"),
+                    "文件名里不该残留源剧名：{prefix}"
+                );
+            }
+        }
         assert!(!jobs.is_empty());
         for j in &jobs {
             assert!(

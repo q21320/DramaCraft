@@ -1,4 +1,4 @@
-﻿//! 前后端唯一边界。前端只认这里的命令名与参数形状。
+//! 前后端唯一边界。前端只认这里的命令名与参数形状。
 
 use crate::db;
 use crate::error::{AppError, AppResult};
@@ -1927,43 +1927,38 @@ pub async fn pipeline_start(
                         continue;
                     }
 
-                    // **这部剧已经起过名字了，就复用，不再调模型。**
+                    // **每次跑都重新起名，不沿用上次的。**
                     //
-                    // 为什么必须这样：AI 每次给的名字都不一样（temperature 0.9，
-                    // 要的就是多样性）。如果每跑一次都重新起名，导出目录里就会
-                    // 一次多一个文件夹 —— 实测跑两次就有了
-                    // 「借车引发的觉醒」和「我的车我说了算」两个目录，越跑越多。
+                    // 用户说「ai生成的文件名不要固定呀」—— 对，AI 起名的价值
+                    // 就在多样性，固定下来就没意义了。
                     //
-                    // 判据：工程名和源目录里的剧名不一样，说明上次改过。
-                    let existing = {
-                        let conn = lock_db(&state)?;
-                        db::find_project_by_root(&conn, &drama.dir)?
-                    };
-                    if let Some(proj) = existing {
-                        if proj.name != drama.name {
-                            log_line(
-                                &state,
-                                "info",
-                                &format!(
-                                    "「{}」上次已改名为「{}」，这次沿用它（避免每次跑都新建目录）",
-                                    drama.name, proj.name
-                                ),
-                            );
-                            renames.insert(
-                                drama.name.clone(),
-                                pipeline::NewName {
-                                    title: proj.name,
-                                    synopsis: drama.synopsis.clone(),
-                                },
-                            );
-                            continue;
-                        }
-                    }
-
+                    // （我一度改成沿用，是为了避免导出目录越跑越多 ——
+                    //  那是**用错的办法解决对的问题**。目录重复该在目录层面
+                    //  解决：新名字定了之后，把上一次的目录改名，见下面。）
+                    //
                     // **失败不中断整条流水线** —— 用原剧名继续跑，
                     // 总比因为一次网络抖动就什么都出不来强。
                     match ai::rewrite_title_and_synopsis(&p, &drama.name, &drama.synopsis).await {
                         Ok((new_title, new_synopsis)) => {
+                            // 上一次的导出目录改成新名字，而不是再建一个。
+                            // 不这么做的话，AI 每次起新名 = 每跑一次多一个文件夹。
+                            let old_dir = out_root.join(pipeline::safe_drama_name(&drama.name));
+                            let new_dir = out_root.join(pipeline::safe_drama_name(&new_title));
+                            if old_dir.is_dir() && !new_dir.exists() && old_dir != new_dir {
+                                match std::fs::rename(&old_dir, &new_dir) {
+                                    Ok(_) => log_line(
+                                        &state,
+                                        "info",
+                                        "上一次的导出目录已改名为新剧名（不新建，避免越跑越多）",
+                                    ),
+                                    Err(e) => log_line(
+                                        &state,
+                                        "warn",
+                                        &format!("旧导出目录改名失败（不影响这次跑）：{e}"),
+                                    ),
+                                }
+                            }
+
                             log_line(
                                 &state,
                                 "ok",
@@ -2311,6 +2306,8 @@ pub async fn dedup_media(
     intensity: Option<String>,
     header_label: Option<HeaderLabel>,
     out_dir: Option<String>,
+    // 产出文件的名字前缀（新剧名-第NN集）。空串就退回素材名。
+    prefix: String,
 ) -> AppResult<DedupReport> {
     let (ffmpeg, ffprobe, media) = {
         let configured = lock_tools(&state)?.clone();
@@ -2330,8 +2327,13 @@ pub async fn dedup_media(
             let dir = PathBuf::from(dir);
             std::fs::create_dir_all(&dir)
                 .map_err(|e| AppError::Msg(format!("建不了输出目录：{e}")))?;
-            // 用原文件名，一眼能认出是哪一集
-            dir.join(format!("{}_去重.mp4", media.name.trim_end_matches(".mp4")))
+            // **文件名用新剧名**（用户要的），没给前缀才退回素材名
+            let stem = if prefix.trim().is_empty() {
+                media.name.trim_end_matches(".mp4").to_string()
+            } else {
+                prefix.trim().to_string()
+            };
+            dir.join(format!("{stem}_去重.mp4"))
         }
         None => input.with_file_name(format!(
             "{}_去重.mp4",
