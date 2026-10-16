@@ -164,8 +164,17 @@ CREATE INDEX IF NOT EXISTS idx_pipeline_drama_run ON pipeline_drama(run_id, id);
 ALTER TABLE job ADD COLUMN pipeline_drama_id INTEGER;
 "#;
 
+/// v9：把「这次运行用的是哪个工程」记下来。
+///
+/// 原来产出查询靠 `pipeline_drama.src_dir = project.root_dir` 间接关联 ——
+/// 一旦同一个源目录被跑过多次（有多个工程），一次查询会把几次运行的数据
+/// 全捞出来。实测：163 行里只有 65 个不同文件，界面上同一集出现两三次。
+const SCHEMA_V9: &str = r#"
+ALTER TABLE pipeline_drama ADD COLUMN project_id INTEGER;
+"#;
+
 /// 当前 schema 版本。加表/加列时递增，并在 `migrate` 里补一段。
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
@@ -204,6 +213,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     }
     if version < 8 {
         conn.execute_batch(SCHEMA_V8)?;
+    }
+    if version < 9 {
+        conn.execute_batch(SCHEMA_V9)?;
     }
     if version < SCHEMA_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -258,6 +270,56 @@ pub fn create_project(conn: &Connection, name: &str, root_dir: &str) -> AppResul
     })
 }
 
+/// 按源目录找已有工程。
+///
+/// 流水线每次跑都新建工程的话，同一批素材会被导入好几遍 ——
+/// 实测撞到过：三个工程指向同一个源目录，163 条素材里只有 65 个不同文件。
+pub fn find_project_by_root(conn: &Connection, root_dir: &str) -> AppResult<Option<Project>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, root_dir, created_at FROM project WHERE root_dir = ?1 ORDER BY id LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![root_dir])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(Project {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            root_dir: row.get(2)?,
+            created_at: row.get(3)?,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// 某个工程里是不是已经导入过这个文件。
+pub fn find_media_by_path(
+    conn: &Connection,
+    project_id: i64,
+    path: &str,
+) -> AppResult<Option<Media>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, path, name, duration_ms, width, height, has_audio,
+                size_bytes, format_name, created_at
+           FROM media WHERE project_id = ?1 AND path = ?2 ORDER BY id LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![project_id, path])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(Media {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            path: row.get(2)?,
+            name: row.get(3)?,
+            duration_ms: row.get(4)?,
+            width: row.get(5)?,
+            height: row.get(6)?,
+            has_audio: row.get::<_, i64>(7)? != 0,
+            size_bytes: row.get(8)?,
+            format_name: row.get(9)?,
+            created_at: row.get(10)?,
+        })),
+        None => Ok(None),
+    }
+}
+
 pub fn list_projects(conn: &Connection) -> AppResult<Vec<Project>> {
     let mut stmt =
         conn.prepare("SELECT id, name, root_dir, created_at FROM project ORDER BY id DESC")?;
@@ -276,7 +338,21 @@ pub fn list_projects(conn: &Connection) -> AppResult<Vec<Project>> {
     Ok(out)
 }
 
+/// 删工程：把它下面的素材逐个清干净再删。
+///
+/// 光 `DELETE FROM project` 会留下一堆孤儿行，而且指向这些素材的任务
+/// 一跑就撞外键。所以走 [`remove_media`]，让连带清理只有一处实现。
 pub fn delete_project(conn: &Connection, id: i64) -> AppResult<()> {
+    let media_ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM media WHERE project_id = ?1")?;
+        let rows = stmt
+            .query_map(params![id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        rows
+    };
+    for mid in media_ids {
+        remove_media(conn, mid)?;
+    }
     conn.execute("DELETE FROM project WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -353,7 +429,16 @@ pub fn list_media(conn: &Connection, project_id: i64) -> AppResult<Vec<Media>> {
     Ok(out)
 }
 
+/// 删素材：**连带它的任务、切片、字幕一起删**。
+///
+/// 不这么做的话，队列里还留着指向这条素材的任务，等它跑到写字幕那一步
+/// 就会撞 `FOREIGN KEY constraint failed` —— 实测发生过：
+/// run#7 整条流水线就是这么挂掉的（删了工程，任务还在队列里）。
 pub fn remove_media(conn: &Connection, id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM cue WHERE media_id = ?1", params![id])?;
+    conn.execute("DELETE FROM segment WHERE media_id = ?1", params![id])?;
+    // 任务直接删掉：素材都没了，任务留着只会失败
+    conn.execute("DELETE FROM job WHERE media_id = ?1", params![id])?;
     conn.execute("DELETE FROM media WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -678,7 +763,7 @@ pub const RUN_FAILED: &str = "failed";
 pub const RUN_CANCELED: &str = "canceled";
 
 const DRAMA_COLUMNS: &str =
-    "id, run_id, name, src_dir, out_dir, episode_count, stage, status, message, updated_at";
+    "id, run_id, name, src_dir, out_dir, episode_count, stage, status, message, updated_at, project_id";
 
 fn row_to_pipeline_drama(row: &rusqlite::Row<'_>) -> rusqlite::Result<PipelineDrama> {
     Ok(PipelineDrama {
@@ -692,6 +777,8 @@ fn row_to_pipeline_drama(row: &rusqlite::Row<'_>) -> rusqlite::Result<PipelineDr
         status: row.get(7)?,
         message: row.get(8)?,
         updated_at: row.get(9)?,
+        // v9 之前的老记录没有这个字段，是 NULL
+        project_id: row.get(10).ok().flatten(),
     })
 }
 
@@ -723,11 +810,12 @@ pub fn add_pipeline_drama(
     src_dir: &str,
     out_dir: &str,
     episode_count: i64,
+    project_id: Option<i64>,
 ) -> AppResult<i64> {
     conn.execute(
-        "INSERT INTO pipeline_drama(run_id, name, src_dir, out_dir, episode_count, stage, status, message, updated_at)
-         VALUES(?1, ?2, ?3, ?4, ?5, '', 'pending', '', ?6)",
-        params![run_id, name, src_dir, out_dir, episode_count, now()],
+        "INSERT INTO pipeline_drama(run_id, name, src_dir, out_dir, episode_count, stage, status, message, updated_at, project_id)
+         VALUES(?1, ?2, ?3, ?4, ?5, '', 'pending', '', ?6, ?7)",
+        params![run_id, name, src_dir, out_dir, episode_count, now(), project_id],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -850,32 +938,60 @@ pub fn refresh_pipeline_run_status(conn: &Connection) -> AppResult<i64> {
 /// 一次流水线跑出来的东西，按「集 → 切片」组织，每片带上它的字幕。
 ///
 /// 链路是：pipeline_drama.src_dir ↔ project.root_dir ↔ media.project_id ↔ segment.media_id
-/// —— 没有在 pipeline_drama 上存 project_id，但 src_dir 就是当初建工程时
-/// 用的那个目录，等价且不用加列。
+/// —— v9 起直接按 pipeline_drama.project_id 查，精确到本次运行；
+/// 老记录没有这个字段时才退回用源目录匹配。
 pub fn run_outputs(conn: &Connection, run_id: i64) -> AppResult<Vec<OutputEpisode>> {
     let dramas = list_pipeline_dramas(conn, run_id)?;
     let mut out = Vec::new();
 
     for drama in dramas {
-        let mut stmt = conn.prepare(
-            "SELECT m.id, m.name, m.duration_ms, m.width, m.height
-               FROM media m
-               JOIN project p ON p.id = m.project_id
-              WHERE p.root_dir = ?1
-              ORDER BY m.id ASC",
-        )?;
-        let medias: Vec<(i64, String, i64, i64, i64)> = stmt
-            .query_map(params![drama.src_dir], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
+        // 按**本次运行自己的工程**查，不再靠源目录猜。
+        //
+        // 同一个源目录跑过多次时，靠源目录关联会把几次运行的数据全捞出来
+        // （实测 163 行里只有 65 个不同文件，界面上同一集出现两三次）。
+        // v9 之前的老记录没存 project_id，这时退回用源目录匹配 —— 不精确，
+        // 但至少还能看，总比空白强。
+        let medias: Vec<(i64, String, i64, i64, i64)> = match drama.project_id {
+            Some(pid) => {
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, m.name, m.duration_ms, m.width, m.height
+                       FROM media m WHERE m.project_id = ?1 ORDER BY m.id ASC",
+                )?;
+                let rows = stmt
+                    .query_map(params![pid], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, m.name, m.duration_ms, m.width, m.height
+                       FROM media m
+                       JOIN project p ON p.id = m.project_id
+                      WHERE p.root_dir = ?1
+                      ORDER BY m.id ASC",
+                )?;
+                let rows = stmt
+                    .query_map(params![drama.src_dir], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            }
+        };
 
         for (media_id, name, duration_ms, width, height) in medias {
             let mut seg_stmt = conn.prepare(
@@ -1788,6 +1904,96 @@ mod tests {
     const OK_SLICE: &str =
         r#"{"mediaId":1,"mode":{"mode":"equalParts","parts":3},"outDir":"E:/o"}"#;
     const OK_OCR: &str = r#"{"mediaId":2}"#;
+    /// 删素材 / 删工程必须连带清掉挂着的任务。
+    ///
+    /// 不清的话，队列里剩下的任务跑到写字幕那一步会撞外键 ——
+    /// 实测发生过：run#7 整条流水线报「FOREIGN KEY constraint failed」。
+    #[test]
+    fn deleting_media_takes_its_jobs_and_data_with_it() {
+        let mut conn = mem();
+        let project = create_project(&conn, "某剧", "D:/某剧").unwrap();
+        let probe = MediaProbe {
+            duration_ms: 1000,
+            width: 720,
+            height: 1280,
+            has_audio: true,
+            size_bytes: 10,
+            format_name: "mp4".into(),
+        };
+        let media = add_media(&conn, project.id, "D:/某剧/第01集.mp4", "第01集.mp4", &probe)
+            .unwrap();
+
+        insert_segment(&conn, media.id, 1, 0, 1000, "D:/out/001.mp4", 10, "ok", "").unwrap();
+        replace_cues(
+            &mut conn,
+            media.id,
+            &[Cue {
+                id: 0,
+                media_id: media.id,
+                index_no: 1,
+                start_ms: 0,
+                end_ms: 500,
+                text: "你好".into(),
+            }],
+        )
+        .unwrap();
+        enqueue_job(&conn, Some(media.id), "slice", OK_SLICE).unwrap();
+
+        remove_media(&conn, media.id).unwrap();
+
+        let count = |sql: &str| -> i64 {
+            conn.query_row(sql, params![media.id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(count("SELECT COUNT(*) FROM cue WHERE media_id=?1"), 0, "字幕该跟着删");
+        assert_eq!(
+            count("SELECT COUNT(*) FROM segment WHERE media_id=?1"),
+            0,
+            "切片该跟着删"
+        );
+        assert_eq!(
+            job_counts(&conn).unwrap().total,
+            0,
+            "挂着这个素材的任务该跟着删 —— 否则它跑起来会撞外键"
+        );
+    }
+
+    #[test]
+    fn deleting_a_project_clears_everything_under_it() {
+        let conn = mem();
+        let probe = MediaProbe {
+            duration_ms: 1000,
+            width: 720,
+            height: 1280,
+            has_audio: true,
+            size_bytes: 10,
+            format_name: "mp4".into(),
+        };
+        let project = create_project(&conn, "某剧", "D:/某剧").unwrap();
+        for n in 1..=3 {
+            let m = add_media(
+                &conn,
+                project.id,
+                &format!("D:/某剧/第0{n}集.mp4"),
+                &format!("第0{n}集.mp4"),
+                &probe,
+            )
+            .unwrap();
+            enqueue_job(&conn, Some(m.id), "slice", OK_SLICE).unwrap();
+        }
+        assert_eq!(list_media(&conn, project.id).unwrap().len(), 3);
+
+        delete_project(&conn, project.id).unwrap();
+
+        assert!(list_projects(&conn).unwrap().is_empty());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM media", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "工程下的素材该跟着删"
+        );
+        assert_eq!(job_counts(&conn).unwrap().total, 0, "任务也该跟着删");
+    }
+
     fn asset(kind: &str, name: &str, path: &str, bytes: i64) -> Asset {
         Asset {
             id: 0,

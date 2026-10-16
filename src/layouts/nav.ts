@@ -135,6 +135,12 @@ export const navGroups: NavGroup[] = [
         subtitle: "把长任务排成一队顺序跑，关掉应用再打开会接着跑",
       },
       {
+        key: "ai",
+        path: "/ai",
+        label: "AI 服务",
+        subtitle: "API Key、接口地址、模型名，以及哪些功能走 AI",
+      },
+      {
         key: "settings",
         path: "/settings",
         label: "设置",

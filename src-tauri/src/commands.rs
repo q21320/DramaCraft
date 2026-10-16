@@ -1,4 +1,4 @@
-﻿//! 前后端唯一边界。前端只认这里的命令名与参数形状。
+//! 前后端唯一边界。前端只认这里的命令名与参数形状。
 
 use crate::db;
 use crate::error::{AppError, AppResult};
@@ -6,7 +6,8 @@ use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, Asset, AssetApplyReport, AssetImportReport, AssetKindOption,
     AssetSummary, CloudConfigView, CloudTestResult, CloudTranscribeReport, CostDocRequest, Cue,
     DiscoveredAsset, DocxReport, EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome,
-    HeaderLabel, IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
+    AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage, CoverReport, CoverRequest, HeaderLabel,
+    IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
     PipelineStage, PlatformOption, Project,
     ProofLayout, ProofPreview, ProofRenderReport, PublishAccount, PublishClipEntry,
     PublishPackageReport, PublishPlan, QueueState, ResplitReport, RuntimeStatus, Segment,
@@ -14,8 +15,8 @@ use crate::models::{
     TransformOptions, TransformReport, VerifyItem, VerifyReport,
 };
 use crate::{
-    asr, asset, cloud, docx, export, jy, media, ocr, pipeline, proc, proof, publish, queue, series,
-    subtitle, tools, transform, verify, AppState,
+    ai, asr, asset, cloud, cover, docx, export, jy, media, ocr, pipeline, proc, proof, publish, queue,
+    series, subtitle, tools, transform, verify, AppState,
 };
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -770,21 +771,54 @@ pub async fn transform_segments(
         .collect();
 
     let ffmpeg_task = ffmpeg.clone();
+    // **并行处理。**
+    //
+    // 原来是逐个跑，一部 60 集的剧要跑接近一小时。真实软件的运行日志显示
+    // 它用 4 路并行，28 个文件 7 分钟就跑完 —— 差距主要在并行度，不在编码器。
+    //
+    // 编码仍是 CPU libx264（本来就是）：**消费级显卡的 NVENC 并发槽位有限**
+    // （那边的日志实测「探测并发 3 路」），4 路并行时第 4 路要排队，
+    // 反而退化成串行。
+    let workers = transform::transform_concurrency();
     let results = tauri::async_runtime::spawn_blocking(move || {
-        let mut acc: Vec<(i64, String, i64, String)> = Vec::with_capacity(plan.len());
-        for (id, input, out, opts) in plan {
-            match transform::apply(
-                &ffmpeg_task,
-                Path::new(&input),
-                Path::new(&out),
-                &opts,
-                target,
-            ) {
-                Ok(size) => acc.push((id, out, size, String::new())),
-                Err(e) => acc.push((id, out, 0, e.to_string())),
-            }
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(plan));
+        let acc: std::sync::Arc<std::sync::Mutex<Vec<(i64, String, i64, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let queue = std::sync::Arc::clone(&queue);
+            let acc = std::sync::Arc::clone(&acc);
+            let ff = ffmpeg_task.clone();
+            handles.push(std::thread::spawn(move || loop {
+                // 取一件就放开锁，别攥着它跑 ffmpeg
+                let item = match queue.lock() {
+                    Ok(mut q) => q.pop(),
+                    Err(_) => return,
+                };
+                let Some((id, input, out, opts)) = item else { break };
+                let res = match transform::apply(
+                    &ff,
+                    Path::new(&input),
+                    Path::new(&out),
+                    &opts,
+                    target,
+                ) {
+                    Ok(size) => (id, out, size, String::new()),
+                    Err(e) => (id, out, 0, e.to_string()),
+                };
+                if let Ok(mut a) = acc.lock() {
+                    a.push(res);
+                }
+            }));
         }
-        acc
+        for h in handles {
+            let _ = h.join();
+        }
+        match std::sync::Arc::try_unwrap(acc) {
+            Ok(m) => m.into_inner().unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
     })
     .await
     .map_err(|e| AppError::Msg(format!("画面处理线程异常终止：{e}")))?;
@@ -812,6 +846,31 @@ pub async fn transform_segments(
         }
     }
 
+    // 出片之后过一遍平台规范（≤500MB / ≥720p / ≥4Mbps / ≥30s）。
+    // 这几条是上传被拒的常见原因，早说比传上去被退回来强。
+    let spec_problems = {
+        let ffprobe = lock_tools(&state)?.ffprobe.clone();
+        if Path::new(&ffprobe).is_file() {
+            results
+                .iter()
+                .filter(|(_, _, size, message)| message.is_empty() && *size > 0)
+                .filter_map(|(_, out, _, _)| {
+                    let problems = transform::check_spec(Path::new(&ffprobe), Path::new(out));
+                    if problems.is_empty() {
+                        None
+                    } else {
+                        Some(transform::SpecProblem {
+                            file: out.clone(),
+                            problems,
+                        })
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+
     let conn = lock_db(&state)?;
     Ok(TransformReport {
         total,
@@ -819,6 +878,7 @@ pub async fn transform_segments(
         failed,
         errors,
         segments: db::list_segments(&conn, media_id)?,
+        spec_problems,
     })
 }
 
@@ -837,6 +897,7 @@ pub fn revert_segments(
         failed: 0,
         errors: Vec::new(),
         segments,
+        spec_problems: Vec::new(),
     })
 }
 
@@ -1895,6 +1956,141 @@ pub fn pipeline_cancel(state: tauri::State<'_, AppState>, id: i64) -> AppResult<
     }
     db::set_pipeline_run_status(&conn, id, db::RUN_CANCELED)?;
     Ok(canceled)
+}
+
+// ---------------- AI 服务配置 ----------------
+
+/// 读 AI 服务配置。**API Key 一律打码** —— 真 Key 不出后端。
+#[tauri::command]
+pub fn ai_config(state: tauri::State<'_, AppState>) -> AppResult<AiConfigView> {
+    let conn = lock_db(&state)?;
+    ai::view(&conn)
+}
+
+/// 保存 AI 服务配置。
+///
+/// Key 留空 = 不改动原来的（界面上显示的是打码值，用户没动它就不该覆盖）。
+#[tauri::command]
+pub fn save_ai_config(
+    state: tauri::State<'_, AppState>,
+    providers: Vec<AiProvider>,
+    active: String,
+    usage: AiUsage,
+) -> AppResult<AiConfigView> {
+    ai::validate(&providers, &active)?;
+    let conn = lock_db(&state)?;
+    ai::apply_view(&conn, &providers, &active, &usage)?;
+    ai::view(&conn)
+}
+
+/// 测试某个服务商通不通。
+///
+/// **只做一次廉价的探测请求，不触发任何生成，不产生费用。**
+#[tauri::command]
+pub async fn ai_test(
+    state: tauri::State<'_, AppState>,
+    provider_id: String,
+) -> AppResult<AiTestResult> {
+    let provider = {
+        let conn = lock_db(&state)?;
+        ai::load_providers(&conn)?
+            .into_iter()
+            .find(|p| p.id == provider_id)
+            .ok_or_else(|| AppError::Msg(format!("没有这个服务商：{provider_id}")))?
+    };
+    Ok(ai::test_provider(&provider).await)
+}
+
+/// 把某个服务商的 Base URL / 模型恢复成内置预设。
+///
+/// 用户把字段清空或者填乱了之后，不用去翻文档抄。
+/// **不动 API Key** —— 那不是预设能决定的东西。
+#[tauri::command]
+pub fn ai_reset_preset(
+    state: tauri::State<'_, AppState>,
+    provider_id: String,
+) -> AppResult<AiProviderView> {
+    let conn = lock_db(&state)?;
+    let mut providers = ai::load_providers(&conn)?;
+    let target = providers
+        .iter_mut()
+        .find(|p| p.id == provider_id)
+        .ok_or_else(|| AppError::Msg(format!("没有这个服务商：{provider_id}")))?;
+    ai::apply_preset(target);
+    // 预设里 Base URL 为空的那个（自定义），恢复后保持为空，不编造
+    ai::save_providers(&conn, &providers)?;
+    Ok(ai::view(&conn)?
+        .providers
+        .into_iter()
+        .find(|p| p.id == provider_id)
+        .ok_or_else(|| AppError::Msg("刚保存的服务商不见了".into()))?)
+}
+
+// ---------------- 封面生成 ----------------
+
+/// 生成封面。
+///
+/// 两条路自动选：配好 AI 且开了「封面生成」就走**图生图**（能擦掉原封面
+/// 上的旧剧名）；否则走**本地合成**（用标题条盖住旧字 + 写新剧名）。
+/// 结果里会说明实际用了哪条 —— 别让用户以为一定是 AI 出的。
+#[tauri::command]
+pub async fn render_cover(
+    state: tauri::State<'_, AppState>,
+    req: CoverRequest,
+) -> AppResult<CoverReport> {
+    let (configured, provider, use_ai) = {
+        let conn = lock_db(&state)?;
+        let configured = lock_tools(&state)?.clone();
+        let usage = ai::load_usage(&conn)?;
+        let provider = ai::usable_provider(&conn)?;
+        (configured, provider, usage.cover_generation)
+    };
+    let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+
+    let out = PathBuf::from(req.out_path.trim());
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::Msg(format!("建不了输出目录：{e}")))?;
+    }
+
+    let mut notes: Vec<String> = Vec::new();
+    let engine;
+
+    match (use_ai, provider) {
+        (true, Some(p)) => {
+            let poster = PathBuf::from(req.poster.trim());
+            let bytes =
+                ai::generate_cover_image(&p, &poster, &req.title, req.width, req.height).await?;
+            std::fs::write(&out, &bytes).map_err(|e| AppError::Msg(format!("写封面失败：{e}")))?;
+            engine = "ai".to_string();
+            notes.push(format!("由「{}」的 {} 生成", p.label, p.image_model));
+            // 这一步很重要：AI 生成的封面属于 AI 生成内容，有标识义务
+            notes.push("这是 AI 生成的封面 —— 按《人工智能生成合成内容标识办法》应当标识".into());
+        }
+        (true, None) => {
+            notes.push(
+                "开了「封面生成」但 AI 服务没配全（Key / Base URL / 生图模型缺一个），已退回本地合成"
+                    .into(),
+            );
+            cover::render(&ffmpeg, &req, &out)?;
+            engine = "local".to_string();
+        }
+        (false, _) => {
+            cover::render(&ffmpeg, &req, &out)?;
+            engine = "local".to_string();
+            notes.push("本地合成：用标题条盖住原封面上的旧字，不擦除、不生成".into());
+        }
+    }
+
+    let size_bytes = std::fs::metadata(&out).map(|m| m.len() as i64).unwrap_or(0);
+    Ok(CoverReport {
+        out_path: out.to_string_lossy().to_string(),
+        width: req.width,
+        height: req.height,
+        size_bytes,
+        engine,
+        notes,
+    })
 }
 
 // ---------------- 任务队列 ----------------

@@ -1,5 +1,9 @@
-﻿import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import type {
+  AiConfigView,
+  AiProvider,
+  AiTestResult,
+  AiUsage,
   AppInfo,
   AsrOutcome,
   Asset,
@@ -11,6 +15,8 @@ import type {
   CloudTestResult,
   CloudTranscribeReport,
   CostDocRequest,
+  CoverReport,
+  CoverRequest,
   Cue,
   DiscoveredAsset,
   DocxReport,
@@ -282,4 +288,16 @@ export const api = {
   openInPlayer: (path: string) => call<void>("open_in_player", { path }),
   /** 在资源管理器里定位 */
   revealInExplorer: (path: string) => call<void>("reveal_in_explorer", { path }),
+
+  // AI 服务配置（Key 只存在本机，读回来的是打码值）
+  aiConfig: () => call<AiConfigView>("ai_config"),
+  saveAiConfig: (providers: AiProvider[], active: string, usage: AiUsage) =>
+    call<AiConfigView>("save_ai_config", { providers, active, usage }),
+  /** 只发一次廉价探测，不触发生成、不产生费用 */
+  aiTest: (providerId: string) => call<AiTestResult>("ai_test", { providerId }),
+  /** 把 Base URL / 模型恢复成内置预设；不动 Key */
+  aiResetPreset: (providerId: string) => call<AiProvider>("ai_reset_preset", { providerId }),
+
+  // 封面生成：配好 AI 走图生图，否则本地合成
+  renderCover: (req: CoverRequest) => call<CoverReport>("render_cover", { req }),
 };

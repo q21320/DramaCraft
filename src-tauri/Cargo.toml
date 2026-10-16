@@ -16,7 +16,9 @@ tauri-plugin-fs = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
-reqwest = { version = "0.12", features = ["multipart"] }
+reqwest = { version = "0.12", features = ["multipart", "json"] }
+# 只为了异步 sleep：DashScope 的生图任务是异步的，要轮询任务状态
+tokio = { version = "1", features = ["time"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"

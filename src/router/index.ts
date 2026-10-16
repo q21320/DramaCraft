@@ -22,6 +22,7 @@ const routes: RouteRecordRaw[] = [
   { path: "/proof", name: "proof", component: () => import("@/views/ProofPage.vue") },
   { path: "/asset", name: "asset", component: () => import("@/views/AssetPage.vue") },
   { path: "/settings", name: "settings", component: () => import("@/views/SettingsPage.vue") },
+  { path: "/ai", name: "ai", component: () => import("@/views/AiPage.vue") },
   { path: "/:pathMatch(.*)*", redirect: "/pipeline" },
 ];
 

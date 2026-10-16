@@ -260,9 +260,22 @@ pub fn start_pipeline(
     let mut skipped: Vec<String> = Vec::new();
     let mut queued = 0i64;
     let mut drama_ids: Vec<i64> = Vec::new();
+    // 复用了多少 —— 报给用户看，让他知道这次没有再重复导入
+    let mut reused_projects = 0i64;
+    let mut reused_media = 0i64;
 
     for drama in &scan.dramas {
-        let project = crate::db::create_project(conn, &drama.name, &drama.dir)?;
+        // **复用已有工程，不重复建。**
+        //
+        // 原来每次跑都新建一个，同一批素材被导入好几遍：实测三个工程指向
+        // 同一个源目录，163 条素材里只有 65 个不同文件，产出页面因此错乱。
+        let project = match crate::db::find_project_by_root(conn, &drama.dir)? {
+            Some(existing) => {
+                reused_projects += 1;
+                existing
+            }
+            None => crate::db::create_project(conn, &drama.name, &drama.dir)?,
+        };
         let drama_out = out_root.join(&drama.name);
         let drama_id = crate::db::add_pipeline_drama(
             conn,
@@ -271,6 +284,7 @@ pub fn start_pipeline(
             &drama.dir,
             &drama_out.to_string_lossy(),
             drama.episode_count,
+            Some(project.id),
         )?;
         drama_ids.push(drama_id);
 
@@ -284,6 +298,15 @@ pub fn start_pipeline(
         let mut media_ids: Vec<i64> = Vec::new();
         for episode in &drama.episodes {
             let path = PathBuf::from(&episode.path);
+            // 同一个文件不重复导入：已经有记录就直接用
+            if let Some(existing) =
+                crate::db::find_media_by_path(conn, project.id, &episode.path)?
+            {
+                media_ids.push(existing.id);
+                media_groups.push((existing.id, safe_dir_name(&episode.file_name)));
+                reused_media += 1;
+                continue;
+            }
             let probe = match crate::media::probe(ffprobe, &path) {
                 Ok(p) => p,
                 Err(e) => {
@@ -328,6 +351,8 @@ pub fn start_pipeline(
         imported,
         queued,
         skipped,
+        reused_projects,
+        reused_media,
     })
 }
 
@@ -520,6 +545,92 @@ fn drama_dir_of(root: &Path, file: &Path) -> PathBuf {
     }
 }
 
+/// 文件名是不是"重复下载留下的副本"。
+///
+/// 认两种最常见的形态：
+/// - 结尾的括号序号：`第01集(1).mp4`、`第01集 (2).mp4`
+/// - 副本题字：`第01集 - 副本.mp4`、`第01集 副本.mp4`、`第01集 copy.mp4`
+///
+/// 刻意**不**把 `_1`、`-1` 这类当副本 —— 那可能是合法的分卷命名，
+/// 误判会把正常的集数吃掉。
+fn looks_like_duplicate(file_name: &str) -> bool {
+    let stem = Path::new(file_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_name.to_string());
+    let lowered = stem.to_lowercase();
+
+    // 结尾的 (数字)
+    if lowered.ends_with(')') {
+        if let Some(open) = lowered.rfind('(') {
+            let inner = &lowered[open + 1..lowered.len() - 1];
+            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    // 副本题字
+    for marker in ["副本", "copy", "拷贝"] {
+        if lowered.ends_with(marker) {
+            return true;
+        }
+        // `- 副本` / `_副本` 也常见
+        if lowered.ends_with(&format!("-{marker}")) || lowered.ends_with(&format!("_{marker}")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 同一集号只保留一个，返回被丢掉的文件名。
+///
+/// 保留规则（按优先级）：
+/// 1. **不是副本的优先** —— 正常命名的那个才是"正主"
+/// 2. 体积大的优先 —— 副本可能下了一半
+/// 3. 文件名靠前的优先 —— 保证结果稳定可复现
+///
+/// 只处理**认得出集号**的；认不出集号的一律保留（宁多勿少，
+/// 让用户自己看警告决定）。
+fn drop_duplicate_episodes(episodes: &mut Vec<SourceEpisode>) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let mut best: HashMap<i64, usize> = HashMap::new();
+    let mut drop_at: Vec<usize> = Vec::new();
+
+    for (i, ep) in episodes.iter().enumerate() {
+        let Some(n) = ep.episode else { continue };
+        match best.get(&n) {
+            None => {
+                best.insert(n, i);
+            }
+            Some(&keep) => {
+                let keep_ep = &episodes[keep];
+                let challenger_is_copy = looks_like_duplicate(&ep.file_name);
+                let keeper_is_copy = looks_like_duplicate(&keep_ep.file_name);
+                let challenger_wins = match (keeper_is_copy, challenger_is_copy) {
+                    (true, false) => true,   // 正主换上来
+                    (false, true) => false,  // 副本别想上位
+                    _ => ep.size_bytes > keep_ep.size_bytes,
+                };
+                if challenger_wins {
+                    drop_at.push(keep);
+                    best.insert(n, i);
+                } else {
+                    drop_at.push(i);
+                }
+            }
+        }
+    }
+
+    drop_at.sort_unstable();
+    let mut ignored: Vec<String> = Vec::new();
+    for i in drop_at.into_iter().rev() {
+        ignored.push(episodes.remove(i).file_name);
+    }
+    ignored.reverse();
+    ignored
+}
+
 fn build_drama(dir: &Path, videos: &[PathBuf]) -> AppResult<SourceDrama> {
     let mut warnings: Vec<String> = Vec::new();
 
@@ -579,6 +690,26 @@ fn build_drama(dir: &Path, videos: &[PathBuf]) -> AppResult<SourceDrama> {
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => a.file_name.cmp(&b.file_name),
     });
+
+    // 同一集号出现多个文件时只留一个。
+    //
+    // 素材包里这种情况很常见：同一个文件下过两次，系统自动加上 `(1)`、
+    // `- 副本` 之类的后缀。它们**时长和字节数完全一样**，是同一份内容。
+    // 不处理的话，一部 61 集的剧会被当成 65 集（实测就是这个数）。
+    let ignored = drop_duplicate_episodes(&mut episodes);
+    if !ignored.is_empty() {
+        let shown: Vec<String> = ignored.iter().take(5).cloned().collect();
+        let more = if ignored.len() > shown.len() {
+            format!(" 等 {} 个", ignored.len())
+        } else {
+            String::new()
+        };
+        warnings.push(format!(
+            "忽略了 {} 个重复副本：{}{more}。同一集只保留一个。",
+            ignored.len(),
+            shown.join("、")
+        ));
+    }
 
     let unnamed = episodes.iter().filter(|e| e.episode.is_none()).count();
     if unnamed > 0 && unnamed == episodes.len() && episodes.len() > 1 {
@@ -1053,6 +1184,148 @@ mod tests {
     }
 
     #[test]
+    fn running_twice_does_not_duplicate_projects_or_media() {
+        // 实测踩到的：每次跑流水线都新建工程、重新导入素材，
+        // 结果三个工程指向同一个源目录，163 条素材里只有 65 个不同文件，
+        // 产出页面因此错乱（同一集出现两三次，有的有字幕有的没有）。
+        let (Some(ffmpeg), Some(ffprobe)) = (
+            env_path("DRAMADIST_TEST_FFMPEG"),
+            env_path("DRAMADIST_TEST_FFPROBE"),
+        ) else {
+            eprintln!("跳过：需要 DRAMADIST_TEST_FFMPEG 与 DRAMADIST_TEST_FFPROBE");
+            return;
+        };
+
+        let t = TempTree::new("rerun");
+        make_video(&ffmpeg, &t.path().join("剧/第01集.mp4"), 2);
+        make_video(&ffmpeg, &t.path().join("剧/第02集.mp4"), 2);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate_for_tests(&conn).unwrap();
+        let out = t.path().join("二创");
+        let stages = vec!["slice".to_string()];
+
+        let first = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None)
+            .expect("第一次跑失败");
+        assert_eq!(first.imported, 2);
+        assert_eq!(first.reused_projects, 0);
+        assert_eq!(first.reused_media, 0);
+
+        let second = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None)
+            .expect("第二次跑失败");
+
+        // 第二次一条都不该新建
+        assert_eq!(second.imported, 0, "第二次不该再导入素材");
+        assert_eq!(second.reused_projects, 1, "应当复用已有工程");
+        assert_eq!(second.reused_media, 2, "两集都该复用已有素材");
+        assert_eq!(second.queued, 2, "任务还是要照排 —— 复用素材不等于跳过这一步");
+
+        // 库里的实际行数才是最终判据
+        assert_eq!(crate::db::list_projects(&conn).unwrap().len(), 1, "只能有一个工程");
+        let media = crate::db::list_media(&conn, 1).unwrap();
+        assert_eq!(media.len(), 2, "只能有两条素材，不能重复导入");
+    }
+
+    #[test]
+    fn dropped_copies_never_reach_the_pipeline() {
+        let (Some(ffmpeg), Some(ffprobe)) = (
+            env_path("DRAMADIST_TEST_FFMPEG"),
+            env_path("DRAMADIST_TEST_FFPROBE"),
+        ) else {
+            eprintln!("跳过：需要 ffmpeg / ffprobe");
+            return;
+        };
+        let t = TempTree::new("dup_pipeline");
+        make_video(&ffmpeg, &t.path().join("剧").join("剧-第01集.mp4"), 2);
+        // 同名副本：内容一样，不该被当成第二集
+        std::fs::copy(
+            t.path().join("剧").join("剧-第01集.mp4"),
+            t.path().join("剧").join("剧-第01集(1).mp4"),
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate_for_tests(&conn).unwrap();
+        let outcome = start_pipeline(
+            &conn,
+            &ffprobe,
+            t.path(),
+            &t.path().join("out"),
+            &["slice".to_string()],
+            10_000,
+            "",
+            None,
+        )
+        .expect("起流水线失败");
+
+        assert_eq!(outcome.imported, 1, "副本不该被导入");
+        assert_eq!(outcome.queued, 1);
+    }
+
+    #[test]
+    fn outputs_never_leak_across_runs() {
+        // 实测踩到的：靠 src_dir 关联工程时，一次查询把几次运行的数据全捞出来
+        // （163 行里只有 65 个不同文件，界面同一集出现两三次）。
+        // v9 起按 project_id 精确查，这条测试把它锁住。
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate_for_tests(&conn).unwrap();
+        let src = "D:/某剧";
+
+        // 造出"同一个源目录被跑过两次、各建了一个工程"的现场
+        let run_a = crate::db::create_pipeline_run(&conn, src, "D:/out", &["slice".into()]).unwrap();
+        let proj_a = crate::db::create_project(&conn, "某剧", src).unwrap();
+        let drama_a = crate::db::add_pipeline_drama(
+            &conn, run_a, "某剧", src, "D:/out/某剧", 2, Some(proj_a.id),
+        )
+        .unwrap();
+
+        let run_b = crate::db::create_pipeline_run(&conn, src, "D:/out", &["slice".into()]).unwrap();
+        let proj_b = crate::db::create_project(&conn, "某剧", src).unwrap();
+        let _drama_b = crate::db::add_pipeline_drama(
+            &conn, run_b, "某剧", src, "D:/out/某剧", 3, Some(proj_b.id),
+        )
+        .unwrap();
+
+        let probe = crate::models::MediaProbe {
+            duration_ms: 1000,
+            width: 720,
+            height: 1280,
+            has_audio: true,
+            size_bytes: 10,
+            format_name: "mp4".into(),
+        };
+        for n in 1..=2 {
+            crate::db::add_media(
+                &conn,
+                proj_a.id,
+                &format!("{src}/第0{n}集.mp4"),
+                &format!("第0{n}集.mp4"),
+                &probe,
+            )
+            .unwrap();
+        }
+        for n in 1..=3 {
+            crate::db::add_media(
+                &conn,
+                proj_b.id,
+                &format!("{src}/第0{n}集.mp4"),
+                &format!("第0{n}集.mp4"),
+                &probe,
+            )
+            .unwrap();
+        }
+
+        // A 这次只该看见自己的 2 集，绝不能把 B 的 3 集也算进来
+        let a = crate::db::run_outputs(&conn, run_a).unwrap();
+        assert_eq!(a.len(), 2, "run A 应当只有 2 集，实际 {}", a.len());
+        let b = crate::db::run_outputs(&conn, run_b).unwrap();
+        assert_eq!(b.len(), 3, "run B 应当只有 3 集，实际 {}", b.len());
+
+        // drama_id 用一下，免得被当成未使用变量
+        assert!(drama_a > 0);
+    }
+
+    #[test]
     fn every_stage_payload_actually_parses() {
         // 这条测试是为了防住一类坑：payload 的**字段名或枚举变体写错**，
         // 编译期查不出来，入队也不报，要跑到那个任务才炸。
@@ -1128,6 +1401,73 @@ mod tests {
         assert_eq!(outcome.queued, 1);
         assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
         assert!(outcome.skipped[0].contains("第02集"), "{:?}", outcome.skipped);
+    }
+
+    #[test]
+    fn duplicate_download_copies_are_merged_into_one_episode() {
+        // 真实素材上撞到的：同一集下过两次，系统加了 (1) 后缀，
+        // 结果一部 61 集的剧被当成 65 集。
+        let t = TempTree::new("dup_episodes");
+        const DRAMA: &str = "某剧";
+        for n in 1..=3 {
+            t.file(&format!("{DRAMA}/某剧-第{n:02}集.mp4"), b"x");
+        }
+        // 第 1~2 集各多一个 (1) 副本
+        t.file(&format!("{DRAMA}/某剧-第01集(1).mp4"), b"x");
+        t.file(&format!("{DRAMA}/某剧-第02集(1).mp4"), b"x");
+        // 第 3 集多一个"副本"
+        t.file(&format!("{DRAMA}/某剧-第03集 - 副本.mp4"), b"x");
+
+        let scan = scan_source(t.path()).unwrap();
+        let d = &scan.dramas[0];
+        assert_eq!(d.episode_count, 3, "三集就该是三集，副本不算");
+        let names: Vec<&str> = d.episodes.iter().map(|e| e.file_name.as_str()).collect();
+        assert!(names.contains(&"某剧-第01集.mp4"), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("(1)")), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("副本")), "{names:?}");
+        // 要如实告诉用户忽略了什么，不能悄悄咽掉
+        assert!(
+            d.warnings.iter().any(|w| w.contains("重复副本")),
+            "{:?}",
+            d.warnings
+        );
+    }
+
+    #[test]
+    fn the_normally_named_file_wins_even_if_the_copy_is_bigger() {
+        let t = TempTree::new("dup_bigger");
+        t.file("某剧/某剧-第01集.mp4", b"small");
+        t.file("某剧/某剧-第01集(1).mp4", b"this one is much bigger");
+        let scan = scan_source(t.path()).unwrap();
+        let d = &scan.dramas[0];
+        assert_eq!(d.episode_count, 1);
+        assert_eq!(d.episodes[0].file_name, "某剧-第01集.mp4");
+    }
+
+    #[test]
+    fn underscored_suffixes_are_not_treated_as_copies() {
+        // `_1`、`-1` 可能是合法的分卷命名，误判会把正常集数吃掉
+        assert!(!looks_like_duplicate("某剧-第01集_1.mp4"));
+        assert!(!looks_like_duplicate("某剧-第01集-1.mp4"));
+        assert!(!looks_like_duplicate("某剧-第01集.mp4"));
+        // 但这些是
+        assert!(looks_like_duplicate("某剧-第01集(1).mp4"));
+        assert!(looks_like_duplicate("某剧-第01集 (12).mp4"));
+        assert!(looks_like_duplicate("某剧-第01集 - 副本.mp4"));
+        assert!(looks_like_duplicate("某剧-第01集 copy.mp4"));
+        assert!(looks_like_duplicate("某剧-第01集(2).MP4"));
+        // 括号里不是纯数字的不算
+        assert!(!looks_like_duplicate("某剧-第01集(高清).mp4"));
+    }
+
+    #[test]
+    fn unnumbered_files_are_never_dropped() {
+        // 认不出集号的一律保留 —— 宁多勿少，让用户看警告自己决定
+        let t = TempTree::new("dup_unnumbered");
+        t.file("某剧/甲(1).mp4", b"a");
+        t.file("某剧/甲.mp4", b"b");
+        let scan = scan_source(t.path()).unwrap();
+        assert_eq!(scan.dramas[0].episode_count, 2);
     }
 
     #[test]

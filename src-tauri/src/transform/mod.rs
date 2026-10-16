@@ -9,6 +9,7 @@
 //! 3. 每个片段只重编码一次，临时文件 + 原子重命名。
 
 use crate::error::{AppError, AppResult};
+use serde::{Deserialize, Serialize};
 use crate::models::{HeaderLabel, LabelPosition, TransformOptions};
 use crate::proc::{no_window, tail};
 use std::path::{Path, PathBuf};
@@ -113,7 +114,7 @@ pub fn find_cjk_font() -> Option<PathBuf> {
 /// ffmpeg 要过**两层**解析：滤镜描述层先吃掉一次转义，选项层再吃一次。
 /// 所以 Windows 路径里的 `C:` 必须写成 `C\\:`（两个反斜杠）——
 /// 少一个就会变成「选项名附近没有名字」那种报错。这是实测出来的，不是猜的。
-fn escape_filter_path(path: &Path) -> String {
+pub(crate) fn escape_filter_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").replace(':', r"\\:")
 }
 
@@ -122,7 +123,7 @@ fn escape_filter_path(path: &Path) -> String {
 /// 同样要过两层。这里只用**安全字符**：中文、字母、数字、空格和常见标点。
 /// 其余（引号、反斜杠、冒号、百分号、方括号、逗号）一律换成空格 ——
 /// 与其猜转义规则猜错，不如不让它们进去。标识本来就该是短标签。
-fn sanitize_label_text(text: &str) -> String {
+pub(crate) fn sanitize_label_text(text: &str) -> String {
     let cleaned: String = text
         .chars()
         .map(|c| {
@@ -138,7 +139,7 @@ fn sanitize_label_text(text: &str) -> String {
 }
 
 /// 标识字号 = 画面高度 × 比例，夹到一个合理区间。
-fn label_font_size(height: i64, ratio: f64) -> i64 {
+pub(crate) fn label_font_size(height: i64, ratio: f64) -> i64 {
     let r = if ratio.is_finite() {
         ratio.clamp(0.015, 0.09)
     } else {
@@ -479,6 +480,128 @@ pub fn processed_path(original: &Path) -> PathBuf {
     dir.join(format!("{stem}_t.{ext}"))
 }
 
+// ---------------- 平台输出规范 ----------------
+
+/// 发布前的硬门槛。照着真实软件日志里那句「输出已通过校验：
+/// ≤500MB、720p、≥4Mbps、≥30s」定的 —— 这几条是平台上传的常见拒收原因。
+pub const MAX_BYTES: i64 = 500 * 1024 * 1024;
+pub const MIN_HEIGHT: i64 = 720;
+pub const MIN_BITRATE_BPS: i64 = 4_000_000;
+pub const MIN_DURATION_MS: i64 = 30_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecProblem {
+    pub file: String,
+    pub problems: Vec<String>,
+}
+
+/// 检查一个成片是否满足平台上传规范。
+///
+/// **只报不改**：这些是提示，不是失败。短片（比如 10 秒分镜）本来就不满足
+/// 时长要求，那是正常的 —— 硬失败会把正常流程卡死。
+pub fn check_spec(ffprobe: &Path, file: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    let size = std::fs::metadata(file).map(|m| m.len() as i64).unwrap_or(0);
+    if size == 0 {
+        problems.push("文件不存在或是空的".to_string());
+        return problems;
+    }
+    if size > MAX_BYTES {
+        problems.push(format!("体积 {:.0} MB 超过 500 MB", size as f64 / 1048576.0));
+    }
+
+    let output = match no_window(
+        Command::new(ffprobe).args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,bit_rate",
+            "-show_entries",
+            "format=duration,bit_rate",
+            "-of",
+            "json",
+        ]),
+    )
+    .arg(file)
+    .output()
+    {
+        Ok(o) => o,
+        Err(_) => {
+            problems.push("探测不了这个文件".to_string());
+            return problems;
+        }
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        problems.push("探测结果读不出来".to_string());
+        return problems;
+    };
+
+    let height = v
+        .pointer("/streams/0/height")
+        .and_then(|h| h.as_i64())
+        .unwrap_or(0);
+    if height > 0 && height < MIN_HEIGHT {
+        problems.push(format!("分辨率 {height}p 低于 720p"));
+    }
+
+    // 码率优先取流上的，没有就用格式上的；都没有就用 体积/时长 算
+    let duration_s = v
+        .pointer("/format/duration")
+        .and_then(|d| d.as_str())
+        .and_then(|d| d.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let stream_rate = v
+        .pointer("/streams/0/bit_rate")
+        .and_then(|b| b.as_str())
+        .and_then(|b| b.parse::<i64>().ok())
+        .unwrap_or(0);
+    let format_rate = v
+        .pointer("/format/bit_rate")
+        .and_then(|b| b.as_str())
+        .and_then(|b| b.parse::<i64>().ok())
+        .unwrap_or(0);
+    let bitrate = if stream_rate > 0 {
+        stream_rate
+    } else if format_rate > 0 {
+        format_rate
+    } else if duration_s > 0.0 {
+        (size as f64 * 8.0 / duration_s) as i64
+    } else {
+        0
+    };
+    if bitrate > 0 && bitrate < MIN_BITRATE_BPS {
+        problems.push(format!("码率 {:.1} Mbps 低于 4 Mbps", bitrate as f64 / 1_000_000.0));
+    }
+
+    if duration_s > 0.0 && (duration_s * 1000.0) < MIN_DURATION_MS as f64 {
+        problems.push(format!("时长 {duration_s:.1}s 短于 30s"));
+    }
+
+    problems
+}
+
+// ---------------- 并行度 ----------------
+
+/// 画面处理同时跑几路。
+///
+/// 依据来自真实软件的运行日志：它用 **4 路并行**，28 个文件 7 分钟跑完；
+/// 同样的活串行要接近半小时。差距主要不在编码器，在并行度。
+///
+/// 也不能开太大：每路 ffmpeg 的滤镜链会吃掉 2~3 个核
+/// （scale / eq / noise 都是逐像素运算），开超过核数只会互相抢。
+pub fn transform_concurrency() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // 每路按 3 个核算，夹在 1~4 路之间
+    (cores / 3).clamp(1, 4)
+}
+
 /// 对单个文件应用处理。返回产出文件大小。
 ///
 /// `target` 为源画面宽高（通常来自素材探测结果），传了就做精确缩放。
@@ -589,6 +712,64 @@ mod tests {
     ///
     /// 真实素材上炸过：那部片子带硬字幕，镜像之后画面里的字全反了，
     /// 一半的切片直接废掉。镜像是不可挽回的，只能由用户显式要求。
+    #[test]
+    fn spec_check_flags_low_resolution_and_short_duration() {
+        let (Some(ffmpeg), Some(ffprobe)) = (
+            std::env::var("DRAMADIST_TEST_FFMPEG")
+                .ok()
+                .map(PathBuf::from)
+                .filter(|p| p.is_file()),
+            std::env::var("DRAMADIST_TEST_FFPROBE")
+                .ok()
+                .map(PathBuf::from)
+                .filter(|p| p.is_file()),
+        ) else {
+            eprintln!("跳过：需要 ffmpeg / ffprobe");
+            return;
+        };
+
+        let dir = std::env::temp_dir().join("dramadist_spec_check");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 360p、4 秒、码率极低 —— 三条都不达标
+        let small = dir.join("small.mp4");
+        let st = crate::proc::no_window(
+            Command::new(&ffmpeg).args([
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=640x360:rate=15",
+                "-t", "4", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40",
+                "-pix_fmt", "yuv420p",
+            ]),
+        )
+        .arg(&small)
+        .status()
+        .expect("生成测试视频失败");
+        assert!(st.success());
+
+        let problems = check_spec(&ffprobe, &small);
+        assert!(
+            problems.iter().any(|p| p.contains("720p")),
+            "应当报分辨率低：{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("短于 30s")),
+            "应当报时长不足：{problems:?}"
+        );
+
+        // 不存在文件要如实报，而不是崩
+        let missing = check_spec(&ffprobe, &dir.join("nope.mp4"));
+        assert!(missing.iter().any(|p| p.contains("不存在")), "{missing:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrency_is_bounded_and_reasonable() {
+        let n = transform_concurrency();
+        assert!((1..=4).contains(&n), "并行度应当在 1~4 之间，实际 {n}");
+    }
+
     #[test]
     fn generated_presets_never_mirror() {
         for level in [Intensity::Light, Intensity::Medium, Intensity::Strong] {

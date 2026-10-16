@@ -1,4 +1,4 @@
-﻿export interface Project {
+export interface Project {
   id: number;
   name: string;
   rootDir: string;
@@ -178,6 +178,72 @@ export interface HeaderLabel {
   position: LabelPosition;
   /** 字号 = 画面高度 × 这个比例 */
   sizeRatio: number;
+}
+
+// ---------------- AI 服务配置 ----------------
+
+/** 一个 AI 服务商。Key 只存在本机，这里没有真 Key。 */
+export interface AiProvider {
+  /** ark / dashscope / custom */
+  id: string;
+  label: string;
+  enabled: boolean;
+  baseUrl: string;
+  /** 语言模型：改写剧名 / 简介用 */
+  textModel: string;
+  /** 生图模型：封面生成用 */
+  imageModel: string;
+  /** 提交时：空串 = 不改动后端已存的 Key */
+  apiKey: string;
+  /** 后端返回：有没有存过 Key */
+  hasKey?: boolean;
+  /** 后端返回：打码后的 Key，例如 ark-****9f2c */
+  keyHint?: string;
+}
+
+/** 哪些功能走 AI。默认全关。 */
+export interface AiUsage {
+  coverGeneration: boolean;
+  titleRewrite: boolean;
+  subtitleCloud: boolean;
+}
+
+export interface AiConfigView {
+  providers: AiProvider[];
+  /** 当前启用哪一个；空串表示都没启用 */
+  active: string;
+  usage: AiUsage;
+  warnings: string[];
+}
+
+export interface AiTestResult {
+  ok: boolean;
+  provider: string;
+  endpoint: string;
+  elapsedMs: number;
+  message: string;
+}
+
+// ---------------- 封面生成 ----------------
+
+export interface CoverRequest {
+  poster: string;
+  title: string;
+  outPath: string;
+  width: number;
+  height: number;
+  position: LabelPosition;
+  outRoot?: string;
+}
+
+export interface CoverReport {
+  outPath: string;
+  width: number;
+  height: number;
+  sizeBytes: number;
+  /** ai 或 local */
+  engine: string;
+  notes: string[];
 }
 
 // ---------------- 用户自备素材库 ----------------

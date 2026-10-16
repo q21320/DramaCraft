@@ -186,6 +186,10 @@ pub struct TransformReport {
     pub failed: i64,
     pub errors: Vec<String>,
     pub segments: Vec<Segment>,
+    /// 成片没达到平台上传规范的地方（≤500MB / ≥720p / ≥4Mbps / ≥30s）。
+    /// **只是提示**：短片（比如 10 秒分镜）本来就不满足时长要求。
+    #[serde(default)]
+    pub spec_problems: Vec<crate::transform::SpecProblem>,
 }
 
 // ---------------- 发布 ----------------
@@ -372,6 +376,10 @@ pub struct StartOutcome {
     pub queued: i64,
     /// 读不出来、被跳过的文件及原因
     pub skipped: Vec<String>,
+    /// 复用了几个已有工程（不是新建的）
+    pub reused_projects: i64,
+    /// 复用了多少条已有素材（没有重复导入）
+    pub reused_media: i64,
 }
 
 /// 一部剧在流水线里的进度
@@ -390,6 +398,9 @@ pub struct PipelineDrama {
     pub status: String,
     pub message: String,
     pub updated_at: String,
+    /// 本次运行用的是哪个工程（v9 起记录；老记录为 null）
+    #[serde(default)]
+    pub project_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,6 +416,122 @@ pub struct PipelineRun {
     pub created_at: String,
     pub updated_at: String,
     pub dramas: Vec<PipelineDrama>,
+}
+
+/// 封面生成请求。
+///
+/// 两条路：配了 AI 服务就走**图生图**（能擦掉原封面上的旧剧名），
+/// 没配就**本地合成**（用标题条把旧字盖住 + 写新剧名）。
+/// 后者离线可用、不产生 AI 内容，代价是盖住的那块画面损失一点。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverRequest {
+    /// 原封面（素材包里的 poster.jpg）
+    pub poster: String,
+    /// 新剧名
+    pub title: String,
+    pub out_path: String,
+    pub width: i64,
+    pub height: i64,
+    /// 标题条位置
+    pub position: LabelPosition,
+    /// 批量生成时按剧名分目录用；单张可以留空
+    #[serde(default)]
+    pub out_root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverReport {
+    pub out_path: String,
+    pub width: i64,
+    pub height: i64,
+    pub size_bytes: i64,
+    /// `ai` 或 `local`
+    pub engine: String,
+    pub notes: Vec<String>,
+}
+
+// ---------------- AI 服务配置 ----------------
+
+/// 一个 AI 服务商。Key 只存在本地设置里，发给前端时一律打码。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProvider {
+    /// `ark` / `dashscope` / `custom`
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+    pub base_url: String,
+    /// 语言模型（改写剧名简介、生成文案用）
+    pub text_model: String,
+    /// 生图模型（封面生成用）
+    pub image_model: String,
+    /// API Key。**不发给前端**，只发 keyHint。
+    #[serde(default)]
+    pub api_key: String,
+}
+
+/// 给界面看的服务商（Key 已打码）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProviderView {
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+    pub base_url: String,
+    pub text_model: String,
+    pub image_model: String,
+    pub has_key: bool,
+    /// 例如 `ark-****9f2c`
+    pub key_hint: String,
+}
+
+/// 哪些功能走 AI。
+///
+/// 刻意做成显式开关而不是"配了 Key 就自动用"：
+/// 用 AI 会产生费用、产出属于 AI 生成内容（有标识义务），
+/// 这两件事都该由用户点头。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiUsage {
+    /// 封面生成（图生图）
+    pub cover_generation: bool,
+    /// 剧名 / 简介改写
+    pub title_rewrite: bool,
+    /// 云端字幕识别
+    pub subtitle_cloud: bool,
+}
+
+impl Default for AiUsage {
+    fn default() -> Self {
+        Self {
+            cover_generation: false,
+            title_rewrite: false,
+            subtitle_cloud: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiConfigView {
+    pub providers: Vec<AiProviderView>,
+    /// 当前启用哪一个；空串表示都没启用
+    pub active: String,
+    pub usage: AiUsage,
+    /// 配置上值得提醒的地方
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiTestResult {
+    pub ok: bool,
+    pub provider: String,
+    pub endpoint: String,
+    pub elapsed_ms: i64,
+    pub message: String,
 }
 
 // ---------------- 用户自备素材库 ----------------
