@@ -227,6 +227,26 @@ pub fn open(path: &Path) -> AppResult<Connection> {
     Ok(conn)
 }
 
+/// 确保某一列存在。**不靠 `user_version` 判断。**
+///
+/// 为什么不能只靠版本号：版本号可能被「只改了版本号、没写迁移」的构建
+/// 错误地推上去 —— 一旦推上去，那个 ALTER 就**永远不会再跑**，
+/// 而库表面上还是"最新版"。真实踩过：`user_version = 12` 但
+/// `run_log.artifact` 根本没加上，界面直接报列不存在。
+///
+/// 直接查表结构最可靠，而且天然幂等：有就跳过，没有就加。
+fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> AppResult<()> {
+    let exists = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|c| c == column);
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))?;
+    }
+    Ok(())
+}
+
 fn migrate(conn: &Connection) -> AppResult<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 1 {
@@ -265,6 +285,25 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     if version < 12 {
         conn.execute_batch(SCHEMA_V12)?;
     }
+    // **兜底：按实际表结构补齐关键列。**
+    //
+    // 上面的版本分支只在版本号正确时才跑到。一旦版本号被错误地推高
+    // （比如某个中间构建只改了 SCHEMA_VERSION、忘了写迁移），
+    // 那段 ALTER 就永远不会执行，而库看起来还是最新的。
+    // 这两句和版本号无关，每次启动都核对一遍 —— 幂等，代价可忽略。
+    ensure_column(
+        conn,
+        "media",
+        "processed_path",
+        "processed_path TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "run_log",
+        "artifact",
+        "artifact TEXT NOT NULL DEFAULT ''",
+    )?;
+
     if version < SCHEMA_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     }
@@ -2493,6 +2532,57 @@ mod tests {
 
         assert_eq!(prune_missing_media(&conn, project.id).unwrap(), 0, "有任务在跑就别动它");
         assert!(get_media(&conn, m.id).is_ok());
+    }
+
+    /// **版本号被错误推高时，该补的列还是要补上。**
+    ///
+    /// 真实踩过：应用曾用一个「只改了 SCHEMA_VERSION、忘了写迁移分支」的
+    /// 中间构建启动过 —— 版本号推到 12，但 `run_log.artifact` 根本没加。
+    /// 之后再怎么正确构建，`if version < 12` 都进不去，那个 ALTER
+    /// **永远不会执行**，而库看起来还是最新的。
+    ///
+    /// 所以 `ensure_column` 不靠版本号，直接查表结构 —— 幂等，每次启动核对。
+    #[test]
+    fn missing_columns_are_repaired_even_if_the_version_looks_current() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        // 造出那个坏现场：**schema 停在 v11，但版本号被推到了最新**。
+        // 按真实顺序把 V1~V11 全跑一遍 —— 少跑任何一段，
+        // 后面的 SCHEMA 会因为依赖的表不存在而失败。
+        for schema in [
+            SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+            SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
+        ] {
+            conn.execute_batch(schema).unwrap();
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+            .unwrap();
+
+        // 确认现场：run_log 在，但没有 artifact
+        let before: Vec<String> = conn
+            .prepare("PRAGMA table_info(run_log)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(before.contains(&"message".to_string()), "run_log 该在");
+        assert!(!before.contains(&"artifact".to_string()), "这时候还没这列");
+
+        // 版本号说"已经是最新"，但 migrate 仍然要把列补上
+        migrate(&conn).unwrap();
+
+        let after: Vec<String> = conn
+            .prepare("PRAGMA table_info(run_log)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(after.contains(&"artifact".to_string()), "列必须被补上：{after:?}");
+
+        // 再跑一次不能出错（幂等）
+        migrate(&conn).unwrap();
     }
 
     /// 日志行能带上「这一行对应哪个产出文件」。
