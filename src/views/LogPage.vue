@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 /**
  * 运行日志页。
  *
@@ -17,7 +17,6 @@ import {
   NButton,
   NCheckbox,
   NModal,
-  NSelect,
   NSpace,
   NTag,
   useMessage,
@@ -34,7 +33,8 @@ const tab = ref<"log" | "output">("log");
 // ---- 日志 ----
 const logs = ref<RunLog[]>([]);
 const runs = ref<PipelineRun[]>([]);
-const pickedRun = ref<number | null>(null);
+/** 当前在看哪次运行 —— 自动跟最新那次，用户不用选 */
+let latestRunId: number | null = null;
 const follow = ref(true);
 const autoScroll = ref(true);
 const boxRef = ref<HTMLElement | null>(null);
@@ -46,14 +46,6 @@ const playing = ref<{ path: string; title: string; cues: string[] } | null>(null
 
 const busy = computed(() => runs.value.some((r) => r.status === "running"));
 const totalSlices = computed(() => outputs.value.reduce((n, e) => n + e.slices.length, 0));
-
-const runOptions = computed(() => [
-  { label: "全部运行", value: 0 },
-  ...runs.value.map((r) => ({
-    label: `#${r.id} ${r.status === "done" ? "已完成" : r.status === "running" ? "运行中" : r.status} · ${r.dramaCount} 部`,
-    value: r.id,
-  })),
-]);
 
 const levelType: Record<string, "default" | "success" | "warning" | "error"> = {
   info: "default",
@@ -107,7 +99,7 @@ async function pullLogs(reset = false) {
   if (pulling) return;
   pulling = true;
   try {
-    const rid = pickedRun.value === 0 ? null : pickedRun.value;
+    const rid = latestRunId;
     if (reset) {
       logs.value = [];
     }
@@ -149,16 +141,31 @@ function triggerPull() {
   }, 300);
 }
 
+/**
+ * 刷新运行列表，并**自动跟到最新那次**。
+ *
+ * 页面不再给「选哪次运行」的下拉 —— 用户说「我只看日志就好了」。
+ * 少一个选择就少一处要解释的东西，而实际要看的永远是**当前这一次**。
+ *
+ * 新的一次运行开始时，日志视图跟着切过去（不然新日志混在旧记录里看不出来）。
+ */
 async function refreshRuns() {
   try {
-    runs.value = await api.pipelineList(20);
+    const list = await api.pipelineList(20);
+    runs.value = list;
+    const latest = list[0]?.id ?? null;
+    if (latest !== latestRunId) {
+      latestRunId = latest;
+      if (tab.value === "log") void pullLogs(true);
+      if (tab.value === "output") void loadOutputs();
+    }
   } catch {
     /* 日志页不因为这个弹错 */
   }
 }
 
 async function loadOutputs() {
-  const rid = pickedRun.value === 0 ? (runs.value[0]?.id ?? null) : pickedRun.value;
+  const rid = latestRunId;
   if (rid === null) {
     outputs.value = [];
     return;
@@ -220,11 +227,6 @@ function stopPolling() {
   }
 }
 
-watch(pickedRun, () => {
-  void pullLogs(true);
-  void loadOutputs();
-});
-
 watch(busy, () => startPolling());
 watch(tab, (v) => {
   if (v === "output") void loadOutputs();
@@ -254,14 +256,11 @@ onUnmounted(() => {
       <n-space :size="10" align="center">
         <span v-if="busy" class="dd-live"><span class="dd-dot" />正在跑</span>
         <span v-else class="dd-muted">空闲</span>
-        <n-select
-          v-model:value="pickedRun"
-          size="small"
-          style="width: 190px"
-          :options="runOptions"
-          placeholder="全部运行"
-        />
-        <n-button size="small" @click="clearAll">清空</n-button>
+        <!--
+          不再给「选哪次运行」的下拉 —— 用户说「我只看日志就好了」。
+          实际要看的永远是**当前这一次**，自动跟过去就行。
+        -->
+        <n-button size="small" @click="clearAll">清空日志</n-button>
       </n-space>
     </div>
     <div class="dd-card-desc">
