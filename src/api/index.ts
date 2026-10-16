@@ -309,6 +309,8 @@ export const api = {
   listLogs: (runId: number | null, afterId: number, limit?: number) =>
     call<RunLog[]>("list_logs", { runId, afterId, limit: limit ?? 800 }),
   clearLogs: () => call<number>("clear_logs"),
+  /** 清空运行记录。**只清记录，磁盘上的产出不动**；正在跑的那次也保留。 */
+  clearPipelineRuns: () => call<number>("clear_pipeline_runs"),
 
   // AI 服务配置（Key 只存在本机，读回来的是打码值）
   aiConfig: () => call<AiConfigView>("ai_config"),

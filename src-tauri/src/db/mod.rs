@@ -1165,6 +1165,54 @@ pub fn prune_missing_media(conn: &Connection, project_id: i64) -> AppResult<i64>
     Ok(removed)
 }
 
+/// 清空运行记录。返回删掉了几次运行。
+///
+/// **两条边界，都是刻意的：**
+///
+/// 1. **正在跑的那次不删** —— 删了队列里的任务就找不到归属，
+///    日志也断了，界面会显示成一次凭空的运行。
+/// 2. **只清记录，不动磁盘上的产出** —— 跑出来的视频是用户的东西，
+///    他只是想清理界面上的历史，不是想删文件。这两件事必须分开。
+///
+/// 连带清掉这些运行的剧目行、任务和日志（那些是纯记录，留着没意义）。
+/// 素材（media）**不动** —— 它属于工程，不属于某次运行。
+pub fn clear_pipeline_runs(conn: &Connection) -> AppResult<i64> {
+    // 哪些运行可以删？
+    //
+    // 1. 状态不是 running 的 —— 明确结束了
+    // 2. **状态是 running、但一个待跑/在跑的任务都没有的** ——
+    //    这是被中断后卡住的那种（应用被杀、队列停了）。不加这条判据的话，
+    //    它会永远显示"运行中"，用户永远清不掉。
+    let run_ids: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM pipeline_run r
+              WHERE r.status != 'running'
+                 OR NOT EXISTS (
+                       SELECT 1 FROM job j
+                        JOIN pipeline_drama d ON d.id = j.pipeline_drama_id
+                       WHERE d.run_id = r.id AND j.status IN ('pending','running')
+                    )",
+        )?;
+        let r = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        r
+    };
+
+    for run_id in &run_ids {
+        conn.execute(
+            "DELETE FROM job WHERE pipeline_drama_id IN
+                (SELECT id FROM pipeline_drama WHERE run_id = ?1)",
+            params![run_id],
+        )?;
+        conn.execute("DELETE FROM pipeline_drama WHERE run_id = ?1", params![run_id])?;
+        conn.execute("DELETE FROM run_log WHERE run_id = ?1", params![run_id])?;
+        conn.execute("DELETE FROM pipeline_run WHERE id = ?1", params![run_id])?;
+    }
+
+    Ok(run_ids.len() as i64)
+}
+
 /// 某部剧属于哪次运行。日志要按运行过滤，而任务只带 drama_id。
 pub fn run_id_of_drama(conn: &Connection, drama_id: Option<i64>) -> AppResult<Option<i64>> {
     let Some(id) = drama_id else { return Ok(None) };
@@ -2202,6 +2250,104 @@ mod tests {
     const OK_SLICE: &str =
         r#"{"mediaId":1,"mode":{"mode":"equalParts","parts":3},"outDir":"E:/o"}"#;
     const OK_OCR: &str = r#"{"mediaId":2}"#;
+    /// 清空运行记录：**正在跑的不删、素材不动**。
+    ///
+    /// 用户问「运行记录能否清空」时，这两条边界是必须守住的：
+    /// 删了正在跑的，队列里的任务会找不到归属；
+    /// 动了素材，界面上的产出就跟着没了 —— 而他只是想清理历史列表。
+    #[test]
+    fn clearing_runs_keeps_the_running_one_and_all_media() {
+        let conn = mem();
+        let done = create_pipeline_run(&conn, "D:/源", "D:/二创", &["slice".into()]).unwrap();
+        let running = create_pipeline_run(&conn, "D:/源", "D:/二创", &["slice".into()]).unwrap();
+        conn.execute(
+            "UPDATE pipeline_run SET status = 'done' WHERE id = ?1",
+            params![done],
+        )
+        .unwrap();
+
+        let d1 = add_pipeline_drama(&conn, done, "旧剧", "D:/源", "D:/二创/旧剧", 1, None).unwrap();
+        let d2 =
+            add_pipeline_drama(&conn, running, "在跑", "D:/源", "D:/二创/在跑", 1, None).unwrap();
+        let probe = MediaProbe {
+            duration_ms: 1000,
+            width: 720,
+            height: 1280,
+            has_audio: true,
+            size_bytes: 10,
+            format_name: "mp4".into(),
+        };
+        let project = create_project(&conn, "旧剧", "D:/源").unwrap();
+        let m = add_media(&conn, project.id, "D:/源/第01集.mp4", "第01集.mp4", &probe).unwrap();
+        enqueue_job_for(
+            &conn,
+            Some(m.id),
+            "dedup",
+            r#"{"mediaId":1,"outDir":"D:/o"}"#,
+            Some(d1),
+        )
+        .unwrap();
+        enqueue_job_for(
+            &conn,
+            Some(m.id),
+            "dedup",
+            r#"{"mediaId":1,"outDir":"D:/o"}"#,
+            Some(d2),
+        )
+        .unwrap();
+        append_log(&conn, Some(done), Some(d1), "info", "旧日志");
+        append_log(&conn, Some(running), Some(d2), "info", "在跑的日志");
+
+        let n = clear_pipeline_runs(&conn).unwrap();
+        assert_eq!(n, 1, "只该清掉已结束的那一次");
+
+        // 正在跑的还在，它的剧目、任务、日志都还在
+        let runs = list_pipeline_runs(&conn, 20).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, running);
+        assert_eq!(list_pipeline_dramas(&conn, running).unwrap().len(), 1);
+        assert_eq!(list_logs(&conn, Some(running), 0, 10).unwrap().len(), 1);
+
+        // 被清掉的那次：剧目、任务、日志一起走
+        assert!(list_pipeline_dramas(&conn, done).unwrap().is_empty());
+        assert!(list_logs(&conn, Some(done), 0, 10).unwrap().is_empty());
+        assert_eq!(job_counts(&conn).unwrap().total, 1, "只剩在跑那次的任务");
+
+        // **素材不动** —— 它属于工程，不属于某次运行
+        assert!(get_media(&conn, m.id).is_ok(), "清运行记录不该动素材");
+    }
+
+    /// 被中断后卡在「运行中」的运行也要能清掉 —— 否则永远清不掉。
+    ///
+    /// 判据是「状态 running **且** 没有待跑/在跑的任务」：
+    /// 真有任务在跑的绝不能删（删了队列找不到归属）。
+    #[test]
+    fn clearing_runs_also_removes_stuck_ones_without_jobs() {
+        let conn = mem();
+        // 卡住的那种：状态还是 running，但一个任务都没有
+        let stuck = create_pipeline_run(&conn, "D:/源", "D:/二创", &["slice".into()]).unwrap();
+
+        // 真在跑的那种：状态 running，而且有任务在跑
+        let live = create_pipeline_run(&conn, "D:/源", "D:/二创", &["slice".into()]).unwrap();
+        let d = add_pipeline_drama(&conn, live, "在跑", "D:/源", "D:/二创/在跑", 1, None).unwrap();
+        let job = enqueue_job_for(
+            &conn,
+            None,
+            "dedup",
+            r#"{"mediaId":1,"outDir":"D:/o"}"#,
+            Some(d),
+        )
+        .unwrap();
+        mark_job_running(&conn, job.id).unwrap();
+
+        let n = clear_pipeline_runs(&conn).unwrap();
+        assert_eq!(n, 1, "只该清掉卡住的那个");
+        let left = list_pipeline_runs(&conn, 20).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, live, "真在跑的必须留着");
+        assert!(list_pipeline_dramas(&conn, stuck).unwrap().is_empty());
+    }
+
     /// 复用的工程里，原片已经不在的素材记录要清掉。
     ///
     /// 实测：一个工程积了 68 条素材，其中 55 条原片早删了，

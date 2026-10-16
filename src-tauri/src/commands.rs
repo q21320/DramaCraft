@@ -2622,6 +2622,18 @@ pub async fn render_cover(
     })
 }
 
+/// 清空运行记录。
+///
+/// **不动磁盘上的产出** —— 跑出来的视频是用户的，删记录不该把文件也带走。
+/// **正在跑的那次也不删**（删了队列就找不到归属）。理由见 `db::clear_pipeline_runs`。
+#[tauri::command]
+pub fn clear_pipeline_runs(state: tauri::State<'_, AppState>) -> AppResult<i64> {
+    let conn = lock_db(&state)?;
+    let n = db::clear_pipeline_runs(&conn)?;
+    db::append_log(&conn, None, None, "info", &format!("清空了 {n} 次运行记录"));
+    Ok(n)
+}
+
 // ---------------- 运行日志 ----------------
 
 /// 读运行日志。

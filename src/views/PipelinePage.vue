@@ -9,6 +9,7 @@ import {
   NSelect,
   NSpace,
   NTag,
+  useDialog,
   useMessage,
 } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -17,6 +18,7 @@ import { api } from "@/api";
 import type { LabelPosition, PipelineRun, PipelineStageOption, SourceScan } from "@/types";
 
 const message = useMessage();
+const dialog = useDialog();
 
 const stages = ref<PipelineStageOption[]>([]);
 const picked = ref<string[]>([]);
@@ -126,6 +128,42 @@ const runStatusLabels: Record<string, string> = {
   failed: "有失败",
   canceled: "已取消",
 };
+
+/**
+ * 清空运行记录。
+ *
+ * **只清记录，不删磁盘上的产出** —— 这一点必须跟用户说清楚，
+ * 否则「清空」两个字会让人以为视频也没了，不敢点。
+ * 正在跑的那次也不会被删。
+ */
+async function clearRuns() {
+  const running = runs.value.filter((r) => r.status === "running").length;
+  const tip =
+    running > 0
+      ? `会清掉已结束的运行记录（正在跑的那 ${running} 次保留）。\n\n磁盘上已经跑出来的视频不会被删除。`
+      : "会清掉所有运行记录。\n\n磁盘上已经跑出来的视频不会被删除。";
+  // NaiveUI 的 useDialog 没有 confirm()，用 warning 自己包一个 Promise
+  const ok = await new Promise<boolean>((resolve) => {
+    dialog.warning({
+      title: "清空运行记录",
+      content: tip,
+      positiveText: "清空",
+      negativeText: "算了",
+      onPositiveClick: () => resolve(true),
+      onNegativeClick: () => resolve(false),
+      onClose: () => resolve(false),
+    });
+  });
+  if (!ok) return;
+  try {
+    const n = await api.clearPipelineRuns();
+    activeRunId.value = null;
+    await refreshRuns();
+    message.success(`清掉了 ${n} 次运行记录（产出文件都还在）`);
+  } catch (e) {
+    message.error((e as Error).message);
+  }
+}
 
 async function refreshRuns() {
   try {
@@ -422,6 +460,9 @@ onUnmounted(() => {
         <span v-else class="dd-muted">空闲</span>
         <span class="dd-muted dd-clock">最后更新 {{ lastUpdatedText || "—" }}</span>
         <n-button size="small" @click="refreshRuns">刷新</n-button>
+        <n-button v-if="runs.length > 0" size="small" quaternary @click="clearRuns">
+          清空记录
+        </n-button>
       </n-space>
     </div>
 
