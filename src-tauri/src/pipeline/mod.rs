@@ -610,6 +610,26 @@ pub fn start_pipeline(
             crate::db::append_log(conn, Some(run_id), Some(drama_id), "warn", w);
         }
 
+        // **每次运行重新导入，不复用。**（用户明确要求：「每次跑不要有复用」）
+        //
+        // 原来同路径的素材会复用，界面上显示「新增 0 条，复用 7 条」——
+        // 用户看到这个不知道到底重跑了没有，而且上次的处理结果会渗进这一次。
+        //
+        // 先把这次要导入的路径对应的旧记录清掉，再全部重新导入。
+        // 有任务在跑的不会被删（否则撞外键）。代价：上一次运行的产出列表会空
+        // —— 文件还在磁盘上，只是记录没了。
+        let import_paths: Vec<String> = drama.episodes.iter().map(|e| e.path.clone()).collect();
+        let cleared = crate::db::remove_media_by_paths(conn, project.id, &import_paths)?;
+        if cleared > 0 {
+            crate::db::append_log(
+                conn,
+                Some(run_id),
+                Some(drama_id),
+                "info",
+                &format!("清掉上次导入的 {cleared} 条素材，这次全部重新导入"),
+            );
+        }
+
         // 每集单独一个子目录。
         //
         // 这不是美观问题：切片是按「这一集的第几片」编号的（001、002…），
@@ -1784,10 +1804,18 @@ mod tests {
     }
 
     #[test]
-    fn running_twice_does_not_duplicate_projects_or_media() {
-        // 实测踩到的：每次跑流水线都新建工程、重新导入素材，
-        // 结果三个工程指向同一个源目录，163 条素材里只有 65 个不同文件，
-        // 产出页面因此错乱（同一集出现两三次，有的有字幕有的没有）。
+    fn rerunning_imports_fresh_instead_of_reusing() {
+        // 两个诉求在这里换了方向，都记下来：
+        //
+        // 一开始踩的坑：每次跑都新建工程、重新导入素材 —— 三个工程指向同一个
+        // 源目录，163 条素材里只有 65 个不同文件，产出页面因此错乱。
+        //
+        // 后来的诉求（用户明确说「每次跑不要有复用」）：界面上写着
+        // 「新增 0 条，复用 2 条」让人不知道到底重跑了没有，
+        // 而且上一次的处理结果会渗进这一次。
+        //
+        // 现在的做法：**工程仍然复用**（避免三个工程那种乱），
+        // 但**素材每次重新导入**（新记录、新 id，上次的路径记录先清掉）。
         let (Some(ffmpeg), Some(ffprobe)) = (
             env_path("DRAMADIST_TEST_FFMPEG"),
             env_path("DRAMADIST_TEST_FFPROBE"),
@@ -1805,25 +1833,53 @@ mod tests {
         let out = t.path().join("二创");
         let stages = vec!["slice".to_string()];
 
-        let first = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames(), None)
-            .expect("第一次跑失败");
+        let first =
+            start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames(), None)
+                .expect("第一次跑失败");
         assert_eq!(first.imported, 2);
         assert_eq!(first.reused_projects, 0);
         assert_eq!(first.reused_media, 0);
 
-        let second = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames(), None)
-            .expect("第二次跑失败");
+        // **把第一次的任务跑完** —— 真实场景就是"跑完再跑第二次"。
+        // 任务还挂着时不能清素材（会让正在跑的任务撞外键），
+        // 所以这个前提必须造出来，否则测的是另一回事。
+        let ids: Vec<i64> = crate::db::list_jobs(&conn, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|j| j.status == "pending")
+            .map(|j| j.id)
+            .collect();
+        for id in ids {
+            crate::db::finish_job(&conn, id, crate::db::JOB_DONE, "好了").unwrap();
+        }
+        let first_media_ids: Vec<i64> = crate::db::list_media(&conn, 1)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
 
-        // 第二次一条都不该新建
-        assert_eq!(second.imported, 0, "第二次不该再导入素材");
-        assert_eq!(second.reused_projects, 1, "应当复用已有工程");
-        assert_eq!(second.reused_media, 2, "两集都该复用已有素材");
-        assert_eq!(second.queued, 2, "任务还是要照排 —— 复用素材不等于跳过这一步");
+        let second =
+            start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames(), None)
+                .expect("第二次跑失败");
 
-        // 库里的实际行数才是最终判据
+        // **这次是全新导入，不是复用**
+        assert_eq!(second.imported, 2, "第二次也该重新导入素材");
+        assert_eq!(second.reused_media, 0, "不该复用 —— 用户明确要求");
+        assert_eq!(second.reused_projects, 1, "工程还是要复用，避免一个源目录建好几个");
+        assert_eq!(second.queued, 2);
+
+        // 工程只有一个，素材也只有两条（旧的清掉了，新的进来了）
         assert_eq!(crate::db::list_projects(&conn).unwrap().len(), 1, "只能有一个工程");
         let media = crate::db::list_media(&conn, 1).unwrap();
-        assert_eq!(media.len(), 2, "只能有两条素材，不能重复导入");
+        assert_eq!(media.len(), 2, "旧记录该被清掉，只留这次的");
+        // id 变了才说明是真的重新导入，不是把旧记录拿来用
+        for m in &media {
+            assert!(
+                !first_media_ids.contains(&m.id),
+                "素材应当是重新导入的新记录，不该是上次那条（id {}）",
+                m.id
+            );
+        }
     }
 
     #[test]

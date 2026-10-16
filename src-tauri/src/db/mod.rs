@@ -1,4 +1,4 @@
-﻿//! SQLite 存取层。
+//! SQLite 存取层。
 //!
 //! 迁移策略：只前进不回退，靠 `PRAGMA user_version` 判断。旧库能直接打开。
 
@@ -1126,7 +1126,53 @@ pub fn run_outputs(conn: &Connection, run_id: i64) -> AppResult<Vec<OutputEpisod
     Ok(out)
 }
 
-// ---------- 运行日志（run_log） ----------
+// ---------- media 清理 ----------
+
+/// 删掉这个工程里、路径在这些里的素材（连同它们的任务/切片/字幕）。
+///
+/// 用途：**每次运行重新导入，不复用**（用户明确要求）。
+///
+/// 复用会让「上次的处理结果」渗进这一次 —— 界面上写着「复用 7 条」，
+/// 用户不知道到底重跑了没有。宁可每次都是干净的。
+///
+/// 代价说清楚：上一次运行的产出列表会变空（**文件还在磁盘上**，
+/// 只是指向它们的记录没了）。所以只在「这次确实要重新导入这些路径」时调。
+pub fn remove_media_by_paths(
+    conn: &Connection,
+    project_id: i64,
+    paths: &[String],
+) -> AppResult<i64> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let wanted: std::collections::HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, path FROM media WHERE project_id = ?1")?;
+        let r = stmt
+            .query_map(params![project_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        r
+    };
+
+    let mut removed = 0i64;
+    for (id, path) in rows {
+        if !wanted.contains(path.as_str()) {
+            continue;
+        }
+        // 有任务在跑的先留着 —— 删了会让正在跑的任务撞外键（这个坑踩过）
+        let busy: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM job WHERE media_id = ?1 AND status IN ('pending','running')",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if busy > 0 {
+            continue;
+        }
+        remove_media(conn, id)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
 
 /// 清掉这个工程里「原片已经不在了、而且没有任务在跑」的素材。
 ///
