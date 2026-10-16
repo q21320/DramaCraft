@@ -1024,12 +1024,19 @@ pub fn stage_payload(
             // 变体名是 everySeconds。写错不会当场报，而是排进队列、
             // 跑到它的时候才炸 —— 真实素材那轮就是这么栽的。
             "mode": { "mode": "everySeconds", "seconds": slice_ms as f64 / 1000.0 },
-            // **一源一文件夹**（照真实软件：`qiepian\第1集_quzimu\分镜001.mp4`）。
-            // 目录已经把「哪一集」分开了，文件名就不必再带集名。
-            "outDir": out_dir.join("qiepian").join(group).to_string_lossy(),
-            // 前缀用中性的「分镜」。真实软件写的是「Flova AI_分镜」——
+            // **平铺在一个「qiepian」目录里**（用户要的）。
+            //
+            // 试过照真实软件做「一源一文件夹」（`qiepian\第01集\分镜001.mp4`），
+            // 但用户更想要平铺 —— **拖进剪映时不用一层层点开**。
+            //
+            // 平铺就**必须让文件名带集名**：切片是按「这一集的第几片」编号的
+            // （001、002…），不带集名的话多集之间会互相覆盖。
+            // 早期真实素材上栽过：16 集共用一个目录，27 片最后只剩 3 片，
+            // 而数据库里路径都在 —— 内容却是别人的。
+            "outDir": out_dir.join("qiepian").to_string_lossy(),
+            // 前缀 = 集名 + 「分镜」。真实软件写的是「Flova AI_分镜」，
             // 那是它自己配套工具的名字，照抄进用户的产出里不合适。
-            "prefix": "分镜",
+            "prefix": format!("{group}_分镜"),
             // **切 AI 去字幕的产物，不是去重产物。**
             //
             // 真实软件日志：「视频切片（流水线 · AI去字幕结果）」。去重产物是
@@ -1772,34 +1779,28 @@ mod tests {
         let pa: serde_json::Value = serde_json::from_str(&a).unwrap();
         let pb: serde_json::Value = serde_json::from_str(&b).unwrap();
 
-        // **一源一文件夹**：两集各自一个目录，不会互相覆盖
-        assert_ne!(
-            pa["outDir"], pb["outDir"],
-            "两集应当各占一个子目录（一源一文件夹）"
-        );
+        // **平铺：两集共用一个目录**（用户要的，拖进剪映不用一层层点）
+        assert_eq!(pa["outDir"], pb["outDir"], "两集应当平铺在同一个目录里");
         assert!(
             pa["outDir"].as_str().unwrap().contains("qiepian"),
             "切片根目录该叫 qiepian：{}",
             pa["outDir"]
         );
+        // **平铺之后，目录里看不出是哪一集** —— 那是**文件名**的职责，
+        // 靠前缀带（下面断言）。目录只到 `qiepian` 为止。
         assert!(
-            pa["outDir"].as_str().unwrap().contains("第01集"),
-            "目录里要能看出是哪一集：{}",
+            !pa["outDir"].as_str().unwrap().contains("第01集"),
+            "平铺时目录里不该再套集名子目录：{}",
             pa["outDir"]
         );
-        assert!(
-            pb["outDir"].as_str().unwrap().contains("第02集"),
-            "{}",
-            pb["outDir"]
-        );
 
-        // **唯一性靠目录，不靠文件名**。
+        // **平铺时唯一性靠文件名** —— 前缀必须带集名，否则跨集互相覆盖。
         //
-        // 原来是「目录共用 + 文件名带集名」；真实软件是「一源一文件夹 +
-        // 文件名统一叫分镜NNN」。后者目录就分开了，前缀不必再承担区分职责。
-        assert_eq!(pa["prefix"], "分镜");
-        assert_eq!(pb["prefix"], "分镜");
-        // 覆盖与否的关键变成了目录不同 —— 上面已经断言过 outDir 不相等
+        // 早期真实素材上栽过：16 集共用一个目录，切片按「第几片」编号，
+        // 27 片最后只剩 3 片，而数据库里路径都在（内容却是别人的）。
+        assert_eq!(pa["prefix"], "第01集_分镜");
+        assert_eq!(pb["prefix"], "第02集_分镜");
+        assert_ne!(pa["prefix"], pb["prefix"], "前缀必须不同，否则会覆盖");
     }
 
     #[test]
@@ -1811,7 +1812,7 @@ mod tests {
         let out = Path::new("D:/二创/某剧");
         let group = "第01集";
         for (stage, key, sub) in [
-            // 切片现在是 `<剧目录>/qiepian/<集名>/`（照真实软件的目录名）
+            // 切片平铺在 `<剧目录>/qiepian/` 下，靠文件名带集名区分
             ("slice", "outDir", "qiepian"),
             ("export", "outPath", "成片"),
             ("package", "outRoot", "发布包"),
@@ -1826,11 +1827,12 @@ mod tests {
                 "{stage} 的产出该落在这部剧的根目录下：{path}"
             );
             assert!(path.contains(sub), "{stage} 该有个「{sub}」子目录：{path}");
-            // **一源一文件夹**：切片的目录里就带集名，文件名不用再带
+            // **平铺**：切片的目录不带集名，靠**前缀**带（见下面那条断言）
             if stage == "slice" {
+                let prefix = v["prefix"].as_str().unwrap_or("");
                 assert!(
-                    path.contains(group),
-                    "切片的目录要能看出是哪一集：{path}"
+                    prefix.contains(group),
+                    "平铺时前缀要带集名，否则跨集覆盖：{prefix}"
                 );
             } else {
                 assert!(path.contains(group), "{stage} 的产出要带集名：{path}");
@@ -2224,11 +2226,11 @@ mod tests {
             .unwrap();
         let regroup_dir = out_root.join(&target).join("重组");
 
-        // 切片现在是 `<剧目录>/qiepian/<集名>/`，比剧目录深两层 ——
-        // 往上退两层才是剧目录（重组是 `<剧目录>/重组/`，退一层）。
+        // 切片平铺在 `<剧目录>/qiepian/`，重组在 `<剧目录>/重组/` ——
+        // 都只比剧目录深一层，退一层就都是剧目录。
         assert_eq!(
             regroup_dir.parent().unwrap(),
-            slice_dir.parent().unwrap().parent().unwrap(),
+            slice_dir.parent().unwrap(),
             "重组和切片必须落在同一个剧目录下，否则一跑就是两个文件夹：\n  重组 {}\n  切片 {}",
             regroup_dir.display(),
             slice_dir.display()
