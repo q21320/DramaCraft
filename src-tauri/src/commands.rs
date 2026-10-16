@@ -1459,7 +1459,24 @@ pub async fn desubtitle_media(
         std::fs::create_dir_all(dir)?;
     }
     let filter = crate::desubtitle::delogo_filter(&band);
-    let args: Vec<String> = vec![
+
+    // **这一段用 GPU 编码。**
+    //
+    // 实测一集 82 秒的素材（1080×1920）：
+    //
+    //     libx264 CPU  57.8s      ← 原来
+    //     h264_nvenc   17.1s      ← 快 3.4 倍
+    //     解码+delogo   3.3s      ← 只占 6%
+    //
+    // 也就是**时间几乎全花在编码上**（54 秒），滤镜本身可以忽略。
+    // 这和「去重」正好相反：去重的滤镜链很重（tmix 那些），所以那边
+    // 特意用 CPU；去字幕只有 `delogo` 一个轻滤镜，瓶颈纯粹是编码。
+    //
+    // 探测用现成的 `pick_h264_encoder` —— 它**真的编一帧**来验，
+    // 而不是看 `-encoders` 列表（列表里有 nvenc 不代表这台机器真有 N 卡）。
+    let enc = media::pick_h264_encoder(&ffmpeg);
+
+    let mut args: Vec<String> = vec![
         "-y".into(),
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -1469,19 +1486,22 @@ pub async fn desubtitle_media(
         "-vf".into(),
         filter.clone(),
         "-c:v".into(),
-        "libx264".into(),
-        "-preset".into(),
-        "veryfast".into(),
-        "-crf".into(),
-        "18".into(),
-        "-pix_fmt".into(),
-        "yuv420p".into(),
-        "-c:a".into(),
-        "copy".into(),
-        "-movflags".into(),
-        "+faststart".into(),
-        out.to_string_lossy().to_string(),
+        enc.name().to_string(),
     ];
+    args.extend(enc.quality_args());
+    args.extend(
+        [
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    args.push(out.to_string_lossy().to_string());
     let mut cmd = std::process::Command::new(&ffmpeg);
     proc::no_window(cmd.args(&args));
     let output = cmd
