@@ -1162,7 +1162,8 @@ pub async fn cluster_series_by_intro(
 pub async fn detect_episodes(
     state: tauri::State<'_, AppState>,
     media_id: i64,
-    sample_fps: Option<f64>,
+    // 保留参数以兼容旧调用；现在按素材时长固定抽 12 帧定位
+    #[allow(unused)] sample_fps: Option<f64>,
     intro_seconds: Option<f64>,
     tolerance: Option<u32>,
 ) -> AppResult<EpisodeDetection> {
@@ -1377,12 +1378,9 @@ pub async fn desubtitle_media(
     state: tauri::State<'_, AppState>,
     media_id: i64,
     out_path: Option<String>,
-    sample_fps: Option<f64>,
+    // 保留参数以兼容旧调用；现在按素材时长固定抽 12 帧定位
+    #[allow(unused)] sample_fps: Option<f64>,
 ) -> AppResult<DesubtitleReport> {
-    // 定位用不着那么密的采样：字幕一句停留 1 秒以上，0.5 帧/秒足够，
-    // 而抽帧 + OCR 是这一步的主要开销。
-    let fps = sample_fps.unwrap_or(0.5).clamp(0.1, 2.0);
-
     let (ffmpeg, python, worker, input, media, out) = {
         let configured = lock_tools(&state)?.clone();
         let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
@@ -1421,9 +1419,28 @@ pub async fn desubtitle_media(
     }
 
     let mut opts = ocr::default_options();
-    opts.sample_fps = fps;
-    // 只扫下半部分就够，而且能少误判画面内容
-    opts.bottom_ratio = 0.45;
+
+    // **抽帧不要裁图。**
+    //
+    // `bottom_ratio` 是给「识别字幕」用的：让 ffmpeg 只抽下半部分，OCR 快一点。
+    // 但**定位**要的是**全画面坐标** —— 裁过之后 OCR 返回的框是相对裁剪图的
+    // （0~864），而 `subtitle_band` 按全画面判「在不在下方」
+    // （要求 y ≥ 1920×0.55 = 1056），结果**所有框都被滤掉**，
+    // 报「没找到硬字幕」—— 明明有。下方筛选在 `subtitle_band` 里自己做。
+    opts.bottom_ratio = 1.0;
+
+    // **少抽几帧。**
+    //
+    // 定位只需要知道「字幕大概在哪一行」，不必逐秒采样。
+    // 原来按 0.5 帧/秒抽（82 秒 = 42 帧），而 RapidOCR 跑在 CPU 上，
+    // 一帧几百毫秒 —— 4 路并发直接把 CPU 打满（用户原话「CPU 爆了」）。
+    //
+    // 12 帧足够：字幕位置在一集里是固定的，样本再多只是重复同一个结论。
+    let duration_sec = (media.duration_ms as f64 / 1000.0).max(1.0);
+    const LOCALIZE_FRAMES: f64 = 12.0;
+    opts.sample_fps = (LOCALIZE_FRAMES / duration_sec).clamp(0.02, 0.5);
+    opts.max_frames = LOCALIZE_FRAMES as usize;
+
     opts.min_confidence = 0.6;
 
     let frames_dir = std::env::temp_dir().join(format!("dramadist_desub_{media_id}"));

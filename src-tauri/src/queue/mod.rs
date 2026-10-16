@@ -653,9 +653,26 @@ fn job_concurrency() -> i64 {
     ((cores / 4).max(1) as i64).clamp(1, 4)
 }
 
+/// 这一类任务同时跑几个。
+///
+/// 默认用 `job_concurrency()`；**AI 去字幕单独限到 2**。
+///
+/// 为什么：它的 OCR（RapidOCR）跑在 CPU 上，而且 onnxruntime 默认
+/// **吃满所有核**（本机 12 核）。默认并发 3 路 = 3 个 session 各开 12 线程，
+/// 36 个线程挤 12 个核 —— 用户的原话是「CPU 爆了」。
+///
+/// 本机 onnxruntime 只编了 CPUExecutionProvider（没有 CUDA），
+/// 所以短时间内只能靠限流：一集 OCR 约 9 秒，2 路并发足够。
+fn concurrency_for(kind: &str) -> i64 {
+    match kind {
+        "desubtitle" => 2,
+        _ => job_concurrency(),
+    }
+}
+
 async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
     let limit = limit.max(1);
-    let workers = job_concurrency();
+    // 每个 kind 的并发由 concurrency_for() 决定（去字幕单独限流）
     let mut processed = 0i64;
     let mut done = 0i64;
     let mut failed = 0i64;
@@ -694,7 +711,7 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             let Some(kind) = db::next_pending_kind(&conn)? else {
                 break;
             };
-            let jobs = db::next_pending_jobs_of_kind(&conn, &kind, workers)?;
+            let jobs = db::next_pending_jobs_of_kind(&conn, &kind, concurrency_for(&kind))?;
             for job in &jobs {
                 db::mark_job_running(&conn, job.id)?;
                 // **步骤标题只打一次。**
