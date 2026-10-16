@@ -6,6 +6,7 @@ import {
   NCheckbox,
   NInput,
   NInputNumber,
+  NPopconfirm,
   NSelect,
   NSpace,
   NTag,
@@ -478,9 +479,28 @@ onUnmounted(() => {
     </div>
 
     <n-space>
-      <n-button size="small" type="primary" :loading="starting" @click="start">
+      <!--
+        运行中这个按钮就变成「停止」。
+        用户问「开始流水线之后 是否改成停止 或者 取消呢？」—— 该改。
+        开始之后最主要的动作就是停下来；让它一直叫「开始流水线」、
+        而取消藏在下面那行状态里，等于两处说同一件事。
+      -->
+      <n-button
+        v-if="!busy"
+        size="small"
+        type="primary"
+        :loading="starting"
+        @click="start"
+      >
         {{ starting && willRewrite ? "正在调 AI 起新剧名…" : "开始流水线" }}
       </n-button>
+      <n-popconfirm v-else @positive-click="cancelRun(activeRunId!)">
+        <template #trigger>
+          <n-button size="small" type="warning" secondary>停止</n-button>
+        </template>
+        <!-- 要说清楚停下来意味着什么，不然用户不敢点 -->
+        停止后：已经跑完的会留着，还没跑的不再跑。想接着跑就再点一次「开始流水线」。
+      </n-popconfirm>
       <span v-if="willRewrite" class="dd-muted">
         会先调 AI 改简介、起新剧名（约十几秒），<b>再用新剧名建目录、排任务</b>；
         改失败了会用原剧名继续，不会卡住
@@ -505,7 +525,7 @@ onUnmounted(() => {
       <span class="dd-muted dd-clock">最后更新 {{ lastUpdatedText || "—" }}</span>
     </n-space>
     <n-space :size="8" align="center">
-      <n-button v-if="busy" size="small" @click="cancelRun(activeRunId!)">取消</n-button>
+      <!-- 「停止」已经在上面主按钮那儿了，这里不再放第二个取消 —— 两处说同一件事 -->
       <n-button size="small" type="primary" ghost @click="goLogs">看运行日志 →</n-button>
     </n-space>
   </div>
