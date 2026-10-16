@@ -17,6 +17,7 @@ import type {
   CostDocRequest,
   CoverReport,
   RewriteOutcome,
+  RunLog,
   CoverRequest,
   Cue,
   DiscoveredAsset,
@@ -289,6 +290,11 @@ export const api = {
   openInPlayer: (path: string) => call<void>("open_in_player", { path }),
   /** 在资源管理器里定位 */
   revealInExplorer: (path: string) => call<void>("reveal_in_explorer", { path }),
+
+  // 运行日志：afterId 用来增量拉取，只要新行
+  listLogs: (runId: number | null, afterId: number, limit?: number) =>
+    call<RunLog[]>("list_logs", { runId, afterId, limit: limit ?? 800 }),
+  clearLogs: () => call<number>("clear_logs"),
 
   // AI 服务配置（Key 只存在本机，读回来的是打码值）
   aiConfig: () => call<AiConfigView>("ai_config"),

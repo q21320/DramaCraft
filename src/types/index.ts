@@ -235,6 +235,19 @@ export interface RewriteOutcome {
   /** 落在了哪些文件上 */
   saved: string[];
 }
+// ---------------- 运行日志 ----------------
+
+/** 一行运行日志 */
+export interface RunLog {
+  id: number;
+  /** 属于哪次流水线运行；手工操作产生的日志没有 run */
+  runId: number | null;
+  dramaId: number | null;
+  /** info | ok | warn | error */
+  level: string;
+  message: string;
+  createdAt: string;
+}
 // ---------------- 封面生成 ----------------
 
 export interface CoverRequest {

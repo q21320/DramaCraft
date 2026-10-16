@@ -275,6 +275,8 @@ pub fn start_pipeline(
         &out_root.to_string_lossy(),
         stages,
     )?;
+    // 顺手裁掉太老的日志，免得攒到几万行拖慢界面
+    let _ = crate::db::trim_logs(conn, 5000);
 
     let mut imported = 0i64;
     let mut skipped: Vec<String> = Vec::new();
@@ -283,6 +285,28 @@ pub fn start_pipeline(
     // 复用了多少 —— 报给用户看，让他知道这次没有再重复导入
     let mut reused_projects = 0i64;
     let mut reused_media = 0i64;
+
+    // 日志开个头：源头扫到了什么。日志页第一眼看到的就是这行。
+    crate::db::append_log(
+        conn,
+        Some(run_id),
+        None,
+        "info",
+        &format!(
+            "扫描「{}」：{} 部剧、共 {} 集。步骤：{}",
+            scan.root,
+            scan.dramas.len(),
+            scan.total_episodes,
+            stages
+                .iter()
+                .map(|s| stage_label(s))
+                .collect::<Vec<_>>()
+                .join(" → ")
+        ),
+    );
+    for w in &scan.warnings {
+        crate::db::append_log(conn, Some(run_id), None, "warn", w);
+    }
 
     for drama in &scan.dramas {
         // **复用已有工程，不重复建。**
@@ -307,6 +331,28 @@ pub fn start_pipeline(
             Some(project.id),
         )?;
         drama_ids.push(drama_id);
+
+        // 日志：这部剧扫到了什么、是新建还是复用。
+        // 用户回头看日志时，最想知道的就是「它到底认出了什么」。
+        crate::db::append_log(
+            conn,
+            Some(run_id),
+            Some(drama_id),
+            "info",
+            &format!(
+                "剧场「{}」：{} 集{}",
+                drama.name,
+                drama.episode_count,
+                if drama.synopsis.trim().is_empty() {
+                    "，无简介"
+                } else {
+                    "，有简介"
+                }
+            ),
+        );
+        for w in &drama.warnings {
+            crate::db::append_log(conn, Some(run_id), Some(drama_id), "warn", w);
+        }
 
         // 每集单独一个子目录。
         //
@@ -393,6 +439,22 @@ pub fn start_pipeline(
                 queued += 1;
             }
         }
+    }
+
+    // 收尾日志：这次一共排了多少活、复用了多少。
+    // 「复用」要写出来 —— 否则用户看到"没导入"会以为出错了（那个 bug 真发生过）。
+    crate::db::append_log(
+        conn,
+        Some(run_id),
+        None,
+        "ok",
+        &format!(
+            "已排 {} 个任务（新增素材 {} 条，复用 {} 条，复用工程 {} 个）",
+            queued, imported, reused_media, reused_projects
+        ),
+    );
+    for s in &skipped {
+        crate::db::append_log(conn, Some(run_id), None, "warn", s);
     }
 
     Ok(StartOutcome {

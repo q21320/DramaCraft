@@ -432,6 +432,17 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                 .lock()
                 .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
             db::mark_job_running(&conn, job.id)?;
+            // 日志：开始跑一个任务。用剧名代替任务 id，读日志的人认得的是剧名。
+            if job.pipeline_drama_id.is_some() {
+                let run_id = db::run_id_of_drama(&conn, job.pipeline_drama_id).unwrap_or(None);
+                db::append_log(
+                    &conn,
+                    run_id,
+                    job.pipeline_drama_id,
+                    "info",
+                    &format!("▶ {}", kind_label(&job.kind)),
+                );
+            }
         }
         let _ = app.emit(
             "queue:progress",
@@ -459,8 +470,16 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             // 流水线任务：把进度写回它所属的那部剧。
             // 失败时整部剧标失败 —— 一步没成，后面的步骤继续跑没有意义。
             if let Some(drama_id) = job.pipeline_drama_id {
+                let run_id = db::run_id_of_drama(&conn, Some(drama_id)).unwrap_or(None);
                 match &outcome {
                     Ok(summary) => {
+                        db::append_log(
+                            &conn,
+                            run_id,
+                            Some(drama_id),
+                            "ok",
+                            &format!("✓ {}：{}", kind_label(&job.kind), crate::proc::tail(summary)),
+                        );
                         db::update_pipeline_drama(
                             &conn,
                             drama_id,
@@ -484,6 +503,13 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                         }
                     }
                     Err(e) => {
+                        db::append_log(
+                            &conn,
+                            run_id,
+                            Some(drama_id),
+                            "error",
+                            &format!("✗ {}：{}", kind_label(&job.kind), crate::proc::tail(&e.to_string())),
+                        );
                         db::update_pipeline_drama(
                             &conn,
                             drama_id,

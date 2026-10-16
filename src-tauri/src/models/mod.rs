@@ -804,6 +804,25 @@ pub struct CloudTestResult {
     pub detail: String,
 }
 
+// ---------------- 运行日志 ----------------
+
+/// 一行运行日志。
+///
+/// 流水线跑起来是几十上百个任务，用户需要能**回头看**
+/// 「刚才到底做了什么、卡在哪一步」。任务表看的是状态，日志看的是过程。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunLog {
+    pub id: i64,
+    /// 属于哪次流水线运行；手工操作产生的日志没有 run
+    pub run_id: Option<i64>,
+    pub drama_id: Option<i64>,
+    /// info | ok | warn | error
+    pub level: String,
+    pub message: String,
+    pub created_at: String,
+}
+
 // ---------------- 任务队列 ----------------
 
 /// 队列里的一条任务。`payload` 是 JSON，形状由 `kind` 决定。

@@ -129,6 +129,12 @@ export const navGroups: NavGroup[] = [
     hint: "看进度、改路径",
     items: [
       {
+        key: "logs",
+        path: "/logs",
+        label: "运行日志",
+        subtitle: "每一步的过程：扫到什么、导入了多少、哪一步成没成；也能看产出",
+      },
+      {
         key: "queue",
         path: "/queue",
         label: "任务队列",

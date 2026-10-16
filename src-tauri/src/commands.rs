@@ -1,4 +1,4 @@
-//! 前后端唯一边界。前端只认这里的命令名与参数形状。
+﻿//! 前后端唯一边界。前端只认这里的命令名与参数形状。
 
 use crate::db;
 use crate::error::{AppError, AppResult};
@@ -10,7 +10,7 @@ use crate::models::{
     IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
     PipelineStage, PlatformOption, Project,
     ProofLayout, ProofPreview, ProofRenderReport, PublishAccount, PublishClipEntry,
-    PublishPackageReport, PublishPlan, QueueState, ResplitReport, RuntimeStatus, Segment,
+    PublishPackageReport, PublishPlan, QueueState, ResplitReport, RunLog, RuntimeStatus, Segment,
     OutputEpisode, SeriesGroup, SliceMode, SlicePlan, SourceScan, ToolPaths, ToolReport,
     TransformOptions, TransformReport, VerifyItem, VerifyReport,
 };
@@ -2182,6 +2182,30 @@ pub async fn render_cover(
         engine,
         notes,
     })
+}
+
+// ---------------- 运行日志 ----------------
+
+/// 读运行日志。
+///
+/// `afterId` 用来做增量拉取 —— 前端只要新行，不用每次把整段搬一遍。
+#[tauri::command]
+pub fn list_logs(
+    state: tauri::State<'_, AppState>,
+    run_id: Option<i64>,
+    after_id: Option<i64>,
+    limit: Option<i64>,
+) -> AppResult<Vec<RunLog>> {
+    let conn = lock_db(&state)?;
+    db::list_logs(&conn, run_id, after_id.unwrap_or(0), limit.unwrap_or(500))
+}
+
+/// 清空日志。跑过很多轮之后会攒下不少，给用户一个清理入口。
+#[tauri::command]
+pub fn clear_logs(state: tauri::State<'_, AppState>) -> AppResult<i64> {
+    let conn = lock_db(&state)?;
+    let n = conn.execute("DELETE FROM run_log", [])?;
+    Ok(n as i64)
 }
 
 // ---------------- 任务队列 ----------------

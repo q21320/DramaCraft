@@ -274,6 +274,8 @@ pub fn run() {
             commands::cancel_pending_jobs,
             commands::clear_finished_jobs,
             commands::delete_job,
+            commands::list_logs,
+            commands::clear_logs,
             commands::pipeline_stages,
             commands::pipeline_scan,
             commands::pipeline_default_out_dir,

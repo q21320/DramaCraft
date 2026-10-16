@@ -5,7 +5,7 @@
 use crate::error::AppResult;
 use crate::models::{
     Asset, AssetSummary, Cue, Job, JobCounts, Media, MediaProbe, OutputEpisode, OutputSlice,
-    PipelineDrama, PipelineRun, Project, PublishAccount, PublishPlan, Segment,
+    PipelineDrama, PipelineRun, Project, PublishAccount, PublishPlan, RunLog, Segment,
 };
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -173,8 +173,29 @@ const SCHEMA_V9: &str = r#"
 ALTER TABLE pipeline_drama ADD COLUMN project_id INTEGER;
 "#;
 
+/// v10：运行日志。
+///
+/// 为什么要单独一张表：流水线跑起来是几十上百个任务，用户需要能**回头看**
+/// 「刚才到底做了什么、卡在哪一步」。原来只有任务表，看的是状态；
+/// 日志看的是**过程**（扫到什么、导入了多少、每一步的产出）。
+///
+/// 真实软件也是这么做的 —— 它左侧有一页「运行日志」，
+/// 日志文件里那种「===== AI 重写简介 =====」的分节就是给人看的。
+const SCHEMA_V10: &str = r#"
+CREATE TABLE IF NOT EXISTS run_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id     INTEGER,
+    drama_id   INTEGER,
+    level      TEXT    NOT NULL DEFAULT 'info',
+    message    TEXT    NOT NULL,
+    created_at TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_log_run ON run_log(run_id, id);
+"#;
+
 /// 当前 schema 版本。加表/加列时递增，并在 `migrate` 里补一段。
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
@@ -216,6 +237,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     }
     if version < 9 {
         conn.execute_batch(SCHEMA_V9)?;
+    }
+    if version < 10 {
+        conn.execute_batch(SCHEMA_V10)?;
     }
     if version < SCHEMA_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -1061,6 +1085,90 @@ pub fn run_outputs(conn: &Connection, run_id: i64) -> AppResult<Vec<OutputEpisod
     Ok(out)
 }
 
+// ---------- run_log（运行日志） ----------
+
+/// 某部剧属于哪次运行。日志要按运行过滤，而任务只带 drama_id。
+pub fn run_id_of_drama(conn: &Connection, drama_id: Option<i64>) -> AppResult<Option<i64>> {
+    let Some(id) = drama_id else { return Ok(None) };
+    let mut stmt = conn.prepare("SELECT run_id FROM pipeline_drama WHERE id = ?1")?;
+    let mut rows = stmt.query(params![id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+/// 写一行日志。
+///
+/// **失败不抛错**：日志写不进去不该让流水线挂掉。调用方也不必处理错误。
+pub fn append_log(
+    conn: &Connection,
+    run_id: Option<i64>,
+    drama_id: Option<i64>,
+    level: &str,
+    message: &str,
+) {
+    let _ = conn.execute(
+        "INSERT INTO run_log(run_id, drama_id, level, message, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![run_id, drama_id, level, message, now()],
+    );
+}
+
+/// 读日志。`after_id` 用来做增量拉取（前端轮询只要新行）。
+pub fn list_logs(
+    conn: &Connection,
+    run_id: Option<i64>,
+    after_id: i64,
+    limit: i64,
+) -> AppResult<Vec<RunLog>> {
+    let limit = limit.clamp(1, 2000);
+    let mut out = Vec::new();
+    match run_id {
+        Some(id) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, run_id, drama_id, level, message, created_at FROM run_log
+                  WHERE run_id = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![id, after_id, limit], row_to_run_log)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT id, run_id, drama_id, level, message, created_at FROM run_log
+                  WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![after_id, limit], row_to_run_log)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn row_to_run_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunLog> {
+    Ok(RunLog {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        drama_id: row.get(2)?,
+        level: row.get(3)?,
+        message: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+/// 清掉某个运行之前的旧日志，免得无限增长。
+pub fn trim_logs(conn: &Connection, keep: i64) -> AppResult<i64> {
+    let n = conn.execute(
+        "DELETE FROM run_log WHERE id <= (SELECT MAX(id) FROM run_log) - ?1",
+        params![keep.max(100)],
+    )?;
+    Ok(n as i64)
+}
+
 // ---------- asset（用户自备素材库） ----------
 
 const ASSET_COLUMNS: &str = "id, kind, name, path, category, tags, duration_ms, size_bytes, \
@@ -1904,6 +2012,43 @@ mod tests {
     const OK_SLICE: &str =
         r#"{"mediaId":1,"mode":{"mode":"equalParts","parts":3},"outDir":"E:/o"}"#;
     const OK_OCR: &str = r#"{"mediaId":2}"#;
+    /// 日志：能按运行过滤、能增量拉取、写坏了不抛错。
+    #[test]
+    fn logs_are_filterable_and_incremental() {
+        let conn = mem();
+        append_log(&conn, Some(1), None, "info", "扫描完成");
+        append_log(&conn, Some(1), Some(7), "warn", "第 03 集有重复副本");
+        append_log(&conn, Some(2), None, "info", "另一次运行");
+
+        // 全部
+        let all = list_logs(&conn, None, 0, 100).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // 只看某次运行 —— 日志页的主要用法
+        let run1 = list_logs(&conn, Some(1), 0, 100).unwrap();
+        assert_eq!(run1.len(), 2);
+        assert!(run1.iter().all(|l| l.run_id == Some(1)));
+        assert_eq!(run1[0].message, "扫描完成");
+        assert_eq!(run1[1].drama_id, Some(7));
+
+        // 增量：只要新行，不重复搬已经看过的
+        let last = run1.last().unwrap().id;
+        append_log(&conn, Some(1), None, "ok", "已排 12 个任务");
+        let fresh = list_logs(&conn, Some(1), last, 100).unwrap();
+        assert_eq!(fresh.len(), 1, "只该拿到新增的那一行");
+        assert_eq!(fresh[0].message, "已排 12 个任务");
+    }
+
+    #[test]
+    fn log_writes_never_fail_the_caller() {
+        // 日志写不进去不该让流水线挂掉 —— 表被删了也不 panic
+        let conn = mem();
+        conn.execute("DROP TABLE run_log", []).unwrap();
+        append_log(&conn, Some(1), None, "info", "这条写不进去");
+        // 到这里没 panic 就算过
+        assert!(list_logs(&conn, Some(1), 0, 10).is_err(), "读要如实报错");
+    }
+
     /// 删素材 / 删工程必须连带清掉挂着的任务。
     ///
     /// 不清的话，队列里剩下的任务跑到写字幕那一步会撞外键 ——
