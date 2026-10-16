@@ -609,9 +609,17 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                 // 判据：这部剧最近一条日志如果已经是同一个标题，就不再打。
                 if let Some(drama_id) = job.pipeline_drama_id {
                     let label = format!("===== {} =====", kind_label(&job.kind));
-                    let last = db::last_log_message(&conn, drama_id).unwrap_or(None);
-                    if last.as_deref() != Some(label.as_str()) {
-                        let run_id = db::run_id_of_drama(&conn, Some(drama_id)).unwrap_or(None);
+                    let run_id = db::run_id_of_drama(&conn, Some(drama_id)).unwrap_or(None);
+                    // **这次运行里这个标题没写过才写。**
+                    //
+                    // 不能用「最近一条是不是标题」当判据 —— 明细行之后
+                    // 它又会认为该打了，61 集分十几批跑就会打十几次标题。
+                    let already = match run_id {
+                        Some(r) => db::has_log_with_message(&conn, drama_id, r, &label)
+                            .unwrap_or(false),
+                        None => false,
+                    };
+                    if !already {
                         db::append_log(&conn, run_id, Some(drama_id), "info", &label);
                     }
                 }

@@ -1,4 +1,4 @@
-//! SQLite 存取层。
+﻿//! SQLite 存取层。
 //!
 //! 迁移策略：只前进不回退，靠 `PRAGMA user_version` 判断。旧库能直接打开。
 
@@ -1224,20 +1224,25 @@ pub fn run_id_of_drama(conn: &Connection, drama_id: Option<i64>) -> AppResult<Op
     }
 }
 
-/// 某部剧最近一条日志的内容。
+/// 这次运行里，这部剧是不是已经写过这条日志了？
 ///
-/// 用来判断「步骤标题要不要再打一次」——
-/// 标题是**分节**，一个步骤只该出现一次。每个任务都打一遍的话，
-/// 61 集就是 61 行一模一样的标题，纯噪音（用户直接问过
-/// 「怎么执行这么多次，执行一次不行嘛」）。
-pub fn last_log_message(conn: &Connection, drama_id: i64) -> AppResult<Option<String>> {
-    let mut stmt =
-        conn.prepare("SELECT message FROM run_log WHERE drama_id = ?1 ORDER BY id DESC LIMIT 1")?;
-    let mut rows = stmt.query(params![drama_id])?;
-    match rows.next()? {
-        Some(row) => Ok(Some(row.get(0)?)),
-        None => Ok(None),
-    }
+/// 用来判断「步骤标题要不要打」——
+/// 标题是**分节**，一个步骤在一次运行里只该出现一次。
+///
+/// **不能用「最近一条是不是标题」当判据**：明细行之后它又会认为该打了，
+/// 61 集分十几批跑就会打十几次标题 —— 那正是用户抱怨的毛病。
+pub fn has_log_with_message(
+    conn: &Connection,
+    drama_id: i64,
+    run_id: i64,
+    message: &str,
+) -> AppResult<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM run_log WHERE drama_id = ?1 AND run_id = ?2 AND message = ?3",
+        params![drama_id, run_id, message],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// 还有多少个这种类型的待跑任务。
@@ -2415,30 +2420,37 @@ mod tests {
         assert!(get_media(&conn, m.id).is_ok());
     }
 
-    /// 步骤标题是**分节**，不是每个任务的进度条。
+    /// 步骤标题是**分节**，一次运行里一个步骤只出现一次。
     ///
-    /// 每集都打一遍的话，61 集就是 61 行一模一样的 `===== 整集去重 =====` ——
-    /// 用户直接问过「怎么执行这么多次，执行一次不行嘛」。
+    /// 用户先后问过两次「怎么执行这么多次，执行一次不行嘛」。
+    ///
+    /// **关键是判据不能是「最近一条是不是标题」**：61 集分十几批跑，
+    /// 每批跑完最近一条都是明细行，于是每批都会再打一次标题 ——
+    /// 那正是用户截图里看到的样子。判据必须是「这次运行里写过没有」。
     #[test]
-    fn stage_header_is_written_once_per_stage() {
+    fn stage_header_is_written_once_per_run() {
         let conn = mem();
         let header = "===== 整集去重 =====";
 
-        // 第一次：最近一条不是它 → 该打
-        assert_eq!(last_log_message(&conn, 7).unwrap(), None);
+        // 第一次：没写过 → 该写
+        assert!(!has_log_with_message(&conn, 7, 1, header).unwrap());
         append_log(&conn, Some(1), Some(7), "info", header);
+        assert!(has_log_with_message(&conn, 7, 1, header).unwrap());
 
-        // 第二次：最近一条已经是它 → 不该再打
-        assert_eq!(last_log_message(&conn, 7).unwrap().as_deref(), Some(header));
+        // **中间插了明细行之后，仍然算写过** —— 这正是旧判据栽的地方
+        append_log(&conn, Some(1), Some(7), "ok", "✓ 第01集.mp4 整集去重：去重完成…");
+        append_log(&conn, Some(1), Some(7), "ok", "✓ 第02集.mp4 整集去重：去重完成…");
+        assert!(
+            has_log_with_message(&conn, 7, 1, header).unwrap(),
+            "明细行插进来之后，标题仍然算写过 —— 否则每一批都会再打一次"
+        );
 
-        // 中间插了明细行之后，又开始新的一批 —— 但标题已经在上面了，
-        // 判据是"最近一条"，所以明细行之后会再打一次标题。
-        // 这是有意的：标题跟着它自己那一段明细走，用户翻日志时对得上。
-        append_log(&conn, Some(1), Some(7), "ok", "✓ 整集去重：去重完成…");
-        assert_ne!(last_log_message(&conn, 7).unwrap().as_deref(), Some(header));
-
+        // 另一次运行要重新打（那是新的一轮）
+        assert!(!has_log_with_message(&conn, 7, 2, header).unwrap());
         // 别的剧不受影响
-        assert_eq!(last_log_message(&conn, 8).unwrap(), None);
+        assert!(!has_log_with_message(&conn, 8, 1, header).unwrap());
+        // 别的步骤不受影响
+        assert!(!has_log_with_message(&conn, 7, 1, "===== 视频切片 =====").unwrap());
     }
 
     #[test]
