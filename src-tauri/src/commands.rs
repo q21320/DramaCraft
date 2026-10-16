@@ -1,4 +1,4 @@
-﻿//! 前后端唯一边界。前端只认这里的命令名与参数形状。
+//! 前后端唯一边界。前端只认这里的命令名与参数形状。
 
 use crate::db;
 use crate::error::{AppError, AppResult};
@@ -1886,11 +1886,14 @@ pub fn pipeline_start(
             outcome.skipped.join("；")
         );
     }
-    if outcome.imported == 0 {
-        return Err(AppError::Msg(format!(
-            "一部剧的素材都没能导入。{}",
-            outcome.skipped.first().cloned().unwrap_or_default()
-        )));
+    // 「一集都没用上」才算失败。判断逻辑在 StartOutcome 上（可测）。
+    if outcome.imported_nothing() {
+        let why = outcome
+            .skipped
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "源目录里没有可用的视频".to_string());
+        return Err(AppError::Msg(format!("一部剧的素材都没能导入。{why}")));
     }
 
     db::get_pipeline_run(&conn, outcome.run_id)?

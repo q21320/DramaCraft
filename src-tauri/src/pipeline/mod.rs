@@ -1421,6 +1421,41 @@ mod tests {
     }
 
     #[test]
+    fn rerunning_is_not_mistaken_for_importing_nothing() {
+        // 加「复用已有素材」之后踩过的坑：第二次跑同一批素材，
+        // imported 全是 0（都复用了），只看 imported 会把正常情况当成失败，
+        // 用户看到「一部剧的素材都没能导入」。
+        let fresh = StartOutcome {
+            run_id: 1,
+            drama_count: 1,
+            imported: 3,
+            queued: 3,
+            skipped: Vec::new(),
+            reused_projects: 0,
+            reused_media: 0,
+        };
+        assert!(!fresh.imported_nothing());
+
+        let reused = StartOutcome {
+            imported: 0,
+            reused_projects: 1,
+            reused_media: 3,
+            ..fresh.clone()
+        };
+        assert!(
+            !reused.imported_nothing(),
+            "全部复用不算失败 —— 这正是那个 bug"
+        );
+
+        let nothing = StartOutcome {
+            imported: 0,
+            reused_media: 0,
+            ..fresh
+        };
+        assert!(nothing.imported_nothing(), "真的没有才算失败");
+    }
+
+    #[test]
     fn every_stage_payload_actually_parses() {
         // 这条测试是为了防住一类坑：payload 的**字段名或枚举变体写错**，
         // 编译期查不出来，入队也不报，要跑到那个任务才炸。

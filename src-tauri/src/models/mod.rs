@@ -382,6 +382,17 @@ pub struct StartOutcome {
     pub reused_media: i64,
 }
 
+impl StartOutcome {
+    /// 一集都没能用上吗？
+    ///
+    /// **必须把「复用的」也算上**：加了「同源目录复用已有素材」之后，
+    /// 第二次跑同一批素材时 `imported` 本来就是 0（全都复用了）。
+    /// 只看 imported 会把正常情况误判成失败 —— 这个 bug 真发生过。
+    pub fn imported_nothing(&self) -> bool {
+        self.imported + self.reused_media == 0
+    }
+}
+
 /// 一部剧在流水线里的进度
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
