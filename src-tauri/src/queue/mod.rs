@@ -588,7 +588,7 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
         // 「上一步全部跑完，才轮到下一步」。
         //
         // 61 集去重原来一个个跑要半小时以上，这是用户抱怨「很慢很慢」的根源。
-        let batch = {
+        let (kind, batch) = {
             let state = app.state::<AppState>();
             let conn = state
                 .db
@@ -600,21 +600,23 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             let jobs = db::next_pending_jobs_of_kind(&conn, &kind, workers)?;
             for job in &jobs {
                 db::mark_job_running(&conn, job.id)?;
-                // 日志用 `===== 整集去重 =====` 分节，**不用 ▶** ——
-                // ▶ 长得像能点开的东西，点了没反应，用户会以为坏了。
-                if job.pipeline_drama_id.is_some() {
-                    let run_id =
-                        db::run_id_of_drama(&conn, job.pipeline_drama_id).unwrap_or(None);
-                    db::append_log(
-                        &conn,
-                        run_id,
-                        job.pipeline_drama_id,
-                        "info",
-                        &format!("===== {} =====", kind_label(&job.kind)),
-                    );
+                // **步骤标题只打一次。**
+                //
+                // 标题是分节（`===== 整集去重 =====`），不是每个任务的进度条。
+                // 每个任务都打一遍的话，61 集就是 61 行一模一样的标题 ——
+                // 用户直接问过「怎么执行这么多次，执行一次不行嘛」。
+                //
+                // 判据：这部剧最近一条日志如果已经是同一个标题，就不再打。
+                if let Some(drama_id) = job.pipeline_drama_id {
+                    let label = format!("===== {} =====", kind_label(&job.kind));
+                    let last = db::last_log_message(&conn, drama_id).unwrap_or(None);
+                    if last.as_deref() != Some(label.as_str()) {
+                        let run_id = db::run_id_of_drama(&conn, Some(drama_id)).unwrap_or(None);
+                        db::append_log(&conn, run_id, Some(drama_id), "info", &label);
+                    }
                 }
             }
-            jobs
+            (kind, jobs)
         };
         if batch.is_empty() {
             break;
@@ -633,6 +635,20 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
 
         // 并发执行 —— 这一整段 await 期间**不持有任何数据库锁**。
         // 各自的 ffmpeg 是独立进程，互不干扰。
+        // 记下这批属于哪次运行 —— batch 马上要被 move 进任务里，
+        // 后面写「步骤完成」汇总时还要用
+        let batch_run_id: Option<i64> = {
+            let state = app.state::<AppState>();
+            let conn = state
+                .db
+                .lock()
+                .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
+            batch
+                .iter()
+                .filter_map(|j| j.pipeline_drama_id)
+                .find_map(|d| db::run_id_of_drama(&conn, Some(d)).unwrap_or(None))
+        };
+
         let mut handles = Vec::with_capacity(batch.len());
         for job in batch {
             let app_task = app.clone();
@@ -761,6 +777,29 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             }
         }
             processed += 1;
+        }
+
+        // **步骤收口。**
+        //
+        // 明细一条条列出来是对的（用户要看去重差异），但一长串 ✓ 没有尽头，
+        // 用户不知道「这一步到底完了没有」。跑到这一步没剩下同类任务，
+        // 就补一行汇总把它收住。
+        if let Some(run_id) = batch_run_id {
+            let state = app.state::<AppState>();
+            let conn = state
+                .db
+                .lock()
+                .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
+            if db::count_pending_jobs_of_kind(&conn, &kind)? == 0 {
+                let n = db::count_done_jobs_of_kind(&conn, run_id, &kind).unwrap_or(0);
+                db::append_log(
+                    &conn,
+                    Some(run_id),
+                    None,
+                    "info",
+                    &format!("===== {} 全部完成（{n} 个） =====", kind_label(&kind)),
+                );
+            }
         }
     }
 

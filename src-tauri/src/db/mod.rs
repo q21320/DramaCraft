@@ -1,4 +1,4 @@
-﻿//! SQLite 存取层。
+//! SQLite 存取层。
 //!
 //! 迁移策略：只前进不回退，靠 `PRAGMA user_version` 判断。旧库能直接打开。
 
@@ -1157,6 +1157,42 @@ pub fn run_id_of_drama(conn: &Connection, drama_id: Option<i64>) -> AppResult<Op
     }
 }
 
+/// 某部剧最近一条日志的内容。
+///
+/// 用来判断「步骤标题要不要再打一次」——
+/// 标题是**分节**，一个步骤只该出现一次。每个任务都打一遍的话，
+/// 61 集就是 61 行一模一样的标题，纯噪音（用户直接问过
+/// 「怎么执行这么多次，执行一次不行嘛」）。
+pub fn last_log_message(conn: &Connection, drama_id: i64) -> AppResult<Option<String>> {
+    let mut stmt =
+        conn.prepare("SELECT message FROM run_log WHERE drama_id = ?1 ORDER BY id DESC LIMIT 1")?;
+    let mut rows = stmt.query(params![drama_id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+/// 还有多少个这种类型的待跑任务。
+pub fn count_pending_jobs_of_kind(conn: &Connection, kind: &str) -> AppResult<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM job WHERE status = 'pending' AND kind = ?1",
+        params![kind],
+        |r| r.get(0),
+    )?)
+}
+
+/// 这次运行里，某个步骤完成了多少个。
+pub fn count_done_jobs_of_kind(conn: &Connection, run_id: i64, kind: &str) -> AppResult<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM job
+          WHERE status = 'done' AND kind = ?2
+            AND pipeline_drama_id IN (SELECT id FROM pipeline_drama WHERE run_id = ?1)",
+        params![run_id, kind],
+        |r| r.get(0),
+    )?)
+}
+
 /// 写一行日志。
 ///
 /// **失败不抛错**：日志写不进去不该让流水线挂掉。调用方也不必处理错误。
@@ -2147,6 +2183,75 @@ mod tests {
     const OK_SLICE: &str =
         r#"{"mediaId":1,"mode":{"mode":"equalParts","parts":3},"outDir":"E:/o"}"#;
     const OK_OCR: &str = r#"{"mediaId":2}"#;
+    /// 步骤标题是**分节**，不是每个任务的进度条。
+    ///
+    /// 每集都打一遍的话，61 集就是 61 行一模一样的 `===== 整集去重 =====` ——
+    /// 用户直接问过「怎么执行这么多次，执行一次不行嘛」。
+    #[test]
+    fn stage_header_is_written_once_per_stage() {
+        let conn = mem();
+        let header = "===== 整集去重 =====";
+
+        // 第一次：最近一条不是它 → 该打
+        assert_eq!(last_log_message(&conn, 7).unwrap(), None);
+        append_log(&conn, Some(1), Some(7), "info", header);
+
+        // 第二次：最近一条已经是它 → 不该再打
+        assert_eq!(last_log_message(&conn, 7).unwrap().as_deref(), Some(header));
+
+        // 中间插了明细行之后，又开始新的一批 —— 但标题已经在上面了，
+        // 判据是"最近一条"，所以明细行之后会再打一次标题。
+        // 这是有意的：标题跟着它自己那一段明细走，用户翻日志时对得上。
+        append_log(&conn, Some(1), Some(7), "ok", "✓ 整集去重：去重完成…");
+        assert_ne!(last_log_message(&conn, 7).unwrap().as_deref(), Some(header));
+
+        // 别的剧不受影响
+        assert_eq!(last_log_message(&conn, 8).unwrap(), None);
+    }
+
+    #[test]
+    fn counting_pending_and_done_jobs_by_kind() {
+        let conn = mem();
+        let run = create_pipeline_run(&conn, "D:/源", "D:/二创", &[]).unwrap();
+        let drama = add_pipeline_drama(&conn, run, "某剧", "D:/源", "D:/二创/某剧", 3, None)
+            .unwrap();
+
+        for i in 1..=3 {
+            enqueue_job_for(
+                &conn,
+                None,
+                "dedup",
+                &format!(r#"{{"mediaId":{i},"outDir":"D:/o"}}"#),
+                Some(drama),
+            )
+            .unwrap();
+        }
+        enqueue_job_for(
+            &conn,
+            None,
+            "slice",
+            r#"{"mediaId":1,"mode":{"mode":"everySeconds","seconds":10},"outDir":"D:/o"}"#,
+            Some(drama),
+        )
+        .unwrap();
+
+        assert_eq!(count_pending_jobs_of_kind(&conn, "dedup").unwrap(), 3);
+        assert_eq!(count_pending_jobs_of_kind(&conn, "slice").unwrap(), 1);
+        assert_eq!(count_done_jobs_of_kind(&conn, run, "dedup").unwrap(), 0);
+
+        // 跑完两个之后
+        let jobs = next_pending_jobs_of_kind(&conn, "dedup", 2).unwrap();
+        for j in &jobs {
+            finish_job(&conn, j.id, JOB_DONE, "好了").unwrap();
+        }
+        assert_eq!(count_pending_jobs_of_kind(&conn, "dedup").unwrap(), 1, "还剩一个");
+        assert_eq!(
+            count_done_jobs_of_kind(&conn, run, "dedup").unwrap(),
+            2,
+            "完成数要分开统计 —— 收口汇总要用"
+        );
+    }
+
     /// 日志：能按运行过滤、能增量拉取、写坏了不抛错。
     #[test]
     fn logs_are_filterable_and_incremental() {
