@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   NAlert,
@@ -9,16 +9,16 @@ import {
   NSelect,
   NSpace,
   NTag,
-  useDialog,
   useMessage,
 } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { useRouter } from "vue-router";
 import { api } from "@/api";
 import type { LabelPosition, PipelineRun, PipelineStageOption, SourceScan } from "@/types";
 
 const message = useMessage();
-const dialog = useDialog();
+const router = useRouter();
 
 const stages = ref<PipelineStageOption[]>([]);
 const picked = ref<string[]>([]);
@@ -106,63 +106,14 @@ const lastUpdatedText = computed(() => {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 });
 
-const statusLabels: Record<string, string> = {
-  pending: "待跑",
-  running: "进行中",
-  done: "完成",
-  failed: "失败",
-  skipped: "已跳过",
-};
-
-const statusTypes: Record<string, "default" | "info" | "success" | "error" | "warning"> = {
-  pending: "default",
-  running: "info",
-  done: "success",
-  failed: "error",
-  skipped: "warning",
-};
-
-const runStatusLabels: Record<string, string> = {
-  running: "运行中",
-  done: "已完成",
-  failed: "有失败",
-  canceled: "已取消",
-};
-
 /**
- * 清空运行记录。
+ * 跳到运行日志页。
  *
- * **只清记录，不删磁盘上的产出** —— 这一点必须跟用户说清楚，
- * 否则「清空」两个字会让人以为视频也没了，不敢点。
- * 正在跑的那次也不会被删。
+ * 流水线页不再列运行记录 —— 那份列表和日志页说的是同一件事，
+ * 摆两份只会互相打架。**过程去日志页看**。
  */
-async function clearRuns() {
-  const running = runs.value.filter((r) => r.status === "running").length;
-  const tip =
-    running > 0
-      ? `会清掉已结束的运行记录（正在跑的那 ${running} 次保留）。\n\n磁盘上已经跑出来的视频不会被删除。`
-      : "会清掉所有运行记录。\n\n磁盘上已经跑出来的视频不会被删除。";
-  // NaiveUI 的 useDialog 没有 confirm()，用 warning 自己包一个 Promise
-  const ok = await new Promise<boolean>((resolve) => {
-    dialog.warning({
-      title: "清空运行记录",
-      content: tip,
-      positiveText: "清空",
-      negativeText: "算了",
-      onPositiveClick: () => resolve(true),
-      onNegativeClick: () => resolve(false),
-      onClose: () => resolve(false),
-    });
-  });
-  if (!ok) return;
-  try {
-    const n = await api.clearPipelineRuns();
-    activeRunId.value = null;
-    await refreshRuns();
-    message.success(`清掉了 ${n} 次运行记录（产出文件都还在）`);
-  } catch (e) {
-    message.error((e as Error).message);
-  }
+function goLogs() {
+  router.push("/logs");
 }
 
 async function refreshRuns() {
@@ -252,9 +203,6 @@ async function cancelRun(id: number) {
     message.error((e as Error).message);
   }
 }
-
-const kindLabel = (key: string) => stages.value.find((s) => s.key === key)?.label ?? key;
-
 let unlisten: UnlistenFn | null = null;
 let timer: number | null = null;
 
@@ -449,85 +397,25 @@ onUnmounted(() => {
     </n-space>
   </div>
 
-  <div class="dd-card">
-    <div class="dd-row" style="justify-content: space-between; margin-bottom: 10px">
-      <div class="dd-card-title">运行记录</div>
-      <n-space :size="10" align="center">
-        <!-- 「在动」要看得见：光让数字悄悄变，用户会以为卡死了 -->
-        <span v-if="busy" class="dd-live">
-          <span class="dd-dot" />正在跑
-        </span>
-        <span v-else class="dd-muted">空闲</span>
-        <span class="dd-muted dd-clock">最后更新 {{ lastUpdatedText || "—" }}</span>
-        <n-button size="small" @click="refreshRuns">刷新</n-button>
-        <n-button v-if="runs.length > 0" size="small" quaternary @click="clearRuns">
-          清空记录
-        </n-button>
-      </n-space>
-    </div>
+  <!--
+    只留一行状态，不再列运行记录。
 
-    <div v-if="runs.length === 0" class="dd-empty">还没跑过流水线。</div>
+    用户说「运行记录不要了 我只看日志就好了」—— 对：那份列表和日志页
+    说的是同一件事，摆两份只会互相打架。一份事实来源就够了。
 
-    <n-space v-else vertical :size="12">
-      <div v-for="run in runs" :key="run.id" class="dd-card" style="margin: 0">
-        <div class="dd-row" style="justify-content: space-between; margin-bottom: 8px">
-          <n-space :size="8">
-            <n-tag
-              size="small"
-              :type="run.status === 'done' ? 'success' : run.status === 'failed' ? 'error' : 'info'"
-              :bordered="false"
-            >
-              #{{ run.id }} {{ runStatusLabels[run.status] ?? run.status }}
-            </n-tag>
-            <n-tag size="small" :bordered="false">{{ run.dramaCount }} 部剧</n-tag>
-            <span class="dd-muted dd-mono dd-wrap">{{ run.rootDir }}</span>
-          </n-space>
-          <n-space :size="8">
-            <n-button size="tiny" @click="activeRunId = activeRunId === run.id ? null : run.id">
-              {{ activeRunId === run.id ? "收起" : "展开" }}
-            </n-button>
-            <n-button
-              v-if="run.status === 'running'"
-              size="tiny"
-              @click="cancelRun(run.id)"
-            >
-              取消
-            </n-button>
-          </n-space>
-        </div>
-
-        <table v-if="activeRunId === run.id" class="dd-table">
-          <thead>
-            <tr>
-              <th style="width: 200px">剧目</th>
-              <th style="width: 70px">集数</th>
-              <th style="width: 90px">状态</th>
-              <th style="width: 90px">到哪一步</th>
-              <th>最近一条消息</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="d in run.dramas" :key="d.id">
-              <td>{{ d.name }}</td>
-              <td>{{ d.episodeCount }}</td>
-              <td>
-                <n-tag size="tiny" :type="statusTypes[d.status] ?? 'default'" :bordered="false">
-                  {{ statusLabels[d.status] ?? d.status }}
-                </n-tag>
-              </td>
-              <td class="dd-muted">{{ d.stage ? kindLabel(d.stage) : "未开始" }}</td>
-              <td class="dd-wrap dd-muted">{{ d.message || "—" }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
+    但「正在跑」还是得看得见：光让数字悄悄变，用户会以为卡死了。
+  -->
+  <div class="dd-row" style="justify-content: space-between; padding: 2px 4px">
+    <n-space :size="10" align="center">
+      <span v-if="busy" class="dd-live"><span class="dd-dot" />正在跑</span>
+      <span v-else class="dd-muted">空闲</span>
+      <span v-if="activeRun" class="dd-muted">{{ activeRun.dramaCount }} 部剧</span>
+      <span class="dd-muted dd-clock">最后更新 {{ lastUpdatedText || "—" }}</span>
     </n-space>
-
-    <n-alert v-if="activeRun" type="info" style="margin-top: 12px" title="说明">
-      进度按「一部剧做完再做下一部」推进。某一步失败时，那部剧会标成失败，
-      其余步骤不再继续 —— 一步没成，后面的产出没有意义。
-      详细的任务列表在「任务队列」页。
-    </n-alert>
+    <n-space :size="8" align="center">
+      <n-button v-if="busy" size="small" @click="cancelRun(activeRunId!)">取消</n-button>
+      <n-button size="small" type="primary" ghost @click="goLogs">看运行日志 →</n-button>
+    </n-space>
   </div>
 
 </template>

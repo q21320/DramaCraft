@@ -1,4 +1,4 @@
-//! 发布：把切片整理成「可以直接上传」的发布包，并维护**本地**发布台账。
+﻿//! 发布：把切片整理成「可以直接上传」的发布包，并维护**本地**发布台账。
 //!
 //! ## 为什么这里不直接调平台接口
 //!
@@ -227,7 +227,7 @@ pub fn render_readme(meta: &PublishMetadata) -> String {
     out.push_str("4. 发完回到 DramaDist 的「发布」页，把该平台标记为已发布，方便自己记账。\n\n");
 
     out.push_str("说明\n----\n");
-    out.push_str("· 本次导出只在本地整理文件，**没有向任何平台发送任何内容**；\n");
+    out.push_str("· 本次导出只在本地整理文件，没有向任何平台发送任何内容；\n");
     out.push_str("· 封面若未指定，是从第一个片段抽的一帧，建议按平台要求自行替换；\n");
     let note = platform_note(&meta.platform);
     if !note.is_empty() {

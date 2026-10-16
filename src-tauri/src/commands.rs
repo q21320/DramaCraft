@@ -1,4 +1,4 @@
-//! 前后端唯一边界。前端只认这里的命令名与参数形状。
+﻿//! 前后端唯一边界。前端只认这里的命令名与参数形状。
 
 use crate::db;
 use crate::error::{AppError, AppResult};
@@ -2568,7 +2568,7 @@ pub async fn build_storyboard(
     if used_ai {
         notes.push(format!("分镜描述由「{}」反推", provider.as_ref().unwrap().label));
     } else {
-        notes.push("没有可用的 AI 服务，产出的是**无描述版**（只有画面，没有文字说明）".into());
+        notes.push("没有可用的 AI 服务，产出的是无描述版（只有画面，没有文字说明）".into());
     }
     let list = out_dir.join("分镜清单.txt");
     let _ = std::fs::write(
