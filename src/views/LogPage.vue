@@ -16,6 +16,7 @@ import {
   NAlert,
   NButton,
   NCheckbox,
+  NModal,
   NSelect,
   NSpace,
   NTag,
