@@ -56,19 +56,54 @@ pub fn normalize(raw: &TransformOptions) -> TransformOptions {
         // 标识在这里不夹数值：文字要按绘图规则清洗、字号要按画面高度算，
         // 那两件事都在 build_label_filter 里做（这里拿不到画面尺寸）
         header_label: raw.header_label.clone(),
-            hue: 0.0,
-            sharpen: 0.0,
-            tmix: 0,
-            max_height: 0,
-            fps: 0.0,
-            shift_x: 0,
-            shift_y: 0,
-            corner_label: None,
-            gop: 0,
-            bframes: -1,
-            bitrate_bps: 0,    }
+
+        // ---- 照 13 项补的那些：**必须原样带过来并夹进安全范围** ----
+        //
+        // 这里踩过一次坑：批量加字段时脚本把这一段写成了固定默认值
+        // （`hue: 0.0` 之类），于是新加的 11 项参数**一个都没生效** ——
+        // 用户勾了片头标识、选了 720p，跑完什么都没变。
+        // 教训：normalize 是「过滤网」，新字段必须显式过网，漏一个就静默失效。
+        hue: clamp_finite(raw.hue, HUE_MIN, HUE_MAX, 0.0),
+        sharpen: clamp_finite(raw.sharpen, 0.0, SHARPEN_MAX, 0.0),
+        tmix: raw.tmix.min(TMIX_MAX),
+        max_height: clamp_i64(raw.max_height, 0, MAX_HEIGHT_MAX, 0),
+        fps: clamp_finite(raw.fps, 0.0, FPS_MAX, 0.0),
+        shift_x: clamp_i64(raw.shift_x, -SHIFT_MAX, SHIFT_MAX, 0),
+        shift_y: clamp_i64(raw.shift_y, -SHIFT_MAX, SHIFT_MAX, 0),
+        corner_label: raw.corner_label.clone(),
+        gop: clamp_i64(raw.gop, 0, GOP_MAX, 0),
+        bframes: clamp_i64(raw.bframes, -1, BF_MAX, -1),
+        bitrate_bps: clamp_i64(raw.bitrate_bps, 0, BITRATE_MAX, 0),
+    }
 }
 
+/// 夹一个整数到范围内；越界就取 default。
+fn clamp_i64(v: i64, lo: i64, hi: i64, default: i64) -> i64 {
+    if (lo..=hi).contains(&v) {
+        v
+    } else {
+        default
+    }
+}
+
+/// 新增参数的取值范围。
+///
+/// 这些是照真实软件那 13 项补贴上去的，不在「轻/中/强」三个档里，
+/// 但**必须有上限** —— 用户乱填一个 999 会直接把 ffmpeg 跑挂。
+const HUE_MIN: f64 = -30.0;
+const HUE_MAX: f64 = 30.0;
+const SHARPEN_MAX: f64 = 1.5;
+/// 帧混合最多混 4 帧。再多就不是去重而是糊成一片了
+const TMIX_MAX: u32 = 4;
+/// 输出高度上限（含）。0 = 不缩放
+const MAX_HEIGHT_MAX: i64 = 2160;
+const FPS_MAX: f64 = 120.0;
+/// 几何位移上限（像素）
+const SHIFT_MAX: i64 = 40;
+const GOP_MAX: i64 = 600;
+const BF_MAX: i64 = 8;
+/// 码率上限 50Mbps
+const BITRATE_MAX: i64 = 50_000_000;
 /// 是否为"什么都不做"。
 pub fn is_noop(raw: &TransformOptions) -> bool {
     let o = normalize(raw);
@@ -337,7 +372,12 @@ pub fn build_video_filter(raw: &TransformOptions, target: Option<(u32, u32)>) ->
     // 片头标识放在**最后**：它要压在最终画面上。
     // 放前面的话，后面的裁切/缩放会把标识一起变形。
     if let Some(label) = &o.header_label {
-        let size = target.map(|(w, h)| (w as i64, h as i64)).unwrap_or((1080, 1920));
+        // **按缩放之后的高度算字号。**
+        //
+        // 标识画在 `scale=-2:720` 之后，画面已经是 720 高了；
+        // 还按源尺寸 1920 算字号的话，字会大三倍（实测 fontsize=58 画在 720 上）。
+        let (w, h) = target.unwrap_or((1080, 1920));
+        let size = (w as i64, final_height(&o, h as i64));
         let seg = build_label_filter(label, size)?;
         if !seg.is_empty() {
             parts.push(seg);
@@ -346,7 +386,8 @@ pub fn build_video_filter(raw: &TransformOptions, target: Option<(u32, u32)>) ->
 
     // 剧名角标也是压在最终画面上，和片头标识同理
     if let Some(corner) = &o.corner_label {
-        let size = target.map(|(w, h)| (w as i64, h as i64)).unwrap_or((1080, 1920));
+        let (w, h) = target.unwrap_or((1080, 1920));
+        let size = (w as i64, final_height(&o, h as i64));
         let seg = build_corner_filter(corner, size)?;
         if !seg.is_empty() {
             parts.push(seg);
@@ -356,6 +397,17 @@ pub fn build_video_filter(raw: &TransformOptions, target: Option<(u32, u32)>) ->
     Ok(parts.join(","))
 }
 
+/// 滤镜跑完之后画面有多高。
+///
+/// 标识、角标这些**画在最后**的东西，字号要按这个高度算，不能按源尺寸 ——
+/// 中间有 `scale=-2:720` 会把画面缩小。
+fn final_height(o: &TransformOptions, source_height: i64) -> i64 {
+    if o.max_height > 0 && source_height > o.max_height {
+        o.max_height
+    } else {
+        source_height
+    }
+}
 /// 剧名角标：一直显示在角落的小字。
 ///
 /// 和「片头标识」的区别：片头标识是**合规声明**（只显示前几秒、要求显著），
@@ -1200,6 +1252,26 @@ mod tests {
         assert!(b.crop_ratio > a.crop_ratio, "裁切该随强度变：{} vs {}", a.crop_ratio, b.crop_ratio);
         assert!(b.speed > a.speed, "变速该随强度变");
         assert!(b.noise > a.noise, "噪点该随强度变");
+    }
+    /// 临时：打印实际生成的滤镜串，用来核对片头标识有没有进去。
+    #[test]
+    #[ignore]
+    fn dump_label_filter() {
+        let st = Strengths::from_seed(42);
+        let mut o = preset_for(Intensity::Strong, 0, &st);
+        o.header_label = Some(HeaderLabel {
+            text: "AI创作".into(),
+            seconds: 3.0,
+            position: LabelPosition::TopLeft,
+            size_ratio: 0.03,
+        });
+        let n = normalize(&o);
+        eprintln!("=== 无标识 ===");
+        eprintln!("{}", build_video_filter(&o, Some((1080, 1920))).unwrap());
+        eprintln!("=== 有标识（normalize 之后）===");
+        eprintln!("{}", build_video_filter(&n, Some((1080, 1920))).unwrap());
+        eprintln!("=== normalize 之后 header_label 还在吗: {} ===", n.header_label.is_some());
+        eprintln!("=== is_noop: {} ===", is_noop(&n));
     }
     #[test]
     fn generated_presets_never_mirror() {
