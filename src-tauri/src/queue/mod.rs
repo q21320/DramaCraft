@@ -67,7 +67,15 @@ pub fn is_known_kind(kind: &str) -> bool {
 // ---------------- 各任务的参数 ----------------
 
 /// AI 去字幕任务带的参数。
+///
+/// **`rename_all = "camelCase"` 不能少。**
+///
+/// 这一条踩过：结构体漏了这个属性，而生产端（`pipeline::stage_payload`）
+/// 造的是 camelCase —— 两边都没有编译期约束，任务跑到那一步才报
+/// 「参数无法解析（missing field `media_id`）」。**光断言生产端的输出形状
+/// 不够，必须真的反序列化一遍**（见 `every_payload_parses_into_its_executor`）。
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DesubtitlePayload {
     media_id: i64,
     /// 产出路径（`<剧目录>/quzimu/<组名>_quzimu.mp4`），由 pipeline 算好。
@@ -1027,5 +1035,64 @@ mod tests {
         assert_eq!(human_size(2048), "2.0 KB");
         assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
         assert_eq!(human_size(300 * 1024 * 1024), "300 MB");
+    }
+}
+#[cfg(test)]
+mod payload_shape_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// **每个步骤排进队列的 payload，执行器必须解得开。**
+    ///
+    /// 这条是为一类真实 bug 加的，而且**踩了两次**：
+    ///
+    /// 1. `desubtitle` 排的是整部剧的通用占位，执行器要的是按集的 ——
+    ///    报「missing field `media_id`」
+    /// 2. 修好形状之后又漏了 `rename_all = "camelCase"` —— 生产端造
+    ///    `mediaId`，消费端等 `media_id`，又是同一句报错
+    ///
+    /// **`stage_payload` 造、`execute` 解，两边没有任何编译期约束。**
+    /// 光断言 JSON 里有某个键是不够的（第 2 个 bug 就是这么漏过去的）——
+    /// 必须**真的用消费端的结构体解一遍**。
+    #[test]
+    #[test]
+    fn every_payload_parses_into_its_executor() {
+        // 只测**按集**的那几个 —— 整部剧级别的（storyboard/cover/cost）
+        // 走的是 `pipeline::drama_payload`，不经过 `stage_payload`。
+        for stage in ["desubtitle", "slice", "dedup"] {
+            let raw = crate::pipeline::stage_payload(
+                stage,
+                7,
+                Path::new("D:/二创/某剧"),
+                10_000,
+                "small",
+                "第01集",
+                None,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("{stage} 该有 payload"));
+
+            match stage {
+                "desubtitle" => {
+                    let p: DesubtitlePayload =
+                        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("去字幕解不开：{e}\n{raw}"));
+                    assert!(p.media_id > 0, "media_id 没解出来：{raw}");
+                    assert!(p.out_path.contains("quzimu"), "out_path 没解出来：{raw}");
+                }
+                "slice" => {
+                    let p: SlicePayload =
+                        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("切片解不开：{e}\n{raw}"));
+                    assert!(p.media_id > 0);
+                    assert!(!p.out_dir.is_empty());
+                }
+                "dedup" => {
+                    let p: DedupPayload =
+                        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("去重解不开：{e}\n{raw}"));
+                    assert!(p.media_id > 0);
+                    assert!(!p.out_dir.is_empty());
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 }
