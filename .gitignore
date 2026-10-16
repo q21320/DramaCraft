@@ -20,3 +20,6 @@ src-tauri/resources/asr_runtime/
 
 # 样本文件保留（记录了产出长什么样）
 !samples/
+
+# LaMa 模型（198MB，太大不进库；下载地址见 docs/gpu-setup.md）
+models/
