@@ -131,9 +131,16 @@ pub fn is_noop(raw: &TransformOptions) -> bool {
 ///
 /// `drawtext` 必须拿到**具体字体文件**，系统默认字体不一定有中文字形
 /// （拿不到就会画出一串方框）。这几款在中文 Windows 上必然存在。
+///
+/// **顺序就是优先级。**
 const CJK_FONTS: [&str; 6] = [
-    r"C:\Windows\Fonts\msyh.ttc",   // 微软雅黑（系统默认界面字体）
+    // **雅黑 Bold 排第一。**
+    //
+    // 常规体在 720p 的角标尺寸下笔画偏细、看着「发虚」
+    // （用户原话「字体也感觉有点点难看」）。六款字体画在同一帧上对比过，
+    // Bold 在同样字号下最干净。
     r"C:\Windows\Fonts\msyhbd.ttc", // 微软雅黑 Bold
+    r"C:\Windows\Fonts\msyh.ttc",   // 微软雅黑（常规，笔画偏细）
     r"C:\Windows\Fonts\simhei.ttf", // 黑体
     r"C:\Windows\Fonts\Deng.ttf",   // 等线
     r"C:\Windows\Fonts\simsun.ttc", // 宋体
@@ -238,13 +245,20 @@ pub fn build_label_filter(label: &HeaderLabel, size: (i64, i64)) -> AppResult<St
 
     // 加个半透明底衬：白字压在浅色画面上会看不清，
     // 而这是个披露义务，看不清等于没标。
+    // **用描边，不用黑底板。**
+    //
+    // 原来加了 `box=1:boxcolor=black@0.55`，是为了让白字在浅色画面上也看得清
+    // （这是披露义务，看不清等于没标）。但用户看到的是"一块黑砖"，很丑。
+    //
+    // 描边能达到同样的可读性，而且不占画面：白字带一圈深色轮廓，
+    // 压在亮处暗处都清楚。实测过：浅色背景上照样读得清。
     let mut f = format!(
-        "drawtext=fontfile={}:text={}:fontcolor=white:fontsize={}:box=1:\
-         boxcolor=black@0.55:boxborderw={}:x={}:y={}",
+        "drawtext=fontfile={}:text={}:fontcolor=white:fontsize={}:\
+         borderw={}:bordercolor=black@0.85:x={}:y={}",
         escape_filter_path(&font),
         text,
         size_px,
-        (size_px / 5).max(6),
+        (size_px / 12).max(2),
         x,
         y
     );
@@ -458,13 +472,14 @@ pub fn build_corner_filter(label: &CornerLabel, size: (i64, i64)) -> AppResult<S
         ),
     };
     let _ = w;
+    // 和片头标识一样用**描边**，不用黑底板 —— 角标是全程显示的，
+    // 一块黑砖压在画面上更难看。
     Ok(format!(
         "drawtext=fontfile='{}':text='{}':fontsize={fs}:fontcolor=white@{a:.2}:\
-         box=1:boxcolor=black@{:.2}:boxborderw={}:x={x}:y={y}",
+         borderw={}:bordercolor=black@0.7:x={x}:y={y}",
         escape_filter_path(&font),
         text,
-        a * 0.35,
-        (fs / 4).max(2)
+        (fs / 12).max(2)
     ))
 }
 
@@ -1362,8 +1377,14 @@ mod tests {
             f.contains(r"enable=lt(t\,3.00)"),
             "时间范围没写对，实际滤镜：{f}"
         );
-        // 白字要有底衬，否则压在浅色画面上看不清
-        assert!(f.contains("box=1"), "实际滤镜：{f}");
+        // 白字要**有描边**，否则压在浅色画面上看不清。
+        //
+        // 原来这里断言的是 `box=1`（半透明黑底板）。用户反馈
+        // 「怎么有个黑色的底板呢 透明的不行嘛？」—— 换成描边后
+        // 可读性一样，但不占画面。判据跟着改成描边。
+        assert!(f.contains("borderw="), "白字得有描边：{f}");
+        assert!(f.contains("bordercolor="), "描边颜色没设：{f}");
+        assert!(!f.contains("box=1"), "不该再有黑底板了：{f}");
         // 字号按画面高度算：1920 × 0.034 ≈ 65
         assert!(f.contains("fontsize=65"), "实际滤镜：{f}");
     }
