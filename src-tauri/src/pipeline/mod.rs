@@ -312,6 +312,7 @@ pub fn regroup_drama(
     ffmpeg: &Path,
     drama: &SourceDrama,
     out_root: &Path,
+    target_name: &str,
     target_ms: i64,
 ) -> AppResult<Vec<SourceEpisode>> {
     if drama.episodes.is_empty() {
@@ -322,7 +323,9 @@ pub fn regroup_drama(
         return Err(AppError::Msg("只有一段，不需要重组".into()));
     }
 
-    let work = out_root.join(safe_drama_name(&drama.name)).join("重组");
+    // 目录名由调用方给 —— 它才知道这部剧最终叫什么（可能已经被 AI 改过名）。
+    // 这里用原剧名的话，一次运行会写出两个文件夹。
+    let work = out_root.join(target_name).join("重组");
     std::fs::create_dir_all(&work)
         .map_err(|e| AppError::Msg(format!("建不了重组目录：{e}")))?;
 
@@ -353,6 +356,10 @@ pub fn regroup_drama(
     }
 
     // 2) 按目标时长切回多段
+    //
+    // **`-segment_start_number 1` 不能省。** ffmpeg 的 segment 复用器
+    // 序号默认从 **0** 开始，切出来是「第00集、第01集…」——
+    // 用户看到「第00集」直接懵了，而且集数也比实际多一个。
     let secs = (target_ms.max(5_000) as f64 / 1000.0).round() as i64;
     let pattern = work.join("第%02d集.mp4");
     let st = crate::proc::no_window(
@@ -360,6 +367,7 @@ pub fn regroup_drama(
             .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(&merged)
             .args(["-c", "copy", "-f", "segment", "-segment_time", &secs.to_string()])
+            .args(["-segment_start_number", "1"])
             .args(["-reset_timestamps", "1"])
             .arg(&pattern),
     )
@@ -383,14 +391,16 @@ pub fn regroup_drama(
         .collect();
     entries.sort();
     for p in entries {
+        // 重组后的集号就是我们切的顺序，自己知道，不用再去猜。
+        // **从 1 开始** —— ffmpeg 那边已经用 `-segment_start_number 1` 对齐了。
+        let no = made.len() as i64 + 1;
         made.push(SourceEpisode {
             path: p.to_string_lossy().to_string(),
             file_name: p
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default(),
-            // 重组后的集号就是我们切的顺序，自己知道，不用再去猜
-            episode: Some(made.len() as i64 + 1),
+            episode: Some(no),
             size_bytes: std::fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0),
         });
     }
@@ -485,7 +495,16 @@ pub fn start_pipeline(
     if let Some(opt) = regroup {
         for drama in &mut regrouped_scan.dramas {
             let before = drama.episodes.len();
-            match regroup_drama(&opt.ffmpeg, drama, out_root, opt.target_ms) {
+            // **要用最终剧名建目录。**
+            //
+            // 这里在 renames 应用之前，`drama.name` 还是源目录里的名字。
+            // 直接用它的话，一次运行会写出两个文件夹：重组落在原剧名目录下，
+            // 去重/切片落在新剧名目录下 —— 用户看到的就是「一跑生成两个文件夹」。
+            let target = renames
+                .get(&drama.name)
+                .map(|n| safe_drama_name(&n.title))
+                .unwrap_or_else(|| safe_drama_name(&drama.name));
+            match regroup_drama(&opt.ffmpeg, drama, out_root, &target, opt.target_ms) {
                 Ok(made) => {
                     let after = made.len();
                     drama.episodes = made;
@@ -1961,6 +1980,54 @@ mod tests {
         assert!(nothing.imported_nothing(), "真的没有才算失败");
     }
 
+    /// **一次运行只能生成一个剧目录。**
+    ///
+    /// 这是用户报的：「一跑就会生成两个文件夹，一个原视频文件夹里面放着去重，
+    /// 一个 ai 改名的文件夹放着其他」。
+    ///
+    /// 根因：整剧重组跑在 `renames` 应用**之前**，那时 `drama.name` 还是
+    /// 源目录里的名字。它按原名建目录，后面的去重/切片按新名建目录 —— 两个。
+    #[test]
+    fn regroup_and_later_stages_share_one_drama_folder() {
+        let out_root = Path::new("D:/二创");
+        let mut renames = std::collections::HashMap::new();
+        renames.insert(
+            "青丝谷桑蚕记".to_string(),
+            NewName {
+                title: "白毛狼引桑蚕守家园".to_string(),
+                synopsis: "简介".to_string(),
+            },
+        );
+
+        // 排任务时用的目录（新剧名）
+        let drama_out = out_root.join("白毛狼引桑蚕守家园");
+        let payload = stage_payload("slice", 1, &drama_out, 10_000, "", "第01集", None)
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let slice_dir = Path::new(v["outDir"].as_str().unwrap()).to_path_buf();
+
+        // 重组该落在**同一个**目录下
+        let target = renames
+            .get("青丝谷桑蚕记")
+            .map(|n| safe_drama_name(&n.title))
+            .unwrap();
+        let regroup_dir = out_root.join(&target).join("重组");
+
+        assert_eq!(
+            regroup_dir.parent().unwrap(),
+            slice_dir.parent().unwrap(),
+            "重组和切片必须落在同一个剧目录下，否则一跑就是两个文件夹：\n  重组 {}\n  切片 {}",
+            regroup_dir.display(),
+            slice_dir.display()
+        );
+        assert!(
+            !regroup_dir.to_string_lossy().contains("青丝谷桑蚕记"),
+            "不该再出现原剧名的目录：{}",
+            regroup_dir.display()
+        );
+    }
+
     /// 整剧重组：碎片按顺序拼成长片，再按目标时长切回「集」。
     ///
     /// 真实软件面对的是 55 个约 40 秒的碎片，得先拼成 28 个 60~90 秒的集 ——
@@ -1999,7 +2066,7 @@ mod tests {
         };
 
         let out_root = t.path().join("二创");
-        let made = regroup_drama(&ffmpeg, &drama, &out_root, 20_000).expect("重组失败");
+        let made = regroup_drama(&ffmpeg, &drama, &out_root, "碎片剧", 20_000).expect("重组失败");
 
         // 60 秒按 20 秒切 → 3 段（切点落在关键帧上，允许上下浮动）
         assert!(
@@ -2015,7 +2082,19 @@ mod tests {
                 ep.path
             );
             assert_eq!(ep.episode, Some(i as i64 + 1), "集号该是连续的");
+            // **文件名不能出现「第00集」** —— ffmpeg 的 segment 默认从 0 编号，
+            // 要用 -segment_start_number 1 掰过来。用户看到第00集直接懵了。
+            assert!(
+                !ep.file_name.contains("第00集"),
+                "段号该从 1 开始，不该有第00集：{}",
+                ep.file_name
+            );
         }
+        assert!(
+            made.iter().any(|e| e.file_name.contains("第01集")),
+            "第一个文件该是第01集：{:?}",
+            made.iter().map(|e| &e.file_name).collect::<Vec<_>>()
+        );
         // 中间产物（拼出来的长片）要清掉，别占地方也别被当成一集
         let work = out_root.join("碎片剧").join("重组");
         assert!(
@@ -2039,7 +2118,7 @@ mod tests {
             warnings: Vec::new(),
         };
         // 一段都没有
-        assert!(regroup_drama(&ffmpeg, &drama, t.path(), 75_000).is_err());
+        assert!(regroup_drama(&ffmpeg, &drama, t.path(), "已成整集", 75_000).is_err());
 
         // 只有一段 —— 没得重组，如实说，而不是白跑一趟 ffmpeg
         drama.episodes.push(SourceEpisode {
@@ -2048,7 +2127,7 @@ mod tests {
             episode: Some(1),
             size_bytes: 1,
         });
-        let err = regroup_drama(&ffmpeg, &drama, t.path(), 75_000).unwrap_err();
+        let err = regroup_drama(&ffmpeg, &drama, t.path(), "已成整集", 75_000).unwrap_err();
         assert!(err.to_string().contains("不需要重组"), "{err}");
     }
 

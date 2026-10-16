@@ -1926,6 +1926,40 @@ pub async fn pipeline_start(
                         );
                         continue;
                     }
+
+                    // **这部剧已经起过名字了，就复用，不再调模型。**
+                    //
+                    // 为什么必须这样：AI 每次给的名字都不一样（temperature 0.9，
+                    // 要的就是多样性）。如果每跑一次都重新起名，导出目录里就会
+                    // 一次多一个文件夹 —— 实测跑两次就有了
+                    // 「借车引发的觉醒」和「我的车我说了算」两个目录，越跑越多。
+                    //
+                    // 判据：工程名和源目录里的剧名不一样，说明上次改过。
+                    let existing = {
+                        let conn = lock_db(&state)?;
+                        db::find_project_by_root(&conn, &drama.dir)?
+                    };
+                    if let Some(proj) = existing {
+                        if proj.name != drama.name {
+                            log_line(
+                                &state,
+                                "info",
+                                &format!(
+                                    "「{}」上次已改名为「{}」，这次沿用它（避免每次跑都新建目录）",
+                                    drama.name, proj.name
+                                ),
+                            );
+                            renames.insert(
+                                drama.name.clone(),
+                                pipeline::NewName {
+                                    title: proj.name,
+                                    synopsis: drama.synopsis.clone(),
+                                },
+                            );
+                            continue;
+                        }
+                    }
+
                     // **失败不中断整条流水线** —— 用原剧名继续跑，
                     // 总比因为一次网络抖动就什么都出不来强。
                     match ai::rewrite_title_and_synopsis(&p, &drama.name, &drama.synopsis).await {
