@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   NAlert,
@@ -420,7 +420,7 @@ onUnmounted(() => {
       </n-checkbox>
       <div class="dd-muted" style="margin-left: 22px; margin-top: 2px">
         《人工智能生成合成内容标识办法》要求 AI 生成 / 合成的内容显著标识。
-        **画面经过 AI 处理**（AI 去字幕、AI 生成封面或文案等）后发布，应当标识。
+        <b>画面经过 AI 处理</b>（AI 去字幕、AI 生成封面或文案等）后发布，应当标识。
         没用到 AI 就别勾 —— 标错了是另一种不实。
       </div>
       <div v-if="labelEnabled" class="dd-row" style="gap: 8px; margin: 8px 0 0 22px; flex-wrap: wrap">

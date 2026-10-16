@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
 import { NAlert, NButton, NInput, NSelect, NSpace, NTag, useMessage } from "naive-ui";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -368,7 +368,7 @@ onMounted(async () => {
     <div class="dd-card">
       <div class="dd-card-title">导出发布包</div>
       <div class="dd-card-desc">
-        把切片、字幕、封面、标题、简介、标签整理成一个可以直接上传的目录。**只在本地写文件。**
+        把切片、字幕、封面、标题、简介、标签整理成一个可以直接上传的目录。<b>只在本地写文件。</b>
       </div>
 
       <div class="dd-row" style="margin-bottom: 12px">

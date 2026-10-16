@@ -164,7 +164,13 @@ fn decode_gbk(bytes: &[u8]) -> String {
 ///
 /// 刻意做成一张表而不是散在各处：加一步只需要在这里加一行，
 /// 界面、校验、执行顺序都跟着走。
-pub const STAGES: [(&str, &str, bool, &str); 6] = [
+pub const STAGES: [(&str, &str, bool, &str); 8] = [
+    (
+        "rewrite",
+        "AI 改剧名简介",
+        false,
+        "先改简介，再按新简介起剧名（整部剧一步，需先在「AI 服务」配好）",
+    ),
     (
         "slice",
         "切片",
@@ -196,12 +202,26 @@ pub const STAGES: [(&str, &str, bool, &str); 6] = [
         "整理成发布包（视频 / 封面 / 字幕 / 标题标签）",
     ),
     (
+        "cover",
+        "生成封面",
+        false,
+        "用原封面 + 新剧名合成封面（整部剧一张）",
+    ),
+    (
         "proof",
         "证明材料",
         false,
         "按模板生成报备用的证明图与成本文档",
     ),
 ];
+
+/// 这一步是**整部剧一步**吗？
+///
+/// 改剧名、生成封面、出证明材料都是针对整部剧的，不该按集排 ——
+/// 60 集排 60 个「改剧名」任务，会调 120 次模型，钱白花。
+pub fn is_drama_level(stage: &str) -> bool {
+    matches!(stage, "rewrite" | "cover" | "proof")
+}
 
 pub fn stage_list() -> Vec<crate::models::PipelineStage> {
     STAGES
@@ -327,6 +347,36 @@ pub fn start_pipeline(
         }
 
         for stage in stages {
+            // 整部剧一步的（改剧名、封面）：**只排一个任务**，不按集排。
+            // 60 集排 60 个「改剧名」= 调 120 次模型，钱白花。
+            if is_drama_level(stage) {
+                match drama_payload(stage, drama, &drama_out)? {
+                    Some(payload) => {
+                        crate::db::enqueue_job_for(
+                            conn,
+                            None,
+                            stage_to_job_kind(stage),
+                            &payload,
+                            Some(drama_id),
+                        )?;
+                        queued += 1;
+                    }
+                    None => {
+                        // 跳过要说清楚为什么，否则用户只看到「这步没跑」
+                        let why = match stage.as_str() {
+                            "rewrite" => "没找到简介",
+                            "cover" => "没找到封面图",
+                            _ => "没配模板",
+                        };
+                        skipped.push(format!(
+                            "{} / {}：{why}，这一步跳过",
+                            drama.name,
+                            stage_label(stage)
+                        ));
+                    }
+                }
+                continue;
+            }
             for (media_id, group) in &media_groups {
                 let Some(payload) =
                     stage_payload(stage, *media_id, &drama_out, slice_ms, model, group, header_label.as_ref())?
@@ -361,12 +411,57 @@ pub fn start_pipeline(
 /// 名字不一样是因为队列的种类更细（比如「出字幕」这一步既可能走 asr 也可能走 ocr）。
 pub fn stage_to_job_kind(stage: &str) -> &'static str {
     match stage {
+        "rewrite" => "rewrite",
         "slice" => "slice",
         "subtitle" => "asr",
         "dedup" => "transform",
         "export" => "export",
         "package" => "publish",
+        "cover" => "cover",
         _ => "verify",
+    }
+}
+
+/// 整部剧一步的步骤要排什么任务。返回 `None` 表示这一步这部剧跳过。
+///
+/// 缺素材就跳过而不是排一个注定失败的任务 —— 但要**说清楚为什么**，
+/// 不然用户只看到「步骤没跑」，不知道是缺简介还是缺封面。
+fn drama_payload(stage: &str, drama: &SourceDrama, drama_out: &Path) -> AppResult<Option<String>> {
+    match stage {
+        "rewrite" => {
+            if drama.synopsis.trim().is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(
+                serde_json::json!({
+                    "title": drama.name,
+                    "synopsis": drama.synopsis,
+                    "outDir": drama_out.to_string_lossy(),
+                })
+                .to_string(),
+            ))
+        }
+        "cover" => {
+            if drama.cover.trim().is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(
+                serde_json::json!({
+                    "poster": drama.cover,
+                    // 新剧名由 rewrite 写在这里；读不到就退回原剧名
+                    "titleDir": drama_out.to_string_lossy(),
+                    "fallbackTitle": drama.name,
+                    "outPath": drama_out.join("封面.jpg").to_string_lossy(),
+                    // 3:4 海报，和真实软件一致
+                    "width": 1080,
+                    "height": 1440,
+                })
+                .to_string(),
+            ))
+        }
+        // 证明图要有模板和字段坐标才谈得上生成，没配就跳过
+        "proof" => Ok(None),
+        other => Err(AppError::Msg(format!("不是整部剧级别的步骤：{other}"))),
     }
 }
 
@@ -1331,19 +1426,85 @@ mod tests {
         // 编译期查不出来，入队也不报，要跑到那个任务才炸。
         // 真实素材那轮：切片方式写成 fixedDuration（枚举里是 everySeconds），
         // 32 个切片任务全废，还连累了后面的画面处理。
+        let drama = SourceDrama {
+            name: "某剧".into(),
+            dir: "D:/某剧".into(),
+            episode_count: 2,
+            episodes: Vec::new(),
+            synopsis: "一段简介".into(),
+            synopsis_path: "D:/某剧/intro.txt".into(),
+            cover: "D:/某剧/poster.jpg".into(),
+            warnings: Vec::new(),
+        };
         let mut checked = 0;
         for (stage, _, _, _) in STAGES {
+            let kind = stage_to_job_kind(stage);
+            if is_drama_level(stage) {
+                // 整部剧一步：参数里带齐简介和封面，否则会被跳过（那也算正常）
+                let Some(payload) = drama_payload(stage, &drama, Path::new("E:/out"))
+                    .unwrap_or_else(|e| panic!("{stage} 生成参数失败：{e}"))
+                else {
+                    continue;
+                };
+                crate::queue::validate_payload(kind, &payload).unwrap_or_else(|e| {
+                    panic!("步骤 {stage}（队列类型 {kind}）的参数过不了校验：{e}")
+                });
+                checked += 1;
+                continue;
+            }
             let payload = stage_payload(stage, 7, Path::new("E:/out"), 40_000, "small", "第01集", None)
                 .unwrap_or_else(|e| panic!("{stage} 生成参数失败：{e}"));
             let Some(payload) = payload else {
                 continue; // 这一步没配就不排任务，正常
             };
-            let kind = stage_to_job_kind(stage);
             crate::queue::validate_payload(kind, &payload)
                 .unwrap_or_else(|e| panic!("步骤 {stage}（队列类型 {kind}）的参数过不了校验：{e}"));
             checked += 1;
         }
-        assert!(checked >= 5, "步骤表里应当有至少 5 步能生成参数，实际 {checked}");
+        assert!(
+            checked >= 6,
+            "步骤表里应当有至少 6 步能生成参数，实际 {checked}"
+        );
+    }
+
+    #[test]
+    fn drama_level_stages_are_queued_once_per_drama_not_per_episode() {
+        // 改剧名、生成封面都是整部剧一步。按集排的话，60 集会调 120 次模型。
+        assert!(is_drama_level("rewrite"));
+        assert!(is_drama_level("cover"));
+        assert!(is_drama_level("proof"));
+        assert!(!is_drama_level("slice"));
+        assert!(!is_drama_level("subtitle"));
+        assert!(!is_drama_level("dedup"));
+    }
+
+    #[test]
+    fn drama_level_stages_skip_cleanly_when_material_is_missing() {
+        // 缺简介就跳过改剧名，缺封面就跳过封面 —— 但不能排一个注定失败的任务
+        let mut drama = SourceDrama {
+            name: "某剧".into(),
+            dir: "D:/某剧".into(),
+            episode_count: 1,
+            episodes: Vec::new(),
+            synopsis: String::new(),
+            synopsis_path: String::new(),
+            cover: String::new(),
+            warnings: Vec::new(),
+        };
+        let out = Path::new("E:/out");
+        assert!(drama_payload("rewrite", &drama, out).unwrap().is_none(), "没简介该跳过");
+        assert!(drama_payload("cover", &drama, out).unwrap().is_none(), "没封面该跳过");
+
+        drama.synopsis = "简介".into();
+        drama.cover = "D:/某剧/poster.jpg".into();
+        assert!(drama_payload("rewrite", &drama, out).unwrap().is_some());
+        assert!(drama_payload("cover", &drama, out).unwrap().is_some());
+
+        // 封面要带上兜底剧名：rewrite 没跑或没写出 剧名.txt 时还能用
+        let raw = drama_payload("cover", &drama, out).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["fallbackTitle"], "某剧");
+        assert_eq!(v["poster"], "D:/某剧/poster.jpg");
     }
 
     #[test]

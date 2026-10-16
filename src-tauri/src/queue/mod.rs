@@ -1,4 +1,4 @@
-﻿//! 任务队列：把长任务排成一队顺序跑，可暂停、可停止、**重启后能接着跑**。
+//! 任务队列：把长任务排成一队顺序跑，可暂停、可停止、**重启后能接着跑**。
 //!
 //! ## 为什么需要它
 //!
@@ -32,7 +32,9 @@ use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager};
 
 /// 队列支持的任务类型：(key, 中文名)
-pub const KINDS: [(&str, &str); 9] = [
+pub const KINDS: [(&str, &str); 11] = [
+    // 整部剧一步的排在最前和最后 —— 和真实软件的流水线顺序一致
+    ("rewrite", "AI 改剧名简介"),
     ("slice", "切片"),
     ("transform", "画面处理"),
     ("ocr", "硬字幕识别"),
@@ -41,6 +43,7 @@ pub const KINDS: [(&str, &str); 9] = [
     ("export", "导出成片"),
     ("draft", "剪映草稿"),
     ("publish", "发布包"),
+    ("cover", "封面生成"),
     ("verify", "效果验证"),
 ];
 
@@ -79,6 +82,31 @@ struct TransformPayload {
     /// 片头标识（合规开关），叠加在预设之上
     #[serde(default)]
     header_label: Option<HeaderLabel>,
+}
+
+/// 整部剧一步：改剧名 / 简介。
+///
+/// 它不挂在某一集上 —— 结果写进导出目录的 `剧名.txt`，后面的步骤去读。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RewritePayload {
+    title: String,
+    synopsis: String,
+    out_dir: String,
+}
+
+/// 整部剧一步：生成封面。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CoverPayload {
+    poster: String,
+    /// 从哪读新剧名（通常是导出目录，rewrite 会在那里写 `剧名.txt`）
+    title_dir: String,
+    /// 兜底剧名：读不到 `剧名.txt` 时用它
+    fallback_title: String,
+    out_path: String,
+    width: i64,
+    height: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +174,8 @@ pub fn validate_payload(kind: &str, payload: &str) -> AppResult<()> {
         })
     }
     match kind {
+        "rewrite" => check::<RewritePayload>(kind, payload),
+        "cover" => check::<CoverPayload>(kind, payload),
         "slice" => check::<SlicePayload>(kind, payload),
         "transform" => check::<TransformPayload>(kind, payload),
         "ocr" => check::<OcrPayload>(kind, payload),
@@ -191,6 +221,48 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
     let state = app.state::<AppState>();
 
     match job.kind.as_str() {
+        // 整部剧第一步：改简介 → 按新简介起剧名。
+        // 结果写进导出目录的 `剧名.txt`，封面那一步会去读。
+        "rewrite" => {
+            let p: RewritePayload = parse_payload(job)?;
+            let outcome = commands::ai_rewrite(state, p.title, p.synopsis, Some(p.out_dir)).await?;
+            Ok(format!(
+                "新剧名「{}」（{} 字简介）",
+                outcome.new_title,
+                outcome.new_synopsis.chars().count()
+            ))
+        }
+        // 整部剧倒数第二步：封面。
+        // 用 rewrite 写下的新剧名；读不到就退回原剧名 —— 别因为缺一个文件就整条卡住。
+        "cover" => {
+            let p: CoverPayload = parse_payload(job)?;
+            let title = std::fs::read_to_string(std::path::Path::new(&p.title_dir).join("剧名.txt"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(p.fallback_title);
+            let report = commands::render_cover(
+                state,
+                crate::models::CoverRequest {
+                    poster: p.poster,
+                    title,
+                    out_path: p.out_path,
+                    width: p.width,
+                    height: p.height,
+                    position: crate::models::LabelPosition::TopCenter,
+                    out_root: String::new(),
+                },
+            )
+            .await?;
+            Ok(format!(
+                "封面已生成（{}）",
+                if report.engine == "ai" {
+                    "AI 图生图"
+                } else {
+                    "本地合成"
+                }
+            ))
+        }
         "slice" => {
             let p: SlicePayload = parse_payload(job)?;
             let segments =
