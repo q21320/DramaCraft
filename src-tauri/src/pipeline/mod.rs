@@ -902,6 +902,10 @@ pub fn safe_drama_name(name: &str) -> String {
 
 /// 把文件名变成一个能当目录名的字符串。
 ///
+/// 现在只被测试用到 —— 产出目录已经改用 `episode_label`（新剧名-第NN集）。
+/// 留着是因为「文件名 → 合法目录名」这件事本身还要防回归。
+#[cfg(test)]
+///
 /// 去掉扩展名，再把 Windows 不允许出现在路径里的字符换掉。
 fn safe_dir_name(file_name: &str) -> String {
     let stem = Path::new(file_name)

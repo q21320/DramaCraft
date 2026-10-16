@@ -1,4 +1,4 @@
-export interface Project {
+﻿export interface Project {
   id: number;
   name: string;
   rootDir: string;
@@ -261,6 +261,16 @@ export interface AiModelInfo {
   /** 空串 = 正常，Retiring = 即将下线 */
   state: string;
   available: boolean;
+}
+/** 成本配置比例情况报告里的一行（一部剧） */
+export interface CostReportRow {
+  name: string;
+  episodes: number;
+  totalMinutes: number;
+  /** 总投资额（万元）。表单要求 ＜100 万。 */
+  investWan: number;
+  /** 演员总片酬占比（百分数）。表单要求 ＜40%。 */
+  actorRatio: number;
 }
 // ---------------- 运行日志 ----------------
 

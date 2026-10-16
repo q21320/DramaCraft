@@ -17,3 +17,6 @@ src-tauri/resources/bin/COPYING.GPLv3.txt
 src-tauri/resources/asr_runtime/
 
 .cache/
+
+# 样本文件保留（记录了产出长什么样）
+!samples/

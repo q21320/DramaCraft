@@ -16,6 +16,7 @@ import type {
   CloudTestResult,
   CloudTranscribeReport,
   CostDocRequest,
+  CostReportRow,
   CoverReport,
   DedupReport,
   RewriteOutcome,
@@ -146,6 +147,20 @@ export const api = {
   // 证明文档（docx）
   generateCostDocx: (request: CostDocRequest, outPath: string) =>
     call<DocxReport>("generate_cost_docx", { request, outPath }),
+  /**
+   * 生成「成本配置比例情况报告」—— 申报用的那张表。
+   *
+   * 版式照 `zhengming/成本图表.docx` 那份模板：标题 + 提审说明 + 5 列表格
+   * + 符合性声明 + 版权承诺 + 报审机构签字。
+   * **报审机构和法人故意留空** —— 不该由工具代写主体信息。
+   */
+  generateCostReport: (
+    rows: CostReportRow[],
+    org: string,
+    legalPerson: string,
+    date: string,
+    outPath: string,
+  ) => call<DocxReport>("generate_cost_report", { rows, org, legalPerson, date, outPath }),
   generateIpDocx: (request: IpDocRequest, outPath: string) =>
     call<DocxReport>("generate_ip_docx", { request, outPath }),
 

@@ -840,6 +840,21 @@ pub struct StoryboardReport {
 }
 // ---------------- 运行日志 ----------------
 
+/// 成本配置比例情况报告里的一行（一部剧）。
+///
+/// 照 `zhengming/成本图表.docx` 那份模板的列定的：
+/// 序号 / 微短剧名称 / 集数和总时长 / 总投资额（需＜100万）/ 演员总片酬占比（需＜40%）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostReportRow {
+    pub name: String,
+    pub episodes: i64,
+    pub total_minutes: f64,
+    /// 总投资额（万元）。表单要求 ＜100 万。
+    pub invest_wan: f64,
+    /// 演员总片酬占比（百分数）。表单要求 ＜40%。
+    pub actor_ratio: f64,
+}
 /// 一行运行日志。
 ///
 /// 流水线跑起来是几十上百个任务，用户需要能**回头看**

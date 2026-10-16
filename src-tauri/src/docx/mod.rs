@@ -67,6 +67,10 @@ pub enum DocBlock {
     Heading(String),
     /// 正文段落（首行缩进两字）
     Paragraph(String),
+    /// 一行纯文本，**指定对齐方式**（left / center / right）。
+    ///
+    /// 给签字栏、落款日期这类用 —— 它们既不是缩进正文，也不是标题。
+    Line { text: String, align: String },
     /// 「名称：值」一行，用于信息栏
     KeyValue { label: String, value: String },
     /// 表格
@@ -85,6 +89,12 @@ pub enum DocBlock {
 pub struct DocStyle {
     /// 中文字体名（Word 里显示的名字，不是文件路径）
     pub east_asian_font: String,
+    /// 标题字体。空串表示和正文用同一个。
+    ///
+    /// 之所以单独一项：成本报告模板的标题是「方正小标宋简体」，
+    /// 那是**商业字体，本机没装**（实测确认），照写会 fallback 成别的样子。
+    /// 与其赌一个装不上的名字，不如挑一个真有的 —— 宋体同属宋体类，最接近。
+    pub title_font: String,
     pub latin_font: String,
     /// 正文字号，半磅为单位（24 = 12pt = 小四）
     pub body_size: u32,
@@ -96,6 +106,7 @@ impl Default for DocStyle {
     fn default() -> Self {
         Self {
             east_asian_font: "仿宋".to_string(),
+            title_font: "宋体".to_string(),
             latin_font: "Times New Roman".to_string(),
             body_size: 24,
             title_size: 36,
@@ -114,22 +125,34 @@ pub struct DocMeta {
 
 // ---------------- document.xml ----------------
 
+/// 正文字体的 run 属性。标题那条走 [`run_props_font`]（要单独指定中文字体）。
 fn run_props(style: &DocStyle, size: u32, bold: bool) -> String {
-    let mut rpr = format!(
-        "<w:rPr><w:rFonts w:ascii=\"{}\" w:hAnsi=\"{}\" w:eastAsia=\"{}\" w:cs=\"{}\"/>",
-        escape_xml(&style.latin_font),
-        escape_xml(&style.latin_font),
-        escape_xml(&style.east_asian_font),
-        escape_xml(&style.latin_font),
-    );
-    if bold {
-        rpr.push_str("<w:b/><w:bCs/>");
-    }
-    rpr.push_str(&format!("<w:sz w:val=\"{size}\"/><w:szCs w:val=\"{size}\"/></w:rPr>"));
-    rpr
+    run_props_font(style, size, bold, &style.east_asian_font)
 }
 
 fn paragraph(text: &str, style: &DocStyle, size: u32, bold: bool, align: &str, indent: bool) -> String {
+    paragraph_with_font(text, style, size, bold, align, indent, &style.east_asian_font)
+}
+
+/// 和 [`paragraph`] 一样，但能指定中文字体。
+///
+/// 标题要单独一个字体（模板的标题和正文不是一个字体），所以单开一个入口。
+#[allow(clippy::too_many_arguments)]
+fn paragraph_with_font(
+    text: &str,
+    style: &DocStyle,
+    size: u32,
+    bold: bool,
+    align: &str,
+    indent: bool,
+    font: &str,
+) -> String {
+    // 字体名空着就退回正文字体
+    let font = if font.trim().is_empty() {
+        style.east_asian_font.as_str()
+    } else {
+        font
+    };
     let mut ppr = String::from("<w:pPr>");
     if !align.is_empty() {
         ppr.push_str(&format!("<w:jc w:val=\"{align}\"/>"));
@@ -146,11 +169,27 @@ fn paragraph(text: &str, style: &DocStyle, size: u32, bold: bool, align: &str, i
     } else {
         format!(
             "<w:r>{}<w:t xml:space=\"preserve\">{}</w:t></w:r>",
-            run_props(style, size, bold),
+            run_props_font(style, size, bold, font),
             escape_xml(text)
         )
     };
     format!("<w:p>{ppr}{body}</w:p>")
+}
+
+/// 和 [`run_props`] 一样，但中文字体可指定。
+fn run_props_font(style: &DocStyle, size: u32, bold: bool, east_asian: &str) -> String {
+    let mut rpr = format!(
+        "<w:rPr><w:rFonts w:ascii=\"{}\" w:hAnsi=\"{}\" w:eastAsia=\"{}\" w:cs=\"{}\"/>",
+        escape_xml(&style.latin_font),
+        escape_xml(&style.latin_font),
+        escape_xml(east_asian),
+        escape_xml(&style.latin_font),
+    );
+    if bold {
+        rpr.push_str("<w:b/><w:bCs/>");
+    }
+    rpr.push_str(&format!("<w:sz w:val=\"{size}\"/><w:szCs w:val=\"{size}\"/></w:rPr>"));
+    rpr
 }
 
 fn table_xml(headers: &[String], rows: &[Vec<String>], widths: &[f64], style: &DocStyle) -> String {
@@ -223,13 +262,17 @@ pub fn render_document(blocks: &[DocBlock], style: &DocStyle) -> String {
     for block in blocks {
         match block {
             DocBlock::Title(text) => {
-                body.push_str(&paragraph(text, style, style.title_size, true, "center", false))
+                body.push_str(&paragraph_with_font(text, style, style.title_size, true, "center", false, &style.title_font))
             }
             DocBlock::Heading(text) => {
                 body.push_str(&paragraph(text, style, style.body_size + 2, true, "", false))
             }
             DocBlock::Paragraph(text) => {
                 body.push_str(&paragraph(text, style, style.body_size, false, "", true))
+            }
+            // 指定对齐的纯文本行：签字栏、落款日期这类
+            DocBlock::Line { text, align } => {
+                body.push_str(&paragraph(text, style, style.body_size, false, align, false))
             }
             DocBlock::KeyValue { label, value } => body.push_str(&paragraph(
                 &format!("{label}：{value}"),
@@ -548,6 +591,162 @@ pub fn build_cost_blocks(
     blocks
 }
 
+// ---------------- 成本配置比例情况报告 ----------------
+
+/// 一部剧在成本报告里占一行。
+#[derive(Debug, Clone, Default)]
+pub struct CostReportRow {
+    pub name: String,
+    pub episodes: i64,
+    pub total_minutes: f64,
+    /// 总投资额（万元）
+    pub invest_wan: f64,
+    /// 演员总片酬占比（百分数，0~100）
+    pub actor_ratio: f64,
+}
+
+/// 成本配置比例情况报告的填报内容。
+#[derive(Debug, Clone, Default)]
+pub struct CostReportRequest {
+    pub rows: Vec<CostReportRow>,
+    /// 报审机构。**留空就只留冒号**，让用户自己填或盖章 ——
+    /// 模板里印着某家公司的名字，那是别人的，不能打进攻出的文档。
+    pub org: String,
+    /// 法定代表人姓名；留空则只留「（签字）」位置
+    pub legal_person: String,
+    /// 日期。空串就用「年    月  日」这种待填格式。
+    pub date: String,
+}
+
+/// 表头。和模板逐字一致 —— 括号里那两句提示是这form 的关键。
+fn cost_headers() -> Vec<String> {
+    vec![
+        "序号".to_string(),
+        "微短剧名称".to_string(),
+        "集数和总时长".to_string(),
+        "总投资额\n（需＜100万）".to_string(),
+        "演员总片酬占比\n（需＜40%）".to_string(),
+    ]
+}
+
+/// 生成「成本配置比例情况报告」的块序列。
+///
+/// **版式照 `zhengming/成本图表.docx` 的模板做**，逐项对齐：
+///
+/// - 标题居中 18pt 加粗
+/// - 正文 16pt 加粗（这份 form 就是全加粗的仿宋）
+/// - 表格 5 列：序号 / 微短剧名称 / 集数和总时长 / 总投资额 / 演员总片酬占比
+/// - 结尾三段：符合性声明、版权承诺、报审机构与签字
+///
+/// 和模板唯一的差别：**报审机构不预填公司名**。模板里写的是模板作者的公司，
+/// 照抄会把别人的主体信息打进用户的申报材料里。
+pub fn build_cost_report_blocks(req: &CostReportRequest) -> Vec<DocBlock> {
+    let n = req.rows.len();
+
+    let mut rows: Vec<Vec<String>> = req
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            vec![
+                (i + 1).to_string(),
+                r.name.clone(),
+                // 模板原文就是「40集，共35分钟」这种写法，逗号是中文逗号
+                format!("{}集，共{:.0}分钟", r.episodes, r.total_minutes),
+                format!("{}万元", trim_num(r.invest_wan)),
+                format!("{}%", trim_num(r.actor_ratio)),
+            ]
+        })
+        .collect();
+    // 模板的表有三行（一实两空）。不足补空行 —— 这是张表单，
+    // 只有一行数据时看起来像没填完。
+    while rows.len() < 3 {
+        rows.push(vec![String::new(); 5]);
+    }
+
+    let org = req.org.trim();
+    let legal = req.legal_person.trim();
+    let date = if req.date.trim().is_empty() {
+        "年    月  日".to_string()
+    } else {
+        req.date.trim().to_string()
+    };
+
+    vec![
+        DocBlock::Spacer,
+        DocBlock::Title("成本配置比例情况报告".to_string()),
+        DocBlock::Spacer,
+        DocBlock::Line {
+            text: format!("我公司提审的{n}部“其他微短剧”，详情见下："),
+            align: String::new(),
+        },
+        DocBlock::Table {
+            headers: cost_headers(),
+            rows,
+            // 序号窄、名称宽，其余三列等宽
+            widths: vec![0.7, 2.4, 1.6, 1.7, 1.6],
+        },
+        DocBlock::Spacer,
+        DocBlock::Line {
+            text: "以上微短剧制作完成的总投资额和演员总片酬占比均符合《关于电视剧网络剧制作成本配置比例的意见》要求。"
+                .to_string(),
+            align: String::new(),
+        },
+        DocBlock::Line {
+            text: format!(
+                "我公司郑重承诺拥有上述{n}部剧目的播出版权，并承诺上述内容真实有效。\
+                 如因材料真实性、演员片酬占比等问题产生的不良后果，我公司愿承担相关责任。"
+            ),
+            align: String::new(),
+        },
+        DocBlock::Spacer,
+        DocBlock::Spacer,
+        // 这两行要留出盖章和签字的位置，所以靠右
+        DocBlock::Line {
+            text: format!("报审机构：{org}"),
+            align: "right".to_string(),
+        },
+        DocBlock::Spacer,
+        DocBlock::Line {
+            text: format!("法定代表人或总编辑：（签字）{legal}"),
+            align: "right".to_string(),
+        },
+        DocBlock::Spacer,
+        DocBlock::Line {
+            text: date,
+            align: "center".to_string(),
+        },
+    ]
+}
+
+/// 数字去掉没意义的小数尾巴：1.0 → "1"，1.5 → "1.5"。
+///
+/// 表单里写「1.0万元」显得很怪，写「1万元」才对。
+fn trim_num(v: f64) -> String {
+    if (v - v.round()).abs() < 0.005 {
+        format!("{}", v.round() as i64)
+    } else {
+        // 保留两位之后再去掉尾部多余的 0
+        format!("{v:.2}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+/// 成本报告的字体设置：正文 16pt（32 半磅）、标题 18pt（36 半磅）。
+///
+/// 模板就是这么设的。默认的 12pt 正文用在申报表单上太小。
+pub fn cost_report_style() -> DocStyle {
+    DocStyle {
+        east_asian_font: "仿宋".to_string(),
+        title_font: "宋体".to_string(),
+        latin_font: "Times New Roman".to_string(),
+        body_size: 32,
+        title_size: 36,
+    }
+}
+
 /// 权属声明
 pub fn build_ip_blocks(
     drama_name: &str,
@@ -741,6 +940,132 @@ mod tests {
         ]
     }
 
+    /// 成本报告：结构要和用户指定那份模板对得上。
+    ///
+    /// 模板（`zhengming/成本图表.docx`）是：
+    /// 居中标题 + 「我公司提审的N部…」+ 5 列表格 + 符合性声明 + 版权承诺
+    /// + 报审机构 + 法定代表人 + 日期。
+    ///
+    /// 这条测试盯三件事：
+    /// 1. 该有的段落都在
+    /// 2. 表头逐字和模板一致（括号里那两句要求是这 form 的关键）
+    /// 3. **不出现模板作者的公司名** —— 抄版式可以，抄主体信息不行
+    /// 生成一份样本成本报告到临时目录，用来人工核对版面。
+    ///
+    /// `cargo test -- --ignored write_sample_cost_report`
+    #[test]
+    #[ignore]
+    fn write_sample_cost_report() {
+        let req = CostReportRequest {
+            rows: vec![CostReportRow {
+                name: "别把借车当成理所当然".into(),
+                episodes: 6,
+                total_minutes: 9.0,
+                invest_wan: 1.0,
+                actor_ratio: 0.0,
+            }],
+            org: String::new(),
+            legal_person: String::new(),
+            date: String::new(),
+        };
+        let blocks = build_cost_report_blocks(&req);
+        let meta = DocMeta {
+            title: "成本配置比例情况报告".into(),
+            author: "DramaDist".into(),
+            created: now_iso(),
+        };
+        let out = std::env::temp_dir().join("cost_report_sample.docx");
+        write_docx(&out, &blocks, &cost_report_style(), &meta).unwrap();
+        eprintln!("样本已写到 {}", out.display());
+    }
+    #[test]
+    fn cost_report_matches_the_template_structure() {
+        let req = CostReportRequest {
+            rows: vec![
+                CostReportRow {
+                    name: "一宴识婆婆".into(),
+                    episodes: 40,
+                    total_minutes: 35.0,
+                    invest_wan: 1.0,
+                    actor_ratio: 0.0,
+                },
+                CostReportRow {
+                    name: "第二部".into(),
+                    episodes: 12,
+                    total_minutes: 18.5,
+                    invest_wan: 2.5,
+                    actor_ratio: 12.0,
+                },
+            ],
+            org: String::new(),
+            legal_person: String::new(),
+            date: String::new(),
+        };
+        let blocks = build_cost_report_blocks(&req);
+        let text: String = blocks
+            .iter()
+            .map(|b| match b {
+                DocBlock::Title(s) | DocBlock::Paragraph(s) | DocBlock::Heading(s) => s.clone(),
+                DocBlock::Line { text, .. } => text.clone(),
+                DocBlock::KeyValue { label, value } => format!("{label}：{value}"),
+                DocBlock::Table { headers, rows, .. } => {
+                    format!("{}{}", headers.join("|"), rows.iter().flatten().cloned().collect::<Vec<_>>().join("|"))
+                }
+                DocBlock::Spacer => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("成本配置比例情况报告"), "要有标题");
+        assert!(text.contains("我公司提审的2部"), "部数要跟着行数走：{text}");
+        assert!(text.contains("《关于电视剧网络剧制作成本配置比例的意见》"));
+        assert!(text.contains("我公司郑重承诺拥有上述2部剧目的播出版权"));
+        assert!(text.contains("报审机构："));
+        assert!(text.contains("法定代表人或总编辑：（签字）"));
+        assert!(text.contains("年    月  日"), "没填日期就留待填格式");
+
+        // 表头逐字和模板一致
+        assert!(text.contains("微短剧名称"));
+        assert!(text.contains("集数和总时长"));
+        assert!(text.contains("（需＜100万）"), "括号里的要求不能少");
+        assert!(text.contains("（需＜40%）"), "括号里的要求不能少");
+
+        // 数据行：模板原文就是「40集，共35分钟」这种写法
+        assert!(text.contains("40集，共35分钟"), "{text}");
+        assert!(text.contains("1万元"), "整数不带小数点：{text}");
+        assert!(text.contains("12.5%") || text.contains("12%"), "{text}");
+        assert!(text.contains("2.5万元"), "{text}");
+
+        // **模板作者的公司名不能出现** —— 抄版式可以，抄主体信息不行
+        assert!(!text.contains("湖北风帧"), "不能把模板里的公司名打进去");
+    }
+
+    /// 一部剧时表格仍补到三行 —— 模板就是这样（一实两空），
+    /// 只有一行时看起来像没填完。
+    #[test]
+    fn cost_report_pads_the_table_to_three_rows() {
+        let req = CostReportRequest {
+            rows: vec![CostReportRow {
+                name: "某剧".into(),
+                episodes: 6,
+                total_minutes: 9.0,
+                invest_wan: 1.0,
+                actor_ratio: 0.0,
+            }],
+            ..Default::default()
+        };
+        let blocks = build_cost_report_blocks(&req);
+        let rows = blocks
+            .iter()
+            .find_map(|b| match b {
+                DocBlock::Table { rows, .. } => Some(rows.clone()),
+                _ => None,
+            })
+            .expect("该有表格");
+        assert_eq!(rows.len(), 3, "补到三行");
+        assert_eq!(rows[0][0], "1", "第一行序号是 1");
+        assert!(rows[1].iter().all(|c| c.is_empty()), "补的是空行");
+    }
     #[test]
     fn zip_has_the_expected_structure() {
         let bytes = build_zip(&sample_entries(), 0, 0x21).unwrap();

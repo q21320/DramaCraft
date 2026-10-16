@@ -6,7 +6,7 @@ use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, Asset, AssetApplyReport, AssetImportReport, AssetKindOption,
     AssetSummary, CloudConfigView, CloudTestResult, CloudTranscribeReport, CostDocRequest, Cue,
     DiscoveredAsset, DocxReport, EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome,
-    AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage, DedupReport, RewriteOutcome, StoryboardReport, CoverReport, CoverRequest, HeaderLabel,
+    AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage, CostReportRow, DedupReport, RewriteOutcome, StoryboardReport, CoverReport, CoverRequest, HeaderLabel,
     IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
     PipelineStage, PlatformOption, Project,
     ProofLayout, ProofPreview, ProofRenderReport, PublishAccount, PublishClipEntry,
@@ -1345,6 +1345,88 @@ pub fn generate_cost_docx(request: CostDocRequest, out_path: String) -> AppResul
         &format!("{} - 成本明细表", request.drama_name.trim()),
         &out_path,
     )
+}
+
+/// 生成「成本配置比例情况报告」。
+///
+/// **版式照 `zhengming/成本图表.docx` 那份模板做**（用户指定的成本模板）：
+/// 标题 + 一句提审说明 + 5 列表格 + 符合性声明 + 版权承诺 + 报审机构签字。
+///
+/// 和模板唯一的差别：**报审机构不预填公司名**。模板里印着模板作者的公司，
+/// 照抄会把别人的主体信息打进用户的申报材料里 —— 那是很严重的事。
+#[tauri::command]
+pub fn generate_cost_report(
+    rows: Vec<CostReportRow>,
+    org: String,
+    legal_person: String,
+    date: String,
+    out_path: String,
+) -> AppResult<DocxReport> {
+    if rows.is_empty() {
+        return Err(AppError::Msg("至少要有一部剧才能出成本报告".into()));
+    }
+    for r in &rows {
+        if r.name.trim().is_empty() {
+            return Err(AppError::Msg("剧目名称不能为空".into()));
+        }
+        // 表单上那两句提示是**硬性要求**，超了就是不符合，早点说清楚
+        if r.invest_wan > 100.0 {
+            return Err(AppError::Msg(format!(
+                "「{}」的总投资额 {} 万元超过 100 万 —— 这张表要求「需＜100万」",
+                r.name, r.invest_wan
+            )));
+        }
+        if r.actor_ratio > 40.0 {
+            return Err(AppError::Msg(format!(
+                "「{}」的演员总片酬占比 {}% 超过 40% —— 这张表要求「需＜40%」",
+                r.name, r.actor_ratio
+            )));
+        }
+    }
+
+    let req = docx::CostReportRequest {
+        rows: rows
+            .iter()
+            .map(|r| docx::CostReportRow {
+                name: r.name.trim().to_string(),
+                episodes: r.episodes,
+                total_minutes: r.total_minutes,
+                invest_wan: r.invest_wan,
+                actor_ratio: r.actor_ratio,
+            })
+            .collect(),
+        org,
+        legal_person,
+        date,
+    };
+    let blocks = docx::build_cost_report_blocks(&req);
+    let block_count = blocks.len() as i64;
+    let out = ensure_docx_extension(Path::new(out_path.trim()));
+    if out.as_os_str().is_empty() {
+        return Err(AppError::Msg("请先选择输出路径".into()));
+    }
+    let meta = docx::DocMeta {
+        title: "成本配置比例情况报告".to_string(),
+        author: "DramaDist".to_string(),
+        created: docx::now_iso(),
+    };
+    // **用成本报告专用的字号**（正文 16pt），不是默认那套 12pt
+    let size_bytes = docx::write_docx(&out, &blocks, &docx::cost_report_style(), &meta)?;
+
+    let mut warnings = vec![
+        "文档只包含你录入的数据，请自行核对金额、机构名称与权属表述后再对外提交。".to_string(),
+        "报审机构、法定代表人、日期都留给你自己填 —— 这些不该由工具代写。".to_string(),
+    ];
+    if req.org.trim().is_empty() {
+        warnings.push("报审机构还是空的，记得填上并盖章。".to_string());
+    }
+    Ok(DocxReport {
+        kind: "cost_report".to_string(),
+        out_path: out.to_string_lossy().to_string(),
+        size_bytes,
+        block_count,
+        warnings,
+    })
 }
 
 /// 生成「作品权属声明」docx。

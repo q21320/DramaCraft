@@ -130,6 +130,12 @@ struct CostPayload {
     invest_wan: f64,
     #[serde(default)]
     actor_ratio: f64,
+    /// 报审机构。**默认空** —— 不预填任何公司名。
+    #[serde(default)]
+    org: String,
+    /// 法定代表人姓名；空着就只留签字位置
+    #[serde(default)]
+    legal_person: String,
 }
 
 /// 整部剧一步：分镜证明。
@@ -295,46 +301,28 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
              没有该服务的 API 说明就没法实现 —— 需要 AccessKey / SecretKey 与接口格式。"
                 .to_string(),
         ),
-        // 成本报告：按模板生成（报备用）
+        // 成本报告：出「成本配置比例情况报告」。
+        //
+        // 版式照用户指定那份模板（zhengming/成本图表.docx）：
+        // 标题 + 提审说明 + 5 列表格 + 符合性声明 + 版权承诺 + 报审机构签字。
         "cost" => {
             let p: CostPayload = parse_payload(job)?;
             let minutes = (p.total_ms as f64 / 60000.0).max(0.0);
-            let invest = if p.invest_wan > 0.0 { p.invest_wan } else { 1.0 };
-            let ratio = if p.actor_ratio > 0.0 { p.actor_ratio } else { 30.0 };
-            let actor_amount = invest * ratio / 100.0;
-            let request = crate::models::CostDocRequest {
-                drama_name: p.title.clone(),
-                producer: String::new(),
-                date: chrono::Local::now().format("%Y-%m-%d").to_string(),
-                total: format!("{invest} 万元"),
-                rows: vec![
-                    crate::models::CostDocRow {
-                        item: "总投资额".into(),
-                        quantity: "1".into(),
-                        unit_price: format!("{invest} 万元"),
-                        amount: format!("{invest} 万元"),
-                    },
-                    crate::models::CostDocRow {
-                        item: format!("演员报酬（{ratio:.0}%）"),
-                        quantity: "1".into(),
-                        unit_price: format!("{actor_amount:.2} 万元"),
-                        amount: format!("{actor_amount:.2} 万元"),
-                    },
-                    crate::models::CostDocRow {
-                        item: "总集数".into(),
-                        quantity: format!("{} 集", p.episode_count),
-                        unit_price: String::new(),
-                        amount: String::new(),
-                    },
-                    crate::models::CostDocRow {
-                        item: "总时长".into(),
-                        quantity: format!("{minutes:.1} 分钟"),
-                        unit_price: String::new(),
-                        amount: String::new(),
-                    },
-                ],
-            };
-            let report = commands::generate_cost_docx(request, p.out_path)?;
+            let report = commands::generate_cost_report(
+                vec![crate::models::CostReportRow {
+                    name: p.title.clone(),
+                    episodes: p.episode_count,
+                    total_minutes: minutes,
+                    // 表单要求「需＜100万」「需＜40%」，默认给保守值。
+                    // 真实数字该由用户填 —— 这是拿去申报的东西。
+                    invest_wan: if p.invest_wan > 0.0 { p.invest_wan } else { 1.0 },
+                    actor_ratio: p.actor_ratio.max(0.0),
+                }],
+                p.org,
+                p.legal_person,
+                String::new(),
+                p.out_path,
+            )?;
             Ok(format!("成本报告已生成（{}）", report.out_path))
         }
         // 分镜证明：抽帧 → 视觉模型反推 → 拼成证明图
