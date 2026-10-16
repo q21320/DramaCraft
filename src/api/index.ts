@@ -16,7 +16,9 @@ import type {
   CloudTranscribeReport,
   CostDocRequest,
   CoverReport,
+  DedupReport,
   RewriteOutcome,
+  StoryboardReport,
   RunLog,
   CoverRequest,
   Cue,
@@ -290,6 +292,17 @@ export const api = {
   openInPlayer: (path: string) => call<void>("open_in_player", { path }),
   /** 在资源管理器里定位 */
   revealInExplorer: (path: string) => call<void>("reveal_in_explorer", { path }),
+
+  /**
+   * 整集去重 —— **发布用的就是这个产物**，切片是它的下游。
+   * 真实软件的流程是「先去重整集、再切片」。
+   */
+  dedupMedia: (mediaId: number, intensity: string, headerLabel: HeaderLabel | null, outDir: string) =>
+    call<DedupReport>("dedup_media", { mediaId, intensity, headerLabel, outDir }),
+
+  /** 分镜证明：抽帧 → 视觉模型反推 → 拼成报备用的证明图 */
+  buildStoryboard: (mediaIds: number[], outDir: string, framesPerEpisode: number, shotsPerSheet: number) =>
+    call<StoryboardReport>("build_storyboard", { mediaIds, outDir, framesPerEpisode, shotsPerSheet }),
 
   // 运行日志：afterId 用来增量拉取，只要新行
   listLogs: (runId: number | null, afterId: number, limit?: number) =>

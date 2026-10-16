@@ -194,8 +194,17 @@ CREATE TABLE IF NOT EXISTS run_log (
 CREATE INDEX IF NOT EXISTS idx_run_log_run ON run_log(run_id, id);
 "#;
 
+/// v11：素材的「去重后文件」。
+///
+/// 真实软件的流程是**先对整集去重、再切片**，去重产物才是发布用的东西。
+/// 我原来反了 —— 先切再对切片去重，同样一部剧要多跑十几倍的去重。
+/// 这个字段记住去重产物；切片时优先读它，读不到才退回原片。
+const SCHEMA_V11: &str = r#"
+ALTER TABLE media ADD COLUMN processed_path TEXT NOT NULL DEFAULT '';
+"#;
+
 /// 当前 schema 版本。加表/加列时递增，并在 `migrate` 里补一段。
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
@@ -240,6 +249,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     }
     if version < 10 {
         conn.execute_batch(SCHEMA_V10)?;
+    }
+    if version < 11 {
+        conn.execute_batch(SCHEMA_V11)?;
     }
     if version < SCHEMA_VERSION {
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -322,7 +334,7 @@ pub fn find_media_by_path(
 ) -> AppResult<Option<Media>> {
     let mut stmt = conn.prepare(
         "SELECT id, project_id, path, name, duration_ms, width, height, has_audio,
-                size_bytes, format_name, created_at
+                size_bytes, format_name, created_at, processed_path
            FROM media WHERE project_id = ?1 AND path = ?2 ORDER BY id LIMIT 1",
     )?;
     let mut rows = stmt.query(params![project_id, path])?;
@@ -339,6 +351,7 @@ pub fn find_media_by_path(
             size_bytes: row.get(8)?,
             format_name: row.get(9)?,
             created_at: row.get(10)?,
+            processed_path: row.get(11)?,
         })),
         None => Ok(None),
     }
@@ -409,13 +422,31 @@ pub fn add_media(
             created_at
         ],
     )?;
-    get_media(conn, conn.last_insert_rowid())
+    // 直接构造返回，不再回头查一遍。
+    //
+    // 一来省一次往返；二来 —— 迁移测试是「先塞旧数据、再升级」，
+    // 塞的时候表上还没有 `processed_path`，回查会撞「no such column」。
+    // 插进去什么自己最清楚，没必要问库。
+    Ok(Media {
+        id: conn.last_insert_rowid(),
+        project_id,
+        path: path.to_string(),
+        name: name.to_string(),
+        duration_ms: probe.duration_ms,
+        width: probe.width,
+        height: probe.height,
+        has_audio: probe.has_audio,
+        size_bytes: probe.size_bytes,
+        format_name: probe.format_name.clone(),
+        created_at,
+        processed_path: String::new(),
+    })
 }
 
 pub fn get_media(conn: &Connection, id: i64) -> AppResult<Media> {
     let media = conn.query_row(
         "SELECT id, project_id, path, name, duration_ms, width, height, has_audio,
-                size_bytes, format_name, created_at
+                size_bytes, format_name, created_at, processed_path
          FROM media WHERE id = ?1",
         params![id],
         row_to_media,
@@ -436,13 +467,14 @@ fn row_to_media(row: &rusqlite::Row<'_>) -> rusqlite::Result<Media> {
         size_bytes: row.get(8)?,
         format_name: row.get(9)?,
         created_at: row.get(10)?,
+        processed_path: row.get(11)?,
     })
 }
 
 pub fn list_media(conn: &Connection, project_id: i64) -> AppResult<Vec<Media>> {
     let mut stmt = conn.prepare(
         "SELECT id, project_id, path, name, duration_ms, width, height, has_audio,
-                size_bytes, format_name, created_at
+                size_bytes, format_name, created_at, processed_path
          FROM media WHERE project_id = ?1 ORDER BY id DESC",
     )?;
     let rows = stmt.query_map(params![project_id], row_to_media)?;
@@ -458,6 +490,33 @@ pub fn list_media(conn: &Connection, project_id: i64) -> AppResult<Vec<Media>> {
 /// 不这么做的话，队列里还留着指向这条素材的任务，等它跑到写字幕那一步
 /// 就会撞 `FOREIGN KEY constraint failed` —— 实测发生过：
 /// run#7 整条流水线就是这么挂掉的（删了工程，任务还在队列里）。
+/// 记下某个素材去重后的文件。传空串表示清掉（比如重跑）。
+pub fn set_media_processed(conn: &Connection, media_id: i64, path: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE media SET processed_path = ?2 WHERE id = ?1",
+        params![media_id, path],
+    )?;
+    Ok(())
+}
+
+/// 切片该读哪个文件：**优先去重产物**，没有才读原片。
+///
+/// 这是「先去重再切片」这条链路的接口 —— 真实软件就是这个顺序，
+/// 去重产物才是发布用的东西，切片只是它的下游。
+pub fn media_source_path(conn: &Connection, media_id: i64) -> AppResult<String> {
+    let (raw, processed): (String, String) = conn.query_row(
+        "SELECT path, processed_path FROM media WHERE id = ?1",
+        params![media_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let p = processed.trim();
+    if !p.is_empty() && std::path::Path::new(p).is_file() {
+        Ok(p.to_string())
+    } else {
+        Ok(raw)
+    }
+}
+
 pub fn remove_media(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute("DELETE FROM cue WHERE media_id = ?1", params![id])?;
     conn.execute("DELETE FROM segment WHERE media_id = ?1", params![id])?;

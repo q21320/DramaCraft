@@ -1,4 +1,4 @@
-//! 前后端共享的数据结构。
+﻿//! 前后端共享的数据结构。
 //!
 //! 约定：所有结构体一律 `#[serde(rename_all = "camelCase")]`，
 //! 与前端 `src/types/index.ts` 一一对应。
@@ -28,6 +28,10 @@ pub struct Media {
     pub size_bytes: i64,
     pub format_name: String,
     pub created_at: String,
+    /// 去重后的文件；空串表示还没去重过。
+    /// 切片优先读它 —— 真实软件的流程就是「先去重再切片」。
+    #[serde(default)]
+    pub processed_path: String,
 }
 
 /// ffprobe 探测结果（尚未落库）
@@ -804,6 +808,31 @@ pub struct CloudTestResult {
     pub detail: String,
 }
 
+/// 整集去重的结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DedupReport {
+    pub media_id: i64,
+    /// 去重产物。**这才是发布用的东西**，切片是它的下游。
+    pub out_path: String,
+    pub size_bytes: i64,
+    /// 没达到平台规范的地方（只是提示）
+    #[serde(default)]
+    pub spec_problems: Vec<crate::transform::SpecProblem>,
+}
+/// 分镜证明的产出。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoryboardReport {
+    /// 拼出了几张证明图
+    pub sheets: i64,
+    /// 一共几个镜头
+    pub shots: i64,
+    /// 分镜描述是不是由视觉模型反推的
+    pub used_ai: bool,
+    pub frames_dir: String,
+    pub notes: Vec<String>,
+}
 // ---------------- 运行日志 ----------------
 
 /// 一行运行日志。

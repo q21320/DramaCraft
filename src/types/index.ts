@@ -1,4 +1,4 @@
-﻿export interface Project {
+export interface Project {
   id: number;
   name: string;
   rootDir: string;
@@ -234,6 +234,26 @@ export interface RewriteOutcome {
   provider: string;
   /** 落在了哪些文件上 */
   saved: string[];
+}
+// ---------------- 整集去重 / 分镜证明 ----------------
+
+/** 整集去重的结果。outPath 就是发布用的东西，切片是它的下游。 */
+export interface DedupReport {
+  mediaId: number;
+  outPath: string;
+  sizeBytes: number;
+  /** 没达到平台规范的地方（只是提示，不是失败） */
+  specProblems: { file: string; problems: string[] }[];
+}
+
+/** 分镜证明的产出 */
+export interface StoryboardReport {
+  sheets: number;
+  shots: number;
+  /** 分镜描述是不是由视觉模型反推的 */
+  usedAi: boolean;
+  framesDir: string;
+  notes: string[];
 }
 // ---------------- 运行日志 ----------------
 

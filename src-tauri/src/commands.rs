@@ -6,7 +6,7 @@ use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, Asset, AssetApplyReport, AssetImportReport, AssetKindOption,
     AssetSummary, CloudConfigView, CloudTestResult, CloudTranscribeReport, CostDocRequest, Cue,
     DiscoveredAsset, DocxReport, EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome,
-    AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage, RewriteOutcome, CoverReport, CoverRequest, HeaderLabel,
+    AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage, DedupReport, RewriteOutcome, StoryboardReport, CoverReport, CoverRequest, HeaderLabel,
     IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
     PipelineStage, PlatformOption, Project,
     ProofLayout, ProofPreview, ProofRenderReport, PublishAccount, PublishClipEntry,
@@ -202,7 +202,13 @@ pub async fn run_slice(
         let conn = lock_db(&state)?;
         let target = db::get_media(&conn, media_id)?;
         let plans = media::plan::build_plan(target.duration_ms, &mode);
-        (target.path, plans, ffmpeg)
+        // **切去重产物，不是原片。**
+        //
+        // 真实软件的流程是「先去重整集、再切片」—— 去重产物才是发布用的，
+        // 切片只是它的下游（做证明图）。原来我切原片，等于去重白做了。
+        // 没去重过就退回原片（media_source_path 自己处理这个）。
+        let source = db::media_source_path(&conn, media_id)?;
+        (source, plans, ffmpeg)
     };
 
     if plans.is_empty() {
@@ -2114,6 +2120,298 @@ pub async fn ai_rewrite(
         new_synopsis,
         provider: provider.label,
         saved,
+    })
+}
+
+/// 对**整集**做画面处理（去重）。
+///
+/// 真实软件的流程是「**先去重整集、再切片**」：去重产物（它叫 `yiquchong`）
+/// 才是发布用的东西，切片只是它的下游（做证明图用）。
+///
+/// 我原来是反的 —— 先切再对每一片去重。同一部剧要多跑十几倍的去重，
+/// 而且去重后的切片还得再拼回去。改过来之后：
+/// - 去重次数 = 集数（61 次），不是片数（150+ 次）
+/// - 去重产物是一个完整文件，直接就能发
+/// - 切片时自动读这个产物（`media_source_path`），不用手动传
+#[tauri::command]
+pub async fn dedup_media(
+    state: tauri::State<'_, AppState>,
+    media_id: i64,
+    intensity: Option<String>,
+    header_label: Option<HeaderLabel>,
+    out_dir: Option<String>,
+) -> AppResult<DedupReport> {
+    let (ffmpeg, ffprobe, media) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let conn = lock_db(&state)?;
+        let media = db::get_media(&conn, media_id)?;
+        (ffmpeg, configured.ffprobe, media)
+    };
+
+    let input = PathBuf::from(&media.path);
+    if !input.is_file() {
+        return Err(AppError::Msg(format!("原片不在了：{}", input.to_string_lossy())));
+    }
+
+    let out = match out_dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| AppError::Msg(format!("建不了输出目录：{e}")))?;
+            // 用原文件名，一眼能认出是哪一集
+            dir.join(format!("{}_去重.mp4", media.name.trim_end_matches(".mp4")))
+        }
+        None => input.with_file_name(format!(
+            "{}_去重.mp4",
+            input
+                .file_stem()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_default()
+        )),
+    };
+
+    let level = transform::Intensity::parse(intensity.as_deref().unwrap_or("strong"));
+    let mut opts = transform::preset_for(level, media_id as usize);
+    opts.header_label = header_label;
+
+    let target = if media.width > 0 && media.height > 0 {
+        Some((media.width as u32, media.height as u32))
+    } else {
+        None
+    };
+
+    let id = media.id;
+    let path_for_task = out.clone();
+    let size = tauri::async_runtime::spawn_blocking(move || {
+        transform::apply(&ffmpeg, &input, &path_for_task, &opts, target)
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("去重线程异常终止：{e}")))??;
+
+    // 记下来：切片时优先读它
+    {
+        let conn = lock_db(&state)?;
+        db::set_media_processed(&conn, id, &out.to_string_lossy())?;
+    }
+
+    let spec_problems = if Path::new(&ffprobe).is_file() {
+        let problems = transform::check_spec(Path::new(&ffprobe), &out);
+        if problems.is_empty() {
+            Vec::new()
+        } else {
+            vec![transform::SpecProblem {
+                file: out.to_string_lossy().to_string(),
+                problems,
+            }]
+        }
+    } else {
+        Vec::new()
+    };
+
+    Ok(DedupReport {
+        media_id: id,
+        out_path: out.to_string_lossy().to_string(),
+        size_bytes: size,
+        spec_problems,
+    })
+}
+
+// ---------------- 分镜证明 ----------------
+
+/// 从切片抽帧 → 反推分镜 → 拼成证明图。
+///
+/// 照真实软件的做法：每集抽若干帧，交给**视觉模型**反推出"这一镜拍了什么"，
+/// 再把若干镜头拼进一张图，就是报备用的分镜证明。
+///
+/// 没有配 AI 服务时**退回无描述版**：只把抽出来的帧拼成图 ——
+/// 证明"这些画面确实存在"这一点仍然成立，只是没有文字说明。
+/// 排一个注定失败的任务不如给一个能用的降级产物。
+#[tauri::command]
+pub async fn build_storyboard(
+    state: tauri::State<'_, AppState>,
+    media_ids: Vec<i64>,
+    out_dir: String,
+    frames_per_episode: i64,
+    shots_per_sheet: i64,
+) -> AppResult<StoryboardReport> {
+    if media_ids.is_empty() {
+        return Err(AppError::Msg(
+            "没有可用于做证明的集 —— 先跑「AI 去字幕」，它决定用哪几集".into(),
+        ));
+    }
+    let out_dir = PathBuf::from(out_dir.trim());
+    if out_dir.as_os_str().is_empty() {
+        return Err(AppError::Msg("没指定证明图输出目录".into()));
+    }
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| AppError::Msg(format!("建不了输出目录：{e}")))?;
+
+    let (ffmpeg, provider, title) = {
+        let configured = lock_tools(&state)?.clone();
+        let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let conn = lock_db(&state)?;
+        let provider = ai::usable_provider(&conn)?;
+        // 剧名：rewrite 写过就用新的
+        let title = std::fs::read_to_string(out_dir.join("剧名.txt"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "未命名".to_string());
+        (ffmpeg, provider, title)
+    };
+
+    let per_ep = frames_per_episode.clamp(1, 12) as usize;
+    let per_sheet = shots_per_sheet.clamp(1, 6) as usize;
+
+    // 抽帧：每集从头到尾均匀取 per_ep 张
+    let mut frames: Vec<PathBuf> = Vec::new();
+    let frame_dir = out_dir.join("_frames");
+    std::fs::create_dir_all(&frame_dir)
+        .map_err(|e| AppError::Msg(format!("建不了抽帧目录：{e}")))?;
+
+    for (i, mid) in media_ids.iter().enumerate() {
+        let segs = {
+            let conn = lock_db(&state)?;
+            db::list_segments(&conn, *mid)?
+                .into_iter()
+                .filter(|s| s.status == "ok")
+                .collect::<Vec<_>>()
+        };
+        // 用这一集的**切片**抽帧 —— 和真实软件一致（它切 10s 片再抽）
+        let Some(seg) = segs.first() else {
+            continue;
+        };
+        let src = PathBuf::from(&seg.out_path);
+        if !src.is_file() {
+            continue;
+        }
+        for k in 0..per_ep {
+            // 均匀分布：第 k 张取在第 (k+0.5)/per_ep 处
+            let at = (seg.end_ms - seg.start_ms) as f64 / 1000.0 * (k as f64 + 0.5)
+                / per_ep as f64;
+            let dst = frame_dir.join(format!("ep{:02}_{:02}.jpg", i + 1, k + 1));
+            let ok = crate::proc::no_window(
+                std::process::Command::new(&ffmpeg).args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-ss",
+                    &format!("{at:.3}"),
+                ]),
+            )
+            .arg("-i")
+            .arg(&src)
+            .args(["-frames:v", "1", "-q:v", "3"])
+            .arg(&dst)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+            if ok && dst.is_file() {
+                frames.push(dst);
+            }
+        }
+    }
+
+    if frames.is_empty() {
+        return Err(AppError::Msg(
+            "一帧都没抽出来 —— 先跑「视频切片」，证明图是从切片里抽的".into(),
+        ));
+    }
+
+    // 反推分镜描述（没有 AI 服务就跳过，产出无描述版）
+    let mut descriptions: Vec<String> = Vec::new();
+    let mut used_ai = false;
+    if let Some(p) = &provider {
+        for f in &frames {
+            match ai::describe_frame(p, f).await {
+                Ok(text) => {
+                    descriptions.push(text);
+                    used_ai = true;
+                }
+                Err(e) => {
+                    eprintln!("DramaDist: 反推分镜失败，改用无描述版：{e}");
+                    descriptions.clear();
+                    used_ai = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 拼图：每 per_sheet 个镜头一张
+    let shot_labels: Vec<String> = frames
+        .iter()
+        .enumerate()
+        .map(|(i, _)| match descriptions.get(i) {
+            Some(d) if !d.is_empty() => d.clone(),
+            _ => format!("镜头{:02}", i + 1),
+        })
+        .collect();
+
+    let mut sheets = 0i64;
+    for (si, chunk) in frames.chunks(per_sheet).enumerate() {
+        let out = out_dir.join(format!("{title}_分镜证明_{:02}.jpg", si + 1));
+        let mut args: Vec<String> = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-y".into(),
+        ];
+        for f in chunk {
+            args.push("-i".into());
+            args.push(f.to_string_lossy().to_string());
+        }
+        // 横向并排，统一高度 720
+        let mut chain = String::new();
+        for (i, _) in chunk.iter().enumerate() {
+            chain.push_str(&format!("[{i}:v]scale=-2:720[v{i}];"));
+        }
+        let refs: Vec<String> = (0..chunk.len()).map(|i| format!("[v{i}]")).collect();
+        chain.push_str(&format!("{}hstack=inputs={}[out]", refs.join(""), chunk.len()));
+        args.push("-filter_complex".into());
+        args.push(chain);
+        args.push("-map".into());
+        args.push("[out]".into());
+        args.push("-frames:v".into());
+        args.push("1".into());
+        args.push("-q:v".into());
+        args.push("2".into());
+        args.push(out.to_string_lossy().to_string());
+
+        let ok = crate::proc::no_window(std::process::Command::new(&ffmpeg).args(&args))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok && out.is_file() {
+            sheets += 1;
+        }
+    }
+
+    // 镜头清单：写一份文字版，报备时好看
+    let mut notes = vec![format!("共 {} 帧、{} 张证明图", frames.len(), sheets)];
+    if used_ai {
+        notes.push(format!("分镜描述由「{}」反推", provider.as_ref().unwrap().label));
+    } else {
+        notes.push("没有可用的 AI 服务，产出的是**无描述版**（只有画面，没有文字说明）".into());
+    }
+    let list = out_dir.join("分镜清单.txt");
+    let _ = std::fs::write(
+        &list,
+        shot_labels
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("镜头{:02}\t{}\n", i + 1, s))
+            .collect::<String>(),
+    );
+
+    Ok(StoryboardReport {
+        sheets,
+        shots: frames.len() as i64,
+        used_ai,
+        frames_dir: frame_dir.to_string_lossy().to_string(),
+        notes,
     })
 }
 

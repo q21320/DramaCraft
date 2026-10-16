@@ -386,6 +386,58 @@ pub async fn test_provider(provider: &AiProvider) -> AiTestResult {
     }
 }
 
+/// 让视觉模型描述一张图的画面内容 —— 用来反推分镜。
+///
+/// 真实软件就是这么做的：日志里有「Ark 语言模型[分镜反推]：…（附图 5 张）」。
+/// 把抽出来的帧发给视觉模型，问"这一镜拍了什么"，结果就是分镜描述。
+pub async fn describe_frame(provider: &AiProvider, image: &std::path::Path) -> AppResult<String> {
+    if let Some(early) = precheck(provider) {
+        return Err(AppError::Msg(early.message));
+    }
+    if provider.text_model.trim().is_empty() {
+        return Err(AppError::Msg(format!("「{}」没填语言模型", provider.label)));
+    }
+    let data_url = image_data_url(image)?;
+    let endpoint = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| AppError::Msg(format!("建不了 HTTP 客户端：{e}")))?;
+
+    let body = serde_json::json!({
+        "model": provider.text_model.trim(),
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "用一句不超过 20 字的中文描述这一镜的画面：谁、在哪、做什么。\
+                             只输出这一句，不要标点以外的任何解释。"
+                },
+                { "type": "image_url", "image_url": { "url": data_url } }
+            ]
+        }],
+        "temperature": 0.3,
+    });
+
+    let resp = client
+        .post(&endpoint)
+        .header("Authorization", format!("Bearer {}", provider.api_key.trim()))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::Msg(format!("请求失败：{e}")))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        return Err(AppError::Msg(friendly_http(status, &text)));
+    }
+    let raw = extract_chat_text(&text)?;
+    // 描述要短 —— 模型很爱写成一段话
+    Ok(raw.trim().lines().next().unwrap_or("").trim().chars().take(40).collect())
+}
+
 // ---------------- 剧名 / 简介改写 ----------------
 
 /// 从 OpenAI 兼容的 chat 返回体里取文本。

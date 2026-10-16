@@ -32,9 +32,14 @@ use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager};
 
 /// 队列支持的任务类型：(key, 中文名)
-pub const KINDS: [(&str, &str); 11] = [
-    // 整部剧一步的排在最前和最后 —— 和真实软件的流水线顺序一致
+pub const KINDS: [(&str, &str); 16] = [
+    // 顺序照着真实软件的流水线来
     ("rewrite", "AI 改剧名简介"),
+    ("regroup", "整剧重组"),
+    ("dedup", "整集去重"),
+    ("desubtitle", "AI 去字幕"),
+    ("storyboard", "分镜证明"),
+    ("cost", "成本报告"),
     ("slice", "切片"),
     ("transform", "画面处理"),
     ("ocr", "硬字幕识别"),
@@ -82,6 +87,57 @@ struct TransformPayload {
     /// 片头标识（合规开关），叠加在预设之上
     #[serde(default)]
     header_label: Option<HeaderLabel>,
+}
+
+/// 整集去重。**发布用的就是这个产物**，切片是它的下游。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DedupPayload {
+    media_id: i64,
+    #[serde(default = "default_intensity")]
+    intensity: String,
+    #[serde(default)]
+    header_label: Option<HeaderLabel>,
+    /// 去重产物放哪个目录
+    out_dir: String,
+}
+
+fn default_intensity() -> String {
+    "strong".to_string()
+}
+
+/// 整部剧一步：成本报告。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CostPayload {
+    title: String,
+    episode_count: i64,
+    total_ms: i64,
+    out_path: String,
+    #[serde(default)]
+    invest_wan: f64,
+    #[serde(default)]
+    actor_ratio: f64,
+}
+
+/// 整部剧一步：分镜证明。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoryboardPayload {
+    /// 从哪几集的切片抽帧（去字幕后的那几集）
+    media_ids: Vec<i64>,
+    out_dir: String,
+    #[serde(default = "default_frames_per_episode")]
+    frames_per_episode: i64,
+    #[serde(default = "default_shots_per_sheet")]
+    shots_per_sheet: i64,
+}
+
+fn default_frames_per_episode() -> i64 {
+    5
+}
+fn default_shots_per_sheet() -> i64 {
+    2
 }
 
 /// 整部剧一步：改剧名 / 简介。
@@ -174,6 +230,13 @@ pub fn validate_payload(kind: &str, payload: &str) -> AppResult<()> {
         })
     }
     match kind {
+        "dedup" => check::<DedupPayload>(kind, payload),
+        "cost" => check::<CostPayload>(kind, payload),
+        "storyboard" => check::<StoryboardPayload>(kind, payload),
+        // 这两步的执行器会直接给出「还没实现 + 为什么」的说明，
+        // 参数只要是个 JSON 对象就够（校验太严会把它挡在入队之前，
+        // 用户就看不到那条说明了）
+        "regroup" | "desubtitle" => check::<serde_json::Map<String, serde_json::Value>>(kind, payload),
         "rewrite" => check::<RewritePayload>(kind, payload),
         "cover" => check::<CoverPayload>(kind, payload),
         "slice" => check::<SlicePayload>(kind, payload),
@@ -221,6 +284,96 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
     let state = app.state::<AppState>();
 
     match job.kind.as_str() {
+        // 整剧重组 / AI 去字幕：先说清楚为什么还不能跑，
+        // 而不是排一个注定失败的任务让用户猜。
+        "regroup" => Err(AppError::Msg(
+            "整剧重组还没实现。它解决的是「源目录里是一堆零碎片段」的情况 —— \
+             把片段按时间轴拼成 60~90 秒的集。你的源目录已经是整集，这一步用不上。"
+                .into(),
+        )),
+        "desubtitle" => Err(AppError::Msg(
+            "AI 去字幕需要云服务的接口文档（真实软件用的是开拍 videoscreenclear）。\
+             没有该服务的 API 说明就没法实现 —— 需要 AccessKey / SecretKey 与接口格式。"
+                .into(),
+        )),
+        // 成本报告：按模板生成（报备用）
+        "cost" => {
+            let p: CostPayload = parse_payload(job)?;
+            let minutes = (p.total_ms as f64 / 60000.0).max(0.0);
+            let invest = if p.invest_wan > 0.0 { p.invest_wan } else { 1.0 };
+            let ratio = if p.actor_ratio > 0.0 { p.actor_ratio } else { 30.0 };
+            let actor_amount = invest * ratio / 100.0;
+            let request = crate::models::CostDocRequest {
+                drama_name: p.title.clone(),
+                producer: String::new(),
+                date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+                total: format!("{invest} 万元"),
+                rows: vec![
+                    crate::models::CostDocRow {
+                        item: "总投资额".into(),
+                        quantity: "1".into(),
+                        unit_price: format!("{invest} 万元"),
+                        amount: format!("{invest} 万元"),
+                    },
+                    crate::models::CostDocRow {
+                        item: format!("演员报酬（{ratio:.0}%）"),
+                        quantity: "1".into(),
+                        unit_price: format!("{actor_amount:.2} 万元"),
+                        amount: format!("{actor_amount:.2} 万元"),
+                    },
+                    crate::models::CostDocRow {
+                        item: "总集数".into(),
+                        quantity: format!("{} 集", p.episode_count),
+                        unit_price: String::new(),
+                        amount: String::new(),
+                    },
+                    crate::models::CostDocRow {
+                        item: "总时长".into(),
+                        quantity: format!("{minutes:.1} 分钟"),
+                        unit_price: String::new(),
+                        amount: String::new(),
+                    },
+                ],
+            };
+            let report = commands::generate_cost_docx(request, p.out_path)?;
+            Ok(format!("成本报告已生成（{}）", report.out_path))
+        }
+        // 分镜证明：抽帧 → 视觉模型反推 → 拼成证明图
+        "storyboard" => {
+            let p: StoryboardPayload = parse_payload(job)?;
+            let report = commands::build_storyboard(
+                state,
+                p.media_ids,
+                p.out_dir,
+                p.frames_per_episode,
+                p.shots_per_sheet,
+            )
+            .await?;
+            Ok(format!(
+                "分镜证明已生成 {} 张（共 {} 镜头）",
+                report.sheets, report.shots
+            ))
+        }
+        // 整集去重 —— 真实软件的流程是「先去重整集、再切片」。
+        // 去重产物才是发布用的东西。
+        "dedup" => {
+            let p: DedupPayload = parse_payload(job)?;
+            let report = commands::dedup_media(
+                state,
+                p.media_id,
+                Some(p.intensity),
+                p.header_label,
+                Some(p.out_dir),
+            )
+            .await?;
+            let mb = report.size_bytes as f64 / 1048576.0;
+            let bad: usize = report.spec_problems.iter().map(|s| s.problems.len()).sum();
+            if bad > 0 {
+                Ok(format!("整集去重完成（{mb:.1} MB）；{bad} 项没达到上传规范"))
+            } else {
+                Ok(format!("整集去重完成（{mb:.1} MB，校验通过）"))
+            }
+        }
         // 整部剧第一步：改简介 → 按新简介起剧名。
         // 结果写进导出目录的 `剧名.txt`，封面那一步会去读。
         "rewrite" => {

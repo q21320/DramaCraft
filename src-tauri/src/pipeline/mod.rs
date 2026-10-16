@@ -1,4 +1,4 @@
-//! 流水线：把「一个源目录」变成「一批做完的剧」。
+﻿//! 流水线：把「一个源目录」变成「一批做完的剧」。
 //!
 //! ## 为什么要有这一层
 //!
@@ -164,63 +164,91 @@ fn decode_gbk(bytes: &[u8]) -> String {
 ///
 /// 刻意做成一张表而不是散在各处：加一步只需要在这里加一行，
 /// 界面、校验、执行顺序都跟着走。
+/// 流水线的步骤表。**顺序就是执行顺序。**
+///
+/// 这 8 步是照真实软件的流水线定的（它日志开头那行就是这个顺序）：
+///
+/// ```text
+/// AI重写简介 → AI重写剧名 → 整剧重组 → 超强去重 → AI去字幕
+///   → 视频切片 → 分镜证明 → 封面 → 成本报告
+/// ```
+///
+/// 其中「重写简介」和「重写剧名」合成一步 `rewrite`（一次调用做完两件事）。
+///
+/// **两个和我们直觉相反、但很关键的地方：**
+///
+/// 1. **去重对「整集」，不对「切片」**。它把去重放在切片之前 ——
+///    去重产物才是发布用的东西，切片只是它的下游（做证明图用）。
+///    反过来做的话，同一部剧要多跑十几倍的去重。
+/// 2. **切片是给「证明」用的，不是给发布用的**。它只切去字幕后的前 4 集，
+///    切成 10 秒一段，用来抽帧做分镜证明图。
+///
+/// 「出字幕 / 导出成片 / 发布包」不在这个表里 —— 真实软件没有这几步
+/// （它的素材自带硬字幕，去重产物直接就能发）。这几个能力在
+/// 「单步工具」里单独用。
 pub const STAGES: [(&str, &str, bool, &str); 8] = [
     (
         "rewrite",
         "AI 改剧名简介",
         false,
-        "先改简介，再按新简介起剧名（整部剧一步，需先在「AI 服务」配好）",
+        "先改简介，再按新简介起剧名（整部剧一次，需先在「AI 服务」配好）",
     ),
     (
-        "slice",
-        "切片",
-        true,
-        "把整集按固定时长切成可发布的片",
-    ),
-    (
-        "subtitle",
-        "出字幕",
-        true,
-        "本地语音识别（默认 small 模型），自动繁转简",
+        "regroup",
+        "整剧重组",
+        false,
+        "把零碎源片段按时间轴拼成 60~90 秒的「集」（源已经是整集时不用开）",
     ),
     (
         "dedup",
-        "画面处理",
+        "整集去重",
         true,
-        "每片做不同的画面处理，互相之间不再完全一致",
+        "对整集做画面处理，产出直接可发；切片会接在它后面",
     ),
     (
-        "export",
-        "导出成片",
+        "desubtitle",
+        "AI 去字幕",
         false,
-        "烧字幕、竖屏 9:16，导出可直接上传的成片",
+        "擦掉硬字幕（只做前 4 集，用来做分镜证明图）",
     ),
     (
-        "package",
-        "发布包",
+        "slice",
+        "视频切片",
         false,
-        "整理成发布包（视频 / 封面 / 字幕 / 标题标签）",
+        "把整集切成 10 秒一段（供做证明图，不是发布用）",
+    ),
+    (
+        "storyboard",
+        "分镜证明",
+        false,
+        "从切片抽帧 → 反推分镜 → 拼成报备用的证明图",
     ),
     (
         "cover",
-        "生成封面",
+        "封面生成",
         false,
-        "用原封面 + 新剧名合成封面（整部剧一张）",
+        "用原封面 + 新剧名合成一张（整部剧一张）",
     ),
     (
-        "proof",
-        "证明材料",
+        "cost",
+        "成本报告",
         false,
-        "按模板生成报备用的证明图与成本文档",
+        "按模板生成成本配置比例报告（报备用）",
     ),
 ];
 
 /// 这一步是**整部剧一步**吗？
 ///
-/// 改剧名、生成封面、出证明材料都是针对整部剧的，不该按集排 ——
-/// 60 集排 60 个「改剧名」任务，会调 120 次模型，钱白花。
+/// 改剧名、整剧重组、去字幕、分镜证明、封面、成本报告都是针对整部剧的，
+/// 不该按集排 —— 60 集排 60 个「改剧名」任务，会调 120 次模型，钱白花。
+///
+/// 注意 `dedup`（整集去重）**不在**这里：它是**按集**的，每集去重一次。
+/// 这正是「先去重整集、再切片」的关键 —— 去重对象是集，不是整部剧。
 pub fn is_drama_level(stage: &str) -> bool {
-    matches!(stage, "rewrite" | "cover" | "proof")
+    matches!(
+        stage,
+        "rewrite" | "regroup" | "desubtitle" | "storyboard" | "cover" | "cost"
+    )
 }
 
 pub fn stage_list() -> Vec<crate::models::PipelineStage> {
@@ -392,11 +420,20 @@ pub fn start_pipeline(
             continue;
         }
 
+        // 整部剧的总时长 —— 成本报告要写「总时长」
+        let total_ms: i64 = {
+            let mut total = 0i64;
+            for mid in &media_ids {
+                total += crate::db::get_media(conn, *mid)?.duration_ms;
+            }
+            total
+        };
+
         for stage in stages {
             // 整部剧一步的（改剧名、封面）：**只排一个任务**，不按集排。
             // 60 集排 60 个「改剧名」= 调 120 次模型，钱白花。
             if is_drama_level(stage) {
-                match drama_payload(stage, drama, &drama_out)? {
+                match drama_payload(stage, drama, &drama_out, &media_ids, total_ms)? {
                     Some(payload) => {
                         crate::db::enqueue_job_for(
                             conn,
@@ -474,12 +511,13 @@ pub fn start_pipeline(
 pub fn stage_to_job_kind(stage: &str) -> &'static str {
     match stage {
         "rewrite" => "rewrite",
+        "regroup" => "regroup",
+        "dedup" => "dedup",
+        "desubtitle" => "desubtitle",
         "slice" => "slice",
-        "subtitle" => "asr",
-        "dedup" => "transform",
-        "export" => "export",
-        "package" => "publish",
+        "storyboard" => "storyboard",
         "cover" => "cover",
+        "cost" => "cost",
         _ => "verify",
     }
 }
@@ -488,7 +526,13 @@ pub fn stage_to_job_kind(stage: &str) -> &'static str {
 ///
 /// 缺素材就跳过而不是排一个注定失败的任务 —— 但要**说清楚为什么**，
 /// 不然用户只看到「步骤没跑」，不知道是缺简介还是缺封面。
-fn drama_payload(stage: &str, drama: &SourceDrama, drama_out: &Path) -> AppResult<Option<String>> {
+fn drama_payload(
+    stage: &str,
+    drama: &SourceDrama,
+    drama_out: &Path,
+    media_ids: &[i64],
+    total_ms: i64,
+) -> AppResult<Option<String>> {
     match stage {
         "rewrite" => {
             if drama.synopsis.trim().is_empty() {
@@ -521,8 +565,45 @@ fn drama_payload(stage: &str, drama: &SourceDrama, drama_out: &Path) -> AppResul
                 .to_string(),
             ))
         }
-        // 证明图要有模板和字段坐标才谈得上生成，没配就跳过
-        "proof" => Ok(None),
+        "cost" => Ok(Some(
+            serde_json::json!({
+                "title": drama.name,
+                "episodeCount": drama.episode_count,
+                "totalMs": total_ms,
+                "outPath": drama_out.join(format!("{}_成本报告.docx", drama.name)).to_string_lossy(),
+                // 报备用的默认值：投资额由用户在报告里改
+                "investWan": 100.0,
+                "actorRatio": 30.0,
+            })
+            .to_string(),
+        )),
+        "storyboard" => {
+            // **只做前 4 集** —— 和真实软件一致。
+            // 全剧都做的话，抽帧 + 视觉模型反推的费用是它的十几倍，
+            // 而报备只需要能说明"这些画面出自本剧"。
+            let first: Vec<i64> = media_ids.iter().take(4).copied().collect();
+            if first.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(
+                serde_json::json!({
+                    "mediaIds": first,
+                    "outDir": drama_out.join("分镜证明").to_string_lossy(),
+                    "framesPerEpisode": 5,
+                    "shotsPerSheet": 2,
+                })
+                .to_string(),
+            ))
+        }
+        // 这两步的执行器会给出明确说明（见 queue::execute）——
+        // 排下去让用户看到原因，比悄悄跳过强
+        "regroup" | "desubtitle" => Ok(Some(
+            serde_json::json!({
+                "dramaName": drama.name,
+                "outDir": drama_out.to_string_lossy(),
+            })
+            .to_string(),
+        )),
         other => Err(AppError::Msg(format!("不是整部剧级别的步骤：{other}"))),
     }
 }
@@ -563,7 +644,9 @@ pub fn stage_payload(
     media_id: i64,
     out_dir: &Path,
     slice_ms: i64,
-    model: &str,
+    // 语音模型：现在只有「出字幕」用得上，而它已经不在流水线里了。
+    // 参数留着是因为单步工具那边还会调它。
+    #[allow(unused_variables)] model: &str,
     group: &str,
     label: Option<&HeaderLabel>,
 ) -> AppResult<Option<String>> {
@@ -582,18 +665,22 @@ pub fn stage_payload(
             // 切出来要能直接上传：源素材常是 HEVC，而平台要 H.264
             "compatible": true,
         }),
-        "subtitle" => serde_json::json!({
-            "mediaId": media_id,
-            "model": model,
-            "language": "zh",
-            "overwrite": true,
-        }),
         "dedup" => serde_json::json!({
+            // **对整集去重** —— 真实软件的流程是「先去重整集、再切片」。
+            // 去重产物才是发布用的，切片读的就是它（不是原片）。
+            // 反过来的话，同一部剧要多跑十几倍的去重。
+            "mediaId": media_id,
+            "intensity": "strong",
+            // 片头标识**叠加**在预设之上：它是合规开关，和"怎么去重"是两件事
+            "headerLabel": label,
+            "outDir": here.join("去重").to_string_lossy(),
+        }),
+        // 「画面处理」是老的按切片做法，留给单步工具页用
+        "transform" => serde_json::json!({
             "mediaId": media_id,
             "intensity": "medium",
             // options 留空 → 用按序号生成的确定性预设，每片各不相同
             "options": serde_json::Value::Null,
-            // 片头标识**叠加**在预设之上：它是合规开关，和"怎么去重"是两件事
             "headerLabel": label,
         }),
         "export" => serde_json::json!({
@@ -1199,7 +1286,8 @@ mod tests {
         crate::db::migrate_for_tests(&conn).unwrap();
 
         let out_root = t.path().join("二创");
-        let stages: Vec<String> = vec!["slice".into(), "subtitle".into()];
+        // 用现在的步骤名：**先去重、再切片**（真实软件的顺序）
+        let stages: Vec<String> = vec!["dedup".into(), "slice".into()];
         let outcome = start_pipeline(
             &conn,
             &ffprobe,
@@ -1235,17 +1323,18 @@ mod tests {
         let kinds: Vec<&str> = jobs.iter().map(|j| j.kind.as_str()).collect();
         assert_eq!(
             kinds,
-            vec!["slice", "slice", "asr", "asr", "slice", "asr"],
+            vec!["dedup", "dedup", "slice", "slice", "dedup", "slice"],
             "应当是剧A 的两步先排完，再排剧B"
         );
-        // 同一部剧内部，步骤顺序不能乱：先切片后字幕
+        // 同一部剧内部，步骤顺序不能乱：**先去重，后切片**。
+        // 反过来的话切片读的是原片，去重就白做了。
         let first_drama = jobs[0].pipeline_drama_id.unwrap();
         let kinds_of_a: Vec<&str> = jobs
             .iter()
             .filter(|j| j.pipeline_drama_id == Some(first_drama))
             .map(|j| j.kind.as_str())
             .collect();
-        assert_eq!(kinds_of_a, vec!["slice", "slice", "asr", "asr"]);
+        assert_eq!(kinds_of_a, vec!["dedup", "dedup", "slice", "slice"]);
 
         // payload 里的输出目录要落在这次运行的导出目录下
         let payload: serde_json::Value = serde_json::from_str(&jobs[0].payload).unwrap();
@@ -1538,7 +1627,7 @@ mod tests {
             let kind = stage_to_job_kind(stage);
             if is_drama_level(stage) {
                 // 整部剧一步：参数里带齐简介和封面，否则会被跳过（那也算正常）
-                let Some(payload) = drama_payload(stage, &drama, Path::new("E:/out"))
+                let Some(payload) = drama_payload(stage, &drama, Path::new("E:/out"), &[1, 2, 3], 180_000)
                     .unwrap_or_else(|e| panic!("{stage} 生成参数失败：{e}"))
                 else {
                     continue;
@@ -1569,9 +1658,13 @@ mod tests {
         // 改剧名、生成封面都是整部剧一步。按集排的话，60 集会调 120 次模型。
         assert!(is_drama_level("rewrite"));
         assert!(is_drama_level("cover"));
-        assert!(is_drama_level("proof"));
+        assert!(is_drama_level("cost"));
+        assert!(is_drama_level("storyboard"));
+        assert!(is_drama_level("regroup"));
+        assert!(is_drama_level("desubtitle"));
         assert!(!is_drama_level("slice"));
-        assert!(!is_drama_level("subtitle"));
+        // 去重是**按集**的（每集去重一次），不是整部剧一次 ——
+        // 这正是「先去重整集再切片」的关键
         assert!(!is_drama_level("dedup"));
     }
 
@@ -1589,16 +1682,16 @@ mod tests {
             warnings: Vec::new(),
         };
         let out = Path::new("E:/out");
-        assert!(drama_payload("rewrite", &drama, out).unwrap().is_none(), "没简介该跳过");
-        assert!(drama_payload("cover", &drama, out).unwrap().is_none(), "没封面该跳过");
+        assert!(drama_payload("rewrite", &drama, out, &[1, 2, 3], 180_000).unwrap().is_none(), "没简介该跳过");
+        assert!(drama_payload("cover", &drama, out, &[1, 2, 3], 180_000).unwrap().is_none(), "没封面该跳过");
 
         drama.synopsis = "简介".into();
         drama.cover = "D:/某剧/poster.jpg".into();
-        assert!(drama_payload("rewrite", &drama, out).unwrap().is_some());
-        assert!(drama_payload("cover", &drama, out).unwrap().is_some());
+        assert!(drama_payload("rewrite", &drama, out, &[1, 2, 3], 180_000).unwrap().is_some());
+        assert!(drama_payload("cover", &drama, out, &[1, 2, 3], 180_000).unwrap().is_some());
 
         // 封面要带上兜底剧名：rewrite 没跑或没写出 剧名.txt 时还能用
-        let raw = drama_payload("cover", &drama, out).unwrap().unwrap();
+        let raw = drama_payload("cover", &drama, out, &[1, 2, 3], 180_000).unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["fallbackTitle"], "某剧");
         assert_eq!(v["poster"], "D:/某剧/poster.jpg");
