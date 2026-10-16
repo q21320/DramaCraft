@@ -1,4 +1,4 @@
-//! SQLite 存取层。
+﻿//! SQLite 存取层。
 //!
 //! 迁移策略：只前进不回退，靠 `PRAGMA user_version` 判断。旧库能直接打开。
 
@@ -1466,14 +1466,43 @@ pub fn list_jobs(conn: &Connection, limit: i64) -> AppResult<Vec<Job>> {
     Ok(out)
 }
 
-/// 取下一条待跑任务（先入先出）。
-pub fn next_pending_job(conn: &Connection) -> AppResult<Option<Job>> {
+/// 取一批**同类型**的待跑任务，用来并行执行。
+///
+/// **为什么必须是同类型**：任务之间并不是都能并行的。
+/// 「切片」得在「去重」之后 —— 切片读的是去重产物，去重还没跑完就切片，
+/// 切出来的是原片，去重白做。
+///
+/// 但**同一类型内部彼此独立**：第 3 集去重和第 7 集去重互不相干，
+/// 可以一起跑。所以规则很简单：看队首是什么类型，就只并发取这个类型。
+/// 这样天然保证「上一步全部跑完，才轮到下一步」。
+pub fn next_pending_jobs_of_kind(
+    conn: &Connection,
+    kind: &str,
+    limit: i64,
+) -> AppResult<Vec<Job>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {JOB_COLUMNS} FROM job WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+        "SELECT {JOB_COLUMNS} FROM job
+          WHERE status = 'pending' AND kind = ?1
+          ORDER BY id ASC LIMIT ?2"
     ))?;
+    let rows = stmt.query_map(params![kind, limit.max(1)], row_to_job)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// 用过的任务类型（除了给定类型之外，还有没有别的在排队）。
+///
+/// 用来判断「这一步是不是全跑完了」—— 队首换类型了就说明上一步结束。
+pub fn next_pending_kind(conn: &Connection) -> AppResult<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT kind FROM job WHERE status = 'pending' ORDER BY id ASC LIMIT 1",
+    )?;
     let mut rows = stmt.query([])?;
     match rows.next()? {
-        Some(row) => Ok(Some(row_to_job(row)?)),
+        Some(row) => Ok(Some(row.get(0)?)),
         None => Ok(None),
     }
 }
@@ -1938,17 +1967,46 @@ mod tests {
         assert_eq!(a.attempts, 0);
         assert_eq!(a.payload, OK_SLICE);
 
-        assert_eq!(next_pending_job(&conn).unwrap().unwrap().id, a.id);
+        // 队列按 id 升序取 —— 先排的先跑
+        assert_eq!(next_pending_kind(&conn).unwrap().unwrap(), "slice");
 
         mark_job_running(&conn, a.id).unwrap();
         let running = get_job(&conn, a.id).unwrap();
         assert_eq!(running.status, JOB_RUNNING);
         assert_eq!(running.attempts, 1, "尝试次数要累加");
+
+        // 正在跑的不会再被取出来；队首换成下一条
         assert_eq!(
-            next_pending_job(&conn).unwrap().unwrap().id,
-            b.id,
+            next_pending_kind(&conn).unwrap().unwrap(),
+            "ocr",
             "正在跑的那条不该被再次取出"
         );
+        let batch = next_pending_jobs_of_kind(&conn, "ocr", 10).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, b.id);
+    }
+
+    /// 并行取任务：**只能取同一类型**。
+    ///
+    /// 跨类型并行会出事：「切片」读的是去重产物，去重还没跑完就切片，
+    /// 切出来的是原片 —— 去重白做。
+    #[test]
+    fn parallel_batches_only_take_one_kind() {
+        let conn = mem();
+        for i in 0..3 {
+            enqueue_job(&conn, Some(i), "dedup", OK_SLICE).unwrap();
+        }
+        enqueue_job(&conn, Some(9), "slice", OK_SLICE).unwrap();
+
+        // 队首是 dedup，就只拿 dedup —— 哪怕要 10 条
+        assert_eq!(next_pending_kind(&conn).unwrap().unwrap(), "dedup");
+        let batch = next_pending_jobs_of_kind(&conn, "dedup", 10).unwrap();
+        assert_eq!(batch.len(), 3, "只有 3 条 dedup，不该把 slice 也捞进来");
+        assert!(batch.iter().all(|j| j.kind == "dedup"));
+
+        // limit 真的起作用
+        let two = next_pending_jobs_of_kind(&conn, "dedup", 2).unwrap();
+        assert_eq!(two.len(), 2);
     }
 
     #[test]

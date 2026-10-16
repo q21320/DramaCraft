@@ -703,9 +703,11 @@ pub fn stage_payload(
             // 变体名是 everySeconds。写错不会当场报，而是排进队列、
             // 跑到它的时候才炸 —— 真实素材那轮就是这么栽的。
             "mode": { "mode": "everySeconds", "seconds": slice_ms as f64 / 1000.0 },
-            // 每集一个子目录：切片按「这一集的第几片」编号，
-            // 共用目录会让 16 集互相覆盖
-            "outDir": here.join("切片").to_string_lossy(),
+            // **平铺在一个「切片」目录里**（用户要的）。
+            // 切片是按「这一集的第几片」编号的，所以文件名必须带集名，
+            // 否则多集平铺会互相覆盖 —— 真实素材那轮 27 片只剩 3 片。
+            "outDir": out_dir.join("切片").to_string_lossy(),
+            "prefix": group,
             // 切出来要能直接上传：源素材常是 HEVC，而平台要 H.264
             "compatible": true,
         }),
@@ -717,7 +719,9 @@ pub fn stage_payload(
             "intensity": "strong",
             // 片头标识**叠加**在预设之上：它是合规开关，和"怎么去重"是两件事
             "headerLabel": label,
-            "outDir": here.join("去重").to_string_lossy(),
+            // **平铺在一个「去重」目录里**（用户要的）。
+            // 文件名带原集名，天然唯一，不会互相覆盖。
+            "outDir": out_dir.join("去重").to_string_lossy(),
         }),
         // 「画面处理」是老的按切片做法，留给单步工具页用
         "transform" => serde_json::json!({
@@ -1412,52 +1416,72 @@ mod tests {
     }
 
     #[test]
-    fn each_episode_writes_into_its_own_folder() {
-        // 这是真实素材上踩到的坑：16 集共用一个「切片」目录，
-        // 而切片是按「这一集的第几片」编号的（001、002…），
-        // 于是后面的集把前面的全覆盖了 —— 27 片只剩最后 3 片，
-        // 数据库里还显示"有"（路径确实存在，内容却是别人的）。
+    fn episodes_share_one_flat_folder_but_filenames_stay_unique() {
+        // 真实素材上踩过的坑：16 集共用一个「切片」目录，而切片是按
+        // 「这一集的第几片」编号的（001、002…），于是后面的集把前面的全覆盖了
+        // —— 27 片只剩最后 3 片，数据库里还显示"有"（路径在，内容却是别人的）。
+        //
+        // 现在的做法（用户要的「平铺」）：**目录共用，文件名带集名**。
+        // 目录平铺好找，文件名唯一不覆盖。
         let out = Path::new("D:/二创/某剧");
-        let a = stage_payload("slice", 1, out, 40_000, "small", "某剧-第01集", None)
+        let a = stage_payload("slice", 1, out, 40_000, "small", "第01集", None)
             .unwrap()
             .unwrap();
-        let b = stage_payload("slice", 2, out, 40_000, "small", "某剧-第02集", None)
+        let b = stage_payload("slice", 2, out, 40_000, "small", "第02集", None)
             .unwrap()
             .unwrap();
-        let dir_a: serde_json::Value = serde_json::from_str(&a).unwrap();
-        let dir_b: serde_json::Value = serde_json::from_str(&b).unwrap();
-        assert_ne!(
-            dir_a["outDir"], dir_b["outDir"],
-            "两集的输出目录必须不同，否则会互相覆盖"
+        let pa: serde_json::Value = serde_json::from_str(&a).unwrap();
+        let pb: serde_json::Value = serde_json::from_str(&b).unwrap();
+
+        // 同一个「切片」目录 —— 平铺
+        assert_eq!(pa["outDir"], pb["outDir"], "两集应当平铺在同一个「切片」目录里");
+        assert!(
+            pa["outDir"].as_str().unwrap().ends_with("切片"),
+            "{}",
+            pa["outDir"]
         );
         assert!(
-            dir_a["outDir"].as_str().unwrap().contains("第01集"),
-            "{}",
-            dir_a["outDir"]
+            !pa["outDir"].as_str().unwrap().contains("第01集"),
+            "目录里不该再套集名子目录：{}",
+            pa["outDir"]
         );
-        assert!(
-            dir_b["outDir"].as_str().unwrap().contains("第02集"),
-            "{}",
-            dir_b["outDir"]
-        );
+
+        // **靠文件名区分** —— 这是不互相覆盖的关键
+        assert_eq!(pa["prefix"], "第01集");
+        assert_eq!(pb["prefix"], "第02集");
+        assert_ne!(pa["prefix"], pb["prefix"], "文件名前缀必须不同，否则会覆盖");
     }
 
     #[test]
-    fn all_stages_of_one_episode_stay_under_its_own_folder() {
-        // 切片 / 导出 / 发布包 都要落在这一集自己的目录下
+    fn every_stage_of_one_episode_goes_into_the_drama_root() {
+        // 所有产出都落在**这部剧的根目录下**，按步骤分子文件夹、平铺。
+        //
+        // 之前是「每集一个子目录」，层级太深（剧/第01集/切片/001.mp4），
+        // 用户翻起来累。现在是 剧/切片/第01集_001.mp4 —— 目录只有一层，
+        // 靠文件名区分是哪一集。
         let out = Path::new("D:/二创/某剧");
-        let group = "某剧-第01集";
-        for stage in ["slice", "export", "package"] {
+        let group = "第01集";
+        for (stage, key, sub) in [
+            ("slice", "outDir", "切片"),
+            ("export", "outPath", "成片"),
+            ("package", "outRoot", "发布包"),
+        ] {
             let raw = stage_payload(stage, 1, out, 40_000, "small", group, None)
                 .unwrap()
                 .unwrap();
             let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            let key = if stage == "slice" { "outDir" } else if stage == "export" { "outPath" } else { "outRoot" };
             let path = v[key].as_str().unwrap();
             assert!(
-                path.contains(group),
-                "{stage} 的输出没有落在这一集自己的目录下：{path}"
+                path.starts_with("D:/二创/某剧") || path.starts_with(r"D:\二创\某剧"),
+                "{stage} 的产出该落在这部剧的根目录下：{path}"
             );
+            assert!(path.contains(sub), "{stage} 该有个「{sub}」子目录：{path}");
+            // 文件名（或前缀）要带上集名，平铺才不互相覆盖
+            if stage == "slice" {
+                assert_eq!(v["prefix"], group, "切片文件名要带集名：{path}");
+            } else {
+                assert!(path.contains(group), "{stage} 的产出要带集名：{path}");
+            }
         }
     }
 

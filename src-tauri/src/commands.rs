@@ -194,6 +194,8 @@ pub async fn run_slice(
     mode: SliceMode,
     out_dir: String,
     compatible: Option<bool>,
+    // 文件名前缀（通常传集名）。空串就用纯编号。
+    prefix: String,
 ) -> AppResult<Vec<Segment>> {
     let compatible = compatible.unwrap_or(false);
     let (input_path, plans, ffmpeg) = {
@@ -228,6 +230,7 @@ pub async fn run_slice(
     let ffmpeg_task = ffmpeg.clone();
     let input_task = input_path.clone();
     let out_task = out_root.clone();
+    let prefix_task = prefix.clone();
     let plans_task = plans.clone();
 
     // 每片一条结果：计划 / 落地路径 / 体积 / 状态 / 说明
@@ -244,7 +247,14 @@ pub async fn run_slice(
                         "phase": "running",
                     }),
                 );
-                let out_path = out_task.join(format!("{:03}.mp4", plan.index));
+                // 带上集名：切片编号是「这一集的第几片」，多集平铺一个目录
+                // 就会互相覆盖 —— 真实素材那轮 27 片只剩 3 片，就是这么丢的。
+                let stem = if prefix_task.is_empty() {
+                    format!("{:03}", plan.index)
+                } else {
+                    format!("{}_{:03}", prefix_task, plan.index)
+                };
+                let out_path = out_task.join(format!("{stem}.mp4"));
                 match media::slice(&ffmpeg_task, Path::new(&input_task), &out_path, plan, compatible) {
                     Ok(o) => acc.push((
                         plan.clone(),

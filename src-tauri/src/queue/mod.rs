@@ -77,6 +77,12 @@ struct SlicePayload {
     /// 源素材常是 HEVC，而平台上传规范要 H.264。
     #[serde(default)]
     compatible: bool,
+    /// 文件名前缀（通常是集名）。
+    ///
+    /// 切片是按「这一集的第几片」编号的（001、002…），多集平铺在同一个
+    /// 目录里就会互相覆盖 —— 必须带上集名才唯一。
+    #[serde(default)]
+    prefix: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,11 +366,22 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
             )
             .await?;
             let mb = report.size_bytes as f64 / 1048576.0;
-            let bad: usize = report.spec_problems.iter().map(|s| s.problems.len()).sum();
-            if bad > 0 {
-                Ok(format!("整集去重完成（{mb:.1} MB）；{bad} 项没达到上传规范"))
+            if report.spec_problems.is_empty() {
+                Ok(format!("去重完成，文件已出（{mb:.1} MB），上传规范校验通过"))
             } else {
-                Ok(format!("整集去重完成（{mb:.1} MB，校验通过）"))
+                // **说清楚"成功但有提示"**：原来只写「1 项没达到上传规范」，
+                // 用户分不清是成了还是废了。产物已经出来了，只是有几条要留意，
+                // 所以直接把是哪几条写出来。
+                let detail: Vec<String> = report
+                    .spec_problems
+                    .iter()
+                    .flat_map(|s| s.problems.iter().cloned())
+                    .collect();
+                Ok(format!(
+                    "去重完成，文件已出（{mb:.1} MB）。{} 条提示，不影响出片：{}",
+                    detail.len(),
+                    detail.join("；")
+                ))
             }
         }
         // 整部剧第一步：改简介 → 按新简介起剧名。
@@ -403,7 +420,7 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         "slice" => {
             let p: SlicePayload = parse_payload(job)?;
             let segments =
-                commands::run_slice(app.clone(), state, p.media_id, p.mode, p.out_dir, Some(p.compatible)).await?;
+                commands::run_slice(app.clone(), state, p.media_id, p.mode, p.out_dir, Some(p.compatible), p.prefix).await?;
             let failed = segments.iter().filter(|s| s.status != "ok").count();
             if failed > 0 {
                 Ok(format!("切出 {} 片，其中 {failed} 片失败", segments.len()))
@@ -529,8 +546,24 @@ pub async fn run(app: AppHandle, max_jobs: Option<i64>) -> AppResult<QueueReport
     outcome
 }
 
+/// 队列同时跑几个任务。
+///
+/// 每个任务是一个独立的 ffmpeg 进程，而 ffmpeg 自己已经多线程
+/// （libx264 默认吃满多核）。开太多只会互相抢核，反而更慢。
+///
+/// 按「每路 4 个核」算，夹在 1~4 路之间。
+/// 实测的痛点：61 集整集去重一个个跑要半小时以上，用户抱怨「很慢很慢」——
+/// 瓶颈就在并行度，不在编码器。
+fn job_concurrency() -> i64 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    ((cores / 4).max(1) as i64).clamp(1, 4)
+}
+
 async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
     let limit = limit.max(1);
+    let workers = job_concurrency();
     let mut processed = 0i64;
     let mut done = 0i64;
     let mut failed = 0i64;
@@ -550,48 +583,78 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             }
         }
 
-        let job = {
+        // **取一批同类型的任务一起跑。**
+        //
+        // 为什么必须是同类型：任务之间不是都能并行 ——「切片」得在「去重」
+        // 之后（切片读的正是去重产物），去重没跑完就切片，切出来的是原片。
+        // 但同一类型内部彼此独立：第 3 集去重和第 7 集去重互不相干。
+        //
+        // 规则：看队首是什么类型，就只并发取这个类型 —— 天然保证
+        // 「上一步全部跑完，才轮到下一步」。
+        //
+        // 61 集去重原来一个个跑要半小时以上，这是用户抱怨「很慢很慢」的根源。
+        let batch = {
             let state = app.state::<AppState>();
             let conn = state
                 .db
                 .lock()
                 .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
-            db::next_pending_job(&conn)?
+            let Some(kind) = db::next_pending_kind(&conn)? else {
+                break;
+            };
+            let jobs = db::next_pending_jobs_of_kind(&conn, &kind, workers)?;
+            for job in &jobs {
+                db::mark_job_running(&conn, job.id)?;
+                // 日志用 `===== 整集去重 =====` 分节，**不用 ▶** ——
+                // ▶ 长得像能点开的东西，点了没反应，用户会以为坏了。
+                if job.pipeline_drama_id.is_some() {
+                    let run_id =
+                        db::run_id_of_drama(&conn, job.pipeline_drama_id).unwrap_or(None);
+                    db::append_log(
+                        &conn,
+                        run_id,
+                        job.pipeline_drama_id,
+                        "info",
+                        &format!("===== {} =====", kind_label(&job.kind)),
+                    );
+                }
+            }
+            jobs
         };
-        let Some(job) = job else {
+        if batch.is_empty() {
             break;
-        };
+        }
 
-        {
-            let state = app.state::<AppState>();
-            let conn = state
-                .db
-                .lock()
-                .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
-            db::mark_job_running(&conn, job.id)?;
-            // 日志：开始跑一个任务。用剧名代替任务 id，读日志的人认得的是剧名。
-            if job.pipeline_drama_id.is_some() {
-                let run_id = db::run_id_of_drama(&conn, job.pipeline_drama_id).unwrap_or(None);
-                db::append_log(
-                    &conn,
-                    run_id,
-                    job.pipeline_drama_id,
-                    "info",
-                    &format!("▶ {}", kind_label(&job.kind)),
-                );
+        for job in &batch {
+            let _ = app.emit(
+                "queue:progress",
+                serde_json::json!({
+                    "jobId": job.id,
+                    "kind": job.kind,
+                    "phase": "running",
+                }),
+            );
+        }
+
+        // 并发执行 —— 这一整段 await 期间**不持有任何数据库锁**。
+        // 各自的 ffmpeg 是独立进程，互不干扰。
+        let mut handles = Vec::with_capacity(batch.len());
+        for job in batch {
+            let app_task = app.clone();
+            handles.push(tauri::async_runtime::spawn(async move {
+                let outcome = execute(&app_task, &job).await;
+                (job, outcome)
+            }));
+        }
+        let mut outcomes = Vec::with_capacity(handles.len());
+        for h in handles {
+            match h.await {
+                Ok(pair) => outcomes.push(pair),
+                Err(e) => eprintln!("DramaDist: 队列任务异常终止：{e}"),
             }
         }
-        let _ = app.emit(
-            "queue:progress",
-            serde_json::json!({
-                "jobId": job.id,
-                "kind": job.kind,
-                "phase": "running",
-            }),
-        );
 
-        // 关键：这一句 await 期间不持有任何数据库锁
-        let outcome = execute(app, &job).await;
+        for (job, outcome) in outcomes {
 
         {
             let state = app.state::<AppState>();
@@ -702,7 +765,8 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                 );
             }
         }
-        processed += 1;
+            processed += 1;
+        }
     }
 
     if processed >= limit {

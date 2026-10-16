@@ -30,7 +30,7 @@ pub const PRESETS: [(&str, &str, &str, &str, &str); 3] = [
         "火山方舟（豆包 Seedream）",
         "https://ark.cn-beijing.volces.com/api/v3",
         "doubao-seed-2-0-mini-260428",
-        "doubao-seedream-5-0-260128",
+        "doubao-seedream-5-0-flash-260915",
     ),
     (
         "dashscope",
@@ -889,7 +889,12 @@ fn friendly_http(status: u16, body: &str) -> String {
                 "接口返回 404。可能是 Base URL 不对，也可能是模型没开通 —— \
                  两种都会返 404，得看原始信息。原始信息：{detail}"
             ),
-            429 => format!("请求太频繁或额度用尽（429）。原始信息：{detail}"),
+            // SetLimitExceeded 特指「模型的推理服务没开通/额度用尽」，
+            // 和"请求太频繁"是两回事 —— 用户要做的动作完全不同
+            429 => format!(
+                "模型额度用尽或推理服务没开通（429）。去火山方舟控制台确认这个模型的\
+                 「推理服务」已开通、额度没用完。原始信息：{detail}"
+            ),
             _ => format!("HTTP {status}：{detail}"),
         },
     }
