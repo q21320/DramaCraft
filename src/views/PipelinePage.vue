@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   NAlert,
@@ -75,8 +75,7 @@ const labelPositions: { label: string; value: LabelPosition }[] = [
   { label: "左上角", value: "topLeft" },
   { label: "右上角", value: "topRight" },
   { label: "左下角", value: "bottomLeft" },
-  { label: "右下角", value: "bottomRight" },
-  { label: "顶部居中", value: "topCenter" },
+  { label: "右下角", value: "bottomRight" },  { label: "顶部居中", value: "topCenter" },
   { label: "底部居中", value: "bottomCenter" },
 ];
 
@@ -229,13 +228,106 @@ function stopPolling() {
   }
 }
 
+// ---------------- 记住这一页的填写状态 ----------------
+
+/**
+ * 把整页的填写状态存起来，下次打开原样回来。
+ *
+ * 用户说：「不保留 我每次都要从选择 好麻烦呀」——对。
+ * 源目录、勾了哪几步、切片多长、片头标识怎么设，这些是**用户的选择**，
+ * 不该每次重来一遍。
+ *
+ * 存在**后端**的 setting 表里，不是 localStorage：跟着库走，
+ * 换机器复制库过去习惯还在；出问题能用 sqlite 直接看。
+ */
+const UI_KEY = "pipeline.form";
+
+type UiForm = {
+  root: string;
+  outDir: string;
+  picked: string[];
+  sliceSeconds: number;
+  model: string;
+  labelEnabled: boolean;
+  labelText: string;
+  labelSeconds: number;
+  labelPosition: LabelPosition;
+};
+
+function snapshot(): UiForm {
+  return {
+    root: root.value,
+    outDir: outDir.value,
+    picked: [...picked.value],
+    sliceSeconds: sliceSeconds.value,
+    model: model.value,
+    labelEnabled: labelEnabled.value,
+    labelText: labelText.value,
+    labelSeconds: labelSeconds.value,
+    labelPosition: labelPosition.value,
+  };
+}
+
+/** 读回来。**读不到就当第一次用**，不报错、不弹窗。 */
+async function loadForm(): Promise<boolean> {
+  try {
+    const raw = await api.loadUiState(UI_KEY);
+    if (!raw) return false;
+    const f = JSON.parse(raw) as Partial<UiForm>;
+    if (typeof f.root === "string") root.value = f.root;
+    if (typeof f.outDir === "string") outDir.value = f.outDir;
+    if (Array.isArray(f.picked)) picked.value = f.picked;
+    if (typeof f.sliceSeconds === "number") sliceSeconds.value = f.sliceSeconds;
+    if (typeof f.model === "string") model.value = f.model;
+    if (typeof f.labelEnabled === "boolean") labelEnabled.value = f.labelEnabled;
+    if (typeof f.labelText === "string") labelText.value = f.labelText;
+    if (typeof f.labelSeconds === "number") labelSeconds.value = f.labelSeconds;
+    if (f.labelPosition) labelPosition.value = f.labelPosition;
+    return true;
+  } catch {
+    // 记不住设置不该让页面打不开
+    return false;
+  }
+}
+
+/** 存。**攒 500ms 再存** —— 勾选框会连着变，别每一下都写库。 */
+let saveTimer: number | null = null;
+async function saveForm() {
+  try {
+    await api.saveUiState(UI_KEY, JSON.stringify(snapshot()));
+  } catch {
+    /* 同上：存不上就算了，不影响使用 */
+  }
+}
+function scheduleSave() {
+  if (saveTimer !== null) window.clearTimeout(saveTimer);
+  saveTimer = window.setTimeout(() => {
+    saveTimer = null;
+    void saveForm();
+  }, 500);
+}
 onMounted(async () => {
+  // **先把上次填的读回来，再谈默认值。**
+  // 顺序反了的话，默认勾选会把用户上次的选择盖掉。
+  const restored = await loadForm();
   try {
     stages.value = await api.pipelineStages();
-    picked.value = stages.value.filter((s) => s.enabledByDefault).map((s) => s.key);
+    if (!restored) {
+      picked.value = stages.value.filter((s) => s.enabledByDefault).map((s) => s.key);
+    } else {
+      // 只保留后端这次真有的步骤（万一以后删了某一步，旧勾选不该留着）
+      const valid = new Set(stages.value.map((s) => s.key));
+      picked.value = picked.value.filter((k) => valid.has(k));
+    }
   } catch (e) {
     message.error((e as Error).message);
   }
+  // 任何一项变了就记下来
+  watch(
+    [root, outDir, picked, sliceSeconds, model, labelEnabled, labelText, labelSeconds, labelPosition],
+    () => scheduleSave(),
+    { deep: true },
+  );
   await refreshRuns();
   startPolling();
   // 忙闲切换时调整刷新频率

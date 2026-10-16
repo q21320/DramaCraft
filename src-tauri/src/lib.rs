@@ -289,6 +289,8 @@ pub fn run() {
             commands::open_in_player,
             commands::reveal_in_explorer,
             commands::ai_config,
+            commands::load_ui_state,
+            commands::save_ui_state,
             commands::save_ai_config,
             commands::ai_test,
             commands::ai_list_models,

@@ -2197,6 +2197,37 @@ pub fn pipeline_cancel(state: tauri::State<'_, AppState>, id: i64) -> AppResult<
 
 // ---------------- AI 服务配置 ----------------
 
+/// 读取界面上记住的东西（源目录、勾了哪些步骤…）。
+///
+/// 用户说：「不保留 我每次都要从选择 好麻烦呀」——对。
+/// 每次打开都要重选一遍源目录、重勾一遍步骤，是很烦。
+///
+/// 存在 `setting` 表里（不是 localStorage）：跟着库走，
+/// 换台机器复制库过去，习惯也还在；出问题能用 sqlite 直接看。
+#[tauri::command]
+pub fn load_ui_state(
+    state: tauri::State<'_, AppState>,
+    key: String,
+) -> AppResult<Option<String>> {
+    let conn = lock_db(&state)?;
+    db::get_setting(&conn, &format!("ui.{key}"))
+}
+
+/// 记住界面上的一些东西。失败不抛错 —— 记不住设置不该让页面卡住。
+#[tauri::command]
+pub fn save_ui_state(
+    state: tauri::State<'_, AppState>,
+    key: String,
+    value: String,
+) -> AppResult<()> {
+    // 单个键值不该无限膨胀（有人手动塞了个巨大 JSON 会拖慢启动）
+    if value.len() > 64 * 1024 {
+        return Err(AppError::Msg("要记的东西太大了".into()));
+    }
+    let conn = lock_db(&state)?;
+    db::set_setting(&conn, &format!("ui.{key}"), &value)
+}
+
 /// 读 AI 服务配置。**API Key 一律打码** —— 真 Key 不出后端。
 #[tauri::command]
 pub fn ai_config(state: tauri::State<'_, AppState>) -> AppResult<AiConfigView> {

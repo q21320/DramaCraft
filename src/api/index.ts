@@ -1,4 +1,4 @@
-﻿import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import type {
   AiConfigView,
   AiProvider,
@@ -143,6 +143,10 @@ export const api = {
     call<ProofPreview>("proof_preview", { layout, values }),
   proofRender: (layout: ProofLayout, values: Record<string, string>, outPath: string) =>
     call<ProofRenderReport>("proof_render", { layout, values, outPath }),
+
+  // 界面上记住的东西（源目录、勾选…）
+  loadUiState: (key: string) => call<string | null>("load_ui_state", { key }),
+  saveUiState: (key: string, value: string) => call<void>("save_ui_state", { key, value }),
 
   // 证明文档（docx）
   generateCostDocx: (request: CostDocRequest, outPath: string) =>
