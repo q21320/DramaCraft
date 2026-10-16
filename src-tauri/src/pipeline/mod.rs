@@ -278,6 +278,126 @@ pub fn stage_label(key: &str) -> String {
         .unwrap_or_else(|| key.to_string())
 }
 
+/// 整剧重组的参数。
+#[derive(Debug, Clone)]
+pub struct RegroupOptions {
+    pub ffmpeg: std::path::PathBuf,
+    /// 重组后每集的目标时长
+    pub target_ms: i64,
+}
+
+/// 把一部剧的碎片**按顺序拼成一条长片，再按目标时长重切成「集」**。
+///
+/// 这就是真实软件的「整剧重组」：它面对的是 55 个约 40 秒的碎片，
+/// 要先拼成 28 个 60~90 秒的集，后面才有东西可去重。
+///
+/// **源目录里已经是整集时不该开这一步** —— 它会把原本的集数边界打乱。
+/// 所以界面上写明「源已经是整集时会跳过」，并且用户可以关掉。
+///
+/// 实现走 ffmpeg 的两条标准命令：
+/// 1. `-f concat -c copy` 拼成一条
+/// 2. `-f segment -c copy` 按时间切回多段
+///
+/// 用 `-c copy` 不重编码：这一步只调整分段，画质不该有损。
+/// 代价是切点落在关键帧上，实际时长和目标值有几秒出入 —— 这是可接受的。
+pub fn regroup_drama(
+    ffmpeg: &Path,
+    drama: &SourceDrama,
+    out_root: &Path,
+    target_ms: i64,
+) -> AppResult<Vec<SourceEpisode>> {
+    if drama.episodes.is_empty() {
+        return Err(AppError::Msg("这部剧没有可用的片段".into()));
+    }
+    // 只有一段时没得重组
+    if drama.episodes.len() < 2 {
+        return Err(AppError::Msg("只有一段，不需要重组".into()));
+    }
+
+    let work = out_root.join(safe_drama_name(&drama.name)).join("重组");
+    std::fs::create_dir_all(&work)
+        .map_err(|e| AppError::Msg(format!("建不了重组目录：{e}")))?;
+
+    // 1) 拼接清单。ffmpeg 的 concat 需要转义单引号。
+    let list = work.join("_concat.txt");
+    let mut body = String::new();
+    for ep in &drama.episodes {
+        let p = ep.path.replace('\'', "'\\''");
+        body.push_str(&format!("file '{p}'\n"));
+    }
+    std::fs::write(&list, body)
+        .map_err(|e| AppError::Msg(format!("写不了拼接清单：{e}")))?;
+
+    let merged = work.join("_merged.mp4");
+    let st = crate::proc::no_window(
+        std::process::Command::new(ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
+            .arg(&list)
+            .args(["-c", "copy"])
+            .arg(&merged),
+    )
+    .status()
+    .map_err(|e| AppError::Msg(format!("启动 ffmpeg 拼接失败：{e}")))?;
+    if !st.success() || !merged.is_file() {
+        return Err(AppError::Msg(
+            "拼接失败 —— 源片段的编码参数可能不一致（分辨率/编码不同就没法直接拼）".into(),
+        ));
+    }
+
+    // 2) 按目标时长切回多段
+    let secs = (target_ms.max(5_000) as f64 / 1000.0).round() as i64;
+    let pattern = work.join("第%02d集.mp4");
+    let st = crate::proc::no_window(
+        std::process::Command::new(ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&merged)
+            .args(["-c", "copy", "-f", "segment", "-segment_time", &secs.to_string()])
+            .args(["-reset_timestamps", "1"])
+            .arg(&pattern),
+    )
+    .status()
+    .map_err(|e| AppError::Msg(format!("启动 ffmpeg 分段失败：{e}")))?;
+    if !st.success() {
+        return Err(AppError::Msg("按目标时长分段失败".into()));
+    }
+
+    // 收尾：把切出来的段落按名字排好，作为这部剧的新「集」
+    let mut made: Vec<SourceEpisode> = Vec::new();
+    let mut entries: Vec<_> = std::fs::read_dir(&work)
+        .map_err(|e| AppError::Msg(format!("读不了重组目录：{e}")))?
+        .filter_map(|r| r.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().starts_with('第'))
+                .unwrap_or(false)
+        })
+        .collect();
+    entries.sort();
+    for p in entries {
+        made.push(SourceEpisode {
+            path: p.to_string_lossy().to_string(),
+            file_name: p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            // 重组后的集号就是我们切的顺序，自己知道，不用再去猜
+            episode: Some(made.len() as i64 + 1),
+            size_bytes: std::fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0),
+        });
+    }
+
+    // 拼出来的长片是中间产物，删掉免得占地方、也免得被当成一集导入
+    let _ = std::fs::remove_file(&merged);
+
+    if made.len() < 2 {
+        return Err(AppError::Msg(
+            "重组后只剩一段 —— 源片段本来就够长，不需要重组".into(),
+        ));
+    }
+    Ok(made)
+}
+
 /// 改剧名那一步的产物：新的剧名和简介。
 ///
 /// 它必须在**建目录、排任务之前**拿到 —— 见 `start_pipeline` 的说明。
@@ -305,6 +425,7 @@ pub fn start_pipeline(
     model: &str,
     header_label: Option<HeaderLabel>,
     renames: &std::collections::HashMap<String, NewName>,
+    regroup: Option<&RegroupOptions>,
 ) -> AppResult<StartOutcome> {
     let scan = scan_source(root)?;
     let run_id = crate::db::create_pipeline_run(
@@ -344,6 +465,39 @@ pub fn start_pipeline(
     );
     for w in &scan.warnings {
         crate::db::append_log(conn, Some(run_id), None, "warn", w);
+    }
+
+    // **整剧重组：在导入素材之前跑。**
+    //
+    // 顺序很关键 —— 重组的产物才是后面所有步骤的输入，
+    // 所以要先把剧集列表换掉，再导入、再排任务。
+    // 放到队列里做的话，素材早按原片段导进去了，重组出来也没人用。
+    let mut regrouped_scan = scan;
+    let mut regroup_notes: Vec<String> = Vec::new();
+    if let Some(opt) = regroup {
+        for drama in &mut regrouped_scan.dramas {
+            let before = drama.episodes.len();
+            match regroup_drama(&opt.ffmpeg, drama, out_root, opt.target_ms) {
+                Ok(made) => {
+                    let after = made.len();
+                    drama.episodes = made;
+                    drama.episode_count = after as i64;
+                    regroup_notes.push(format!(
+                        "「{}」重组：{before} 段 → {after} 集（每集约 {} 秒）",
+                        drama.name,
+                        opt.target_ms / 1000
+                    ));
+                }
+                Err(e) => {
+                    // **失败就用原片段继续**，不能因为重组不了就整条流水线停摆
+                    regroup_notes.push(format!("「{}」重组跳过：{e}", drama.name));
+                }
+            }
+        }
+    }
+    let scan = regrouped_scan;
+    for note in &regroup_notes {
+        crate::db::append_log(conn, Some(run_id), None, "info", note);
     }
 
     for drama in &scan.dramas {
@@ -462,10 +616,10 @@ pub fn start_pipeline(
         };
 
         for stage in stages {
-            // 改剧名**不是队列里的一步** —— 它在 pipeline_start 里、
-            // 排任务之前就跑完了（那时才知道新剧名，输出路径也才定得下来）。
-            // 走到这里说明它已经在 renames 里生效了，跳过即可。
-            if stage == "rewrite" {
+            // 改剧名和整剧重组**都不是队列里的一步** —— 它们必须在
+            // 「导入素材、排任务」之前跑完（那时才知道新剧名、才有重组的集）。
+            // 走到这里说明已经生效了，跳过即可。
+            if stage == "rewrite" || stage == "regroup" {
                 continue;
             }
             // 整部剧一步的（封面、成本报告等）：**只排一个任务**，不按集排。
@@ -1351,6 +1505,7 @@ mod tests {
             "small",
             None,
             &no_renames(),
+            None,
         )
         .expect("起流水线失败");
 
@@ -1543,6 +1698,7 @@ mod tests {
             "",
             None,
             &renames,
+            None,
         )
         .expect("起流水线失败");
 
@@ -1607,13 +1763,13 @@ mod tests {
         let out = t.path().join("二创");
         let stages = vec!["slice".to_string()];
 
-        let first = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames())
+        let first = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames(), None)
             .expect("第一次跑失败");
         assert_eq!(first.imported, 2);
         assert_eq!(first.reused_projects, 0);
         assert_eq!(first.reused_media, 0);
 
-        let second = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames())
+        let second = start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames(), None)
             .expect("第二次跑失败");
 
         // 第二次一条都不该新建
@@ -1658,6 +1814,7 @@ mod tests {
             "",
             None,
             &no_renames(),
+            None,
         )
         .expect("起流水线失败");
 
@@ -1763,6 +1920,97 @@ mod tests {
         assert!(nothing.imported_nothing(), "真的没有才算失败");
     }
 
+    /// 整剧重组：碎片按顺序拼成长片，再按目标时长切回「集」。
+    ///
+    /// 真实软件面对的是 55 个约 40 秒的碎片，得先拼成 28 个 60~90 秒的集 ——
+    /// 这就是「整剧重组」。
+    #[test]
+    fn regroup_joins_fragments_and_splits_into_episodes() {
+        let Some(ffmpeg) = env_path("DRAMADIST_TEST_FFMPEG") else {
+            eprintln!("跳过：需要 DRAMADIST_TEST_FFMPEG");
+            return;
+        };
+
+        let t = TempTree::new("regroup");
+        let src = t.path().join("碎片剧");
+        std::fs::create_dir_all(&src).unwrap();
+        // 6 段 × 10 秒 = 60 秒；目标 20 秒一段 → 应当切出 3 段左右
+        let mut episodes = Vec::new();
+        for i in 1..=6 {
+            let p = src.join(format!("{i:02}.mp4"));
+            make_video(&ffmpeg, &p, 10);
+            episodes.push(SourceEpisode {
+                path: p.to_string_lossy().to_string(),
+                file_name: format!("{i:02}.mp4"),
+                episode: Some(i),
+                size_bytes: std::fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0),
+            });
+        }
+        let drama = SourceDrama {
+            name: "碎片剧".into(),
+            dir: src.to_string_lossy().to_string(),
+            episode_count: 6,
+            episodes,
+            synopsis: String::new(),
+            synopsis_path: String::new(),
+            cover: String::new(),
+            warnings: Vec::new(),
+        };
+
+        let out_root = t.path().join("二创");
+        let made = regroup_drama(&ffmpeg, &drama, &out_root, 20_000).expect("重组失败");
+
+        // 60 秒按 20 秒切 → 3 段（切点落在关键帧上，允许上下浮动）
+        assert!(
+            (2..=4).contains(&made.len()),
+            "6×10 秒按 20 秒重组，该切出 3 段左右，实际 {}",
+            made.len()
+        );
+        for (i, ep) in made.iter().enumerate() {
+            assert!(
+                std::path::Path::new(&ep.path).is_file(),
+                "第 {} 集的文件该存在：{}",
+                i + 1,
+                ep.path
+            );
+            assert_eq!(ep.episode, Some(i as i64 + 1), "集号该是连续的");
+        }
+        // 中间产物（拼出来的长片）要清掉，别占地方也别被当成一集
+        let work = out_root.join("碎片剧").join("重组");
+        assert!(
+            !work.join("_merged.mp4").exists(),
+            "拼出来的长片是中间产物，该删掉"
+        );
+    }
+
+    #[test]
+    fn regroup_declines_when_there_is_nothing_to_regroup() {
+        let ffmpeg = std::path::PathBuf::from("ffmpeg-not-needed");
+        let t = TempTree::new("regroup_noop");
+        let mut drama = SourceDrama {
+            name: "已成整集".into(),
+            dir: t.path().to_string_lossy().to_string(),
+            episode_count: 1,
+            episodes: Vec::new(),
+            synopsis: String::new(),
+            synopsis_path: String::new(),
+            cover: String::new(),
+            warnings: Vec::new(),
+        };
+        // 一段都没有
+        assert!(regroup_drama(&ffmpeg, &drama, t.path(), 75_000).is_err());
+
+        // 只有一段 —— 没得重组，如实说，而不是白跑一趟 ffmpeg
+        drama.episodes.push(SourceEpisode {
+            path: "E:/x.mp4".into(),
+            file_name: "x.mp4".into(),
+            episode: Some(1),
+            size_bytes: 1,
+        });
+        let err = regroup_drama(&ffmpeg, &drama, t.path(), 75_000).unwrap_err();
+        assert!(err.to_string().contains("不需要重组"), "{err}");
+    }
+
     #[test]
     fn every_stage_payload_actually_parses() {
         // 这条测试是为了防住一类坑：payload 的**字段名或枚举变体写错**，
@@ -1783,7 +2031,8 @@ mod tests {
         for (stage, _, _, _) in STAGES {
             // **改剧名不是队列里的一步** —— 它在排任务之前就跑完了，
             // 所以它不该有对应的队列类型。
-            if stage == "rewrite" {
+            // 改剧名、整剧重组都不是队列步骤（排在导入素材之前）
+            if stage == "rewrite" || stage == "regroup" {
                 continue;
             }
             let kind = stage_to_job_kind(stage);
@@ -1908,6 +2157,7 @@ mod tests {
             "",
             None,
             &no_renames(),
+            None,
         )
         .expect("一部坏的素材不该让整条流水线起不来");
 
@@ -2061,7 +2311,7 @@ mod tests {
         // 队列认得的类型才排得进去
         for (key, _, _, _) in STAGES {
             // 改剧名在排任务之前就跑完了，不是队列步骤
-            if key == "rewrite" {
+            if key == "rewrite" || key == "regroup" {
                 continue;
             }
             let kind = stage_to_job_kind(key);

@@ -1961,6 +1961,22 @@ pub async fn pipeline_start(
     }
 
     let conn = lock_db(&state)?;
+    // 整剧重组：把碎片拼成 60~90 秒的集。**在导入素材之前跑** ——
+    // 重组产物才是后面所有步骤的输入。放到队列里做的话，素材早按原片段
+    // 导进去了，重组出来也没人用。
+    let regroup = if enabled.iter().any(|s| s == "regroup") {
+        let ffmpeg = {
+            let configured = lock_tools(&state)?.clone();
+            tools::require(&configured.ffmpeg, "ffmpeg")?
+        };
+        Some(pipeline::RegroupOptions {
+            ffmpeg,
+            // 75 秒落在真实软件的 60~90 秒区间中间
+            target_ms: 75_000,
+        })
+    } else {
+        None
+    };
     let outcome = pipeline::start_pipeline(
         &conn,
         &ffprobe,
@@ -1971,6 +1987,7 @@ pub async fn pipeline_start(
         &asr_model,
         header_label,
         &renames,
+        regroup.as_ref(),
     )?;
 
     // 把开始前写的那几条日志（扫描、改剧名成没成）挂到这次运行上。
@@ -2294,6 +2311,8 @@ pub async fn dedup_media(
     let level = transform::Intensity::parse(intensity.as_deref().unwrap_or("strong"));
     let mut opts = transform::preset_for(level, media_id as usize);
     opts.header_label = header_label;
+    // 先把「改了什么」记下来 —— opts 马上要 move 进闭包
+    let changes = transform::describe(&opts);
 
     let target = if media.width > 0 && media.height > 0 {
         Some((media.width as u32, media.height as u32))
@@ -2333,6 +2352,7 @@ pub async fn dedup_media(
         media_id: id,
         out_path: out.to_string_lossy().to_string(),
         size_bytes: size,
+        changes,
         spec_problems,
     })
 }

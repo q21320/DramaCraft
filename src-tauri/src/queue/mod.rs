@@ -32,11 +32,10 @@ use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager};
 
 /// 队列支持的任务类型：(key, 中文名)
-pub const KINDS: [(&str, &str); 15] = [
+pub const KINDS: [(&str, &str); 14] = [
     // 顺序照着真实软件的流水线来。
     // **没有 "rewrite"** —— 改剧名在排任务**之前**就跑完了
     // （见 commands::pipeline_start），它不是队列里的一步。
-    ("regroup", "整剧重组"),
     ("dedup", "整集去重"),
     ("desubtitle", "AI 去字幕"),
     ("storyboard", "分镜证明"),
@@ -232,7 +231,7 @@ pub fn validate_payload(kind: &str, payload: &str) -> AppResult<()> {
         // 这两步的执行器会直接给出「还没实现 + 为什么」的说明，
         // 参数只要是个 JSON 对象就够（校验太严会把它挡在入队之前，
         // 用户就看不到那条说明了）
-        "regroup" | "desubtitle" => check::<serde_json::Map<String, serde_json::Value>>(kind, payload),
+        "desubtitle" => check::<serde_json::Map<String, serde_json::Value>>(kind, payload),
         "cover" => check::<CoverPayload>(kind, payload),
         "slice" => check::<SlicePayload>(kind, payload),
         "transform" => check::<TransformPayload>(kind, payload),
@@ -285,11 +284,6 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         // 如果返回 Err，一部剧会当场失败、后面的步骤全被取消，什么都出不来。
         // 所以这里返回 Ok，但消息写清楚「跳过了 + 为什么」——
         // 运行记录和运行日志里都看得到，不会被悄悄咽掉。
-        "regroup" => Ok(
-            "已跳过：整剧重组还没实现。它解决的是「源目录里是一堆零碎片段」的情况 —— \
-             把片段按时间轴拼成 60~90 秒的集。源目录已经是整集时用不上这一步。"
-                .to_string(),
-        ),
         "desubtitle" => Ok(
             "已跳过：AI 去字幕需要云服务的接口文档（真实软件用的是开拍 videoscreenclear）。\
              没有该服务的 API 说明就没法实现 —— 需要 AccessKey / SecretKey 与接口格式。"
@@ -366,23 +360,24 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
             )
             .await?;
             let mb = report.size_bytes as f64 / 1048576.0;
-            if report.spec_problems.is_empty() {
-                Ok(format!("去重完成，文件已出（{mb:.1} MB），上传规范校验通过"))
+            let spec = if report.spec_problems.is_empty() {
+                "上传规范校验通过".to_string()
             } else {
                 // **说清楚"成功但有提示"**：原来只写「1 项没达到上传规范」，
-                // 用户分不清是成了还是废了。产物已经出来了，只是有几条要留意，
-                // 所以直接把是哪几条写出来。
+                // 用户分不清是成了还是废了。产物已经出来了，只是有几条要留意。
                 let detail: Vec<String> = report
                     .spec_problems
                     .iter()
                     .flat_map(|s| s.problems.iter().cloned())
                     .collect();
-                Ok(format!(
-                    "去重完成，文件已出（{mb:.1} MB）。{} 条提示，不影响出片：{}",
-                    detail.len(),
-                    detail.join("；")
-                ))
-            }
+                format!("{} 条提示，不影响出片：{}", detail.len(), detail.join("；"))
+            };
+            // 把「改了什么」写出来 —— 用户抱怨过「看不到去重效果差异日志」。
+            // 每片参数按序号生成、故意各不相同，不列出来就只是一句"完成了"。
+            Ok(format!(
+                "去重完成（{mb:.1} MB）｜改了：{}｜{spec}",
+                report.changes
+            ))
         }
         // 整部剧第一步：改简介 → 按新简介起剧名。
         // 结果写进导出目录的 `剧名.txt`，封面那一步会去读。

@@ -480,6 +480,55 @@ pub fn processed_path(original: &Path) -> PathBuf {
     dir.join(format!("{stem}_t.{ext}"))
 }
 
+/// 这一片到底改了什么 —— 一句话说清楚。
+///
+/// 用户抱怨「看不到整集去重后的效果差异日志」：
+/// 原来只报「去重完成，13.2 MB」，**看不出跟原片差在哪**。
+/// 每片用的参数其实都不一样（按序号生成，故意各不相同），
+/// 把差异列出来，用户才知道这一步真干了活、干的是什么。
+///
+/// 只报**动了的部分** —— 中性值的项不列，否则一行全是"没改"。
+pub fn describe(opts: &TransformOptions) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if opts.mirror {
+        parts.push("水平镜像".to_string());
+    }
+    if opts.crop_ratio > 0.0 {
+        parts.push(format!("四边裁 {:.1}%", opts.crop_ratio * 100.0));
+    }
+    if (opts.scale_ratio - 1.0).abs() > 0.0005 {
+        parts.push(format!("缩放 {:.1}%", (opts.scale_ratio - 1.0) * 100.0));
+    }
+    if opts.brightness.abs() > 0.0005 {
+        parts.push(format!("亮度 {:+.0}%", opts.brightness * 100.0));
+    }
+    if (opts.contrast - 1.0).abs() > 0.0005 {
+        parts.push(format!("对比度 {:+.0}%", (opts.contrast - 1.0) * 100.0));
+    }
+    if (opts.saturation - 1.0).abs() > 0.0005 {
+        parts.push(format!("饱和 {:+.0}%", (opts.saturation - 1.0) * 100.0));
+    }
+    if opts.noise > 0 {
+        parts.push(format!("噪点 {}", opts.noise));
+    }
+    if (opts.speed - 1.0).abs() > 0.0005 {
+        parts.push(format!("变速 {:.0}%", opts.speed * 100.0));
+    }
+    if (opts.volume - 1.0).abs() > 0.0005 {
+        parts.push(format!("音量 {:.0}%", opts.volume * 100.0));
+    }
+    if let Some(l) = &opts.header_label {
+        parts.push(format!("片头「{}」", l.text));
+    }
+
+    if parts.is_empty() {
+        "没有启用任何处理项".to_string()
+    } else {
+        parts.join("、")
+    }
+}
+
 // ---------------- 平台输出规范 ----------------
 
 /// 发布前的硬门槛。照着真实软件日志里那句「输出已通过校验：
@@ -712,6 +761,35 @@ mod tests {
     ///
     /// 真实素材上炸过：那部片子带硬字幕，镜像之后画面里的字全反了，
     /// 一半的切片直接废掉。镜像是不可挽回的，只能由用户显式要求。
+    /// 「改了什么」要说人话，而且**只列动过的项**。
+    ///
+    /// 用户抱怨过「看不到整集去重后的效果差异日志」—— 原来只报一个文件大小，
+    /// 看不出跟原片差在哪。这里保证：动了什么就写什么，没动的不占地方。
+    #[test]
+    fn describe_only_lists_what_actually_changed() {
+        let neutral = TransformOptions::default();
+        assert_eq!(describe(&neutral), "没有启用任何处理项");
+
+        let mut o = TransformOptions::default();
+        o.crop_ratio = 0.04;
+        o.speed = 1.05;
+        let d = describe(&o);
+        assert!(d.contains("四边裁 4.0%"), "{d}");
+        assert!(d.contains("变速 105%"), "{d}");
+        // 没动的项不该出现
+        assert!(!d.contains("噪点"), "没开噪点就不该提：{d}");
+        assert!(!d.contains("镜像"), "没镜像就不该提：{d}");
+
+        let mut o2 = TransformOptions::default();
+        o2.mirror = true;
+        o2.noise = 6;
+        o2.header_label = Some(HeaderLabel::default());
+        let d2 = describe(&o2);
+        assert!(d2.contains("水平镜像"), "{d2}");
+        assert!(d2.contains("噪点 6"), "{d2}");
+        assert!(d2.contains("片头"), "加了片头标识要说出来：{d2}");
+    }
+
     #[test]
     fn spec_check_flags_low_resolution_and_short_duration() {
         let (Some(ffmpeg), Some(ffprobe)) = (

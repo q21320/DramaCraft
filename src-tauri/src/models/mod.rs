@@ -1,4 +1,4 @@
-﻿//! 前后端共享的数据结构。
+//! 前后端共享的数据结构。
 //!
 //! 约定：所有结构体一律 `#[serde(rename_all = "camelCase")]`，
 //! 与前端 `src/types/index.ts` 一一对应。
@@ -816,10 +816,15 @@ pub struct DedupReport {
     /// 去重产物。**这才是发布用的东西**，切片是它的下游。
     pub out_path: String,
     pub size_bytes: i64,
+    /// 这一集到底改了什么 —— 给日志看的效果差异。
+    /// 每片参数按序号生成、故意各不相同，列出来用户才知道这步真干了活。
+    #[serde(default)]
+    pub changes: String,
     /// 没达到平台规范的地方（只是提示）
     #[serde(default)]
     pub spec_problems: Vec<crate::transform::SpecProblem>,
 }
+
 /// 分镜证明的产出。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
