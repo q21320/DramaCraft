@@ -467,8 +467,13 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                             let at = timeline + (c.start_ms - seg.start_ms);
                             let dur = (c.end_ms - c.start_ms).clamp(300, 8_000);
                             no += 1;
+                            // **每条之间必须有个空行。**
+                            //
+                            // SRT 规范要求条目之间空一行，漏了的话
+                            // `pyJianYingDraft` 的 `import_srt` 只解析出 **1 条**
+                            // （实测：日志说「字幕 194 条」，草稿里 texts 只有 1 个）。
                             srt.push(format!(
-                                "{}\n{} --> {}\n{}\n",
+                                "{}\n{} --> {}\n{}\n\n",
                                 no,
                                 srt_time(at),
                                 srt_time(at + dur),
@@ -478,7 +483,17 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                         timeline += seg.end_ms - seg.start_ms;
                     }
                     // 剧集标签：`借车之后-第01集`
-                    let ep = media.name.trim().to_string();
+                    // 文件名是 `…-第01集.mp4`，草稿名里不要扩展名、
+                    // 也不要整部剧的源名 —— 只留「第NN集」这一段。
+                    let ep_full = media.name.trim();
+                    let ep_stem = ep_full
+                        .rsplit_once('.')
+                        .map(|(a, _)| a)
+                        .unwrap_or(ep_full);
+                    let ep = ep_stem
+                        .rsplit_once('-')
+                        .map(|(_, b)| b.to_string())
+                        .unwrap_or_else(|| ep_stem.to_string());
                     let label = if ep.is_empty() {
                         p.draft_name.clone()
                     } else {
@@ -489,7 +504,11 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                 if clips.is_empty() {
                     continue;
                 }
-                let srt_path = PathBuf::from(&p.draft_root).join(format!("_{label}.srt"));
+                // 中间文件放进 `_字幕/`，别散在 jy 根目录下 ——
+                // 那里应该只有 4 个草稿文件夹，加一堆 .srt 显得很乱。
+                let srt_path = PathBuf::from(&p.draft_root)
+                    .join("_字幕")
+                    .join(format!("{label}.srt"));
                 let srt_arg = if srt_lines.is_empty() {
                     String::new()
                 } else {
