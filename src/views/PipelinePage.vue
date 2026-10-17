@@ -39,10 +39,10 @@ const picked = ref<string[]>([]);
  */
 const willRewrite = computed(() => picked.value.includes("rewrite"));
 
-/** 展开「导出到」输入框吗？默认收起 —— 默认位置在源目录旁边，一般不用改。 */
-const showOutDir = ref(false);
 
 const root = ref("");
+/** 导出目录：**界面上不再给改**，固定是源目录里面的 `<源目录名>二创`。
+ *  还留着这个 ref 是因为保存/恢复表单状态时它是个字段，删了要改序列化。 */
 const outDir = ref("");
 
 /**
@@ -55,11 +55,14 @@ const outDir = ref("");
  */
 const effectiveOutDir = computed(() => {
   const r = root.value.trim();
-  if (outDir.value.trim()) return outDir.value.trim();
   if (!r) return "";
-  // 跟着源目录的分隔符风格走，别混出 `D:/a\二创`
+  // 和后端 `pipeline::default_out_dir` **必须一个规则**：
+  // 产出在源目录**里面**，叫 `<源目录名>二创`。
+  // 跟着源目录的分隔符风格走，别混出 `D:/a\二创`。
   const sep = r.includes("/") && !r.includes("\\") ? "/" : "\\";
-  return r.replace(/[\\/]+$/, "") + sep + "二创";
+  const base = r.replace(/[\\/]+$/, "");
+  const name = base.split(/[\\/]/).pop() || "输出";
+  return base + sep + name + "二创";
 });
 const sliceSeconds = ref(40);
 const model = ref("small");
@@ -156,10 +159,6 @@ async function pickRoot() {
   }
 }
 
-async function pickOut() {
-  const p = await open({ directory: true, multiple: false, title: "选择导出目录" });
-  if (typeof p === "string") outDir.value = p;
-}
 
 async function doScan() {
   if (!root.value.trim()) {
@@ -402,23 +401,16 @@ onUnmounted(() => {
     </div>
 
     <!--
-      导出目录默认就在源目录旁边，绝大多数情况不用改。
-      所以平时只留一行灰字说明「放哪」，需要改的时候才展开输入框 ——
-      摆一行空输入框只是占地方，还让人以为必须填。
+      **导出位置不给改，只显示。**
+      用户说：「导出的输入框直接删除就好了啊 默认在原视频路径」——
+      对。产出固定在源目录里面的 `<源目录名>二创`，这是设计决定，不是选项。
+      留一个输入框反而让人以为要填、还可能填错（填到源目录里就会互相踩）。
     -->
     <div class="dd-row" style="margin-bottom: 14px; font-size: 12px">
       <span style="width: 78px"></span>
       <span class="dd-muted dd-wrap" style="flex: 1">
-        导出到 {{ effectiveOutDir || "（选好源目录后自动确定）" }}
+        产出会放在：{{ effectiveOutDir || "（选好源目录后自动确定）" }}
       </span>
-      <n-button text size="tiny" @click="showOutDir = !showOutDir">
-        {{ showOutDir ? "收起" : "改" }}
-      </n-button>
-    </div>
-    <div v-if="showOutDir" class="dd-row" style="margin-bottom: 14px">
-      <span class="dd-muted" style="width: 78px">导出到</span>
-      <n-input v-model:value="outDir" size="small" style="width: 420px" placeholder="留空则用源目录旁边的「二创」" />
-      <n-button size="small" @click="pickOut">选择</n-button>
     </div>
 
     <n-alert v-if="scan" type="success" title="扫描结果" style="margin-bottom: 14px">

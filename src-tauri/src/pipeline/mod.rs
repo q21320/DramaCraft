@@ -93,6 +93,18 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             return;
         }
         if path.is_dir() {
+            // **产出目录整棵跳过。**
+            //
+            // 产出现在放在源目录里面（`<源目录>/<源目录名>二创/`），
+            // 不跳过的话下次扫描会把它当成另一部剧 —— 把用户自己加工过的
+            // 去重片、去字幕片、切片**再加工一遍**。
+            //
+            // 判据用**目录里有没有 `剧名.txt`**，而不是按名字匹配：
+            // AI 起的剧名每次都变，按名字根本认不出来；而 `剧名.txt`
+            // 是产出目录一定会有的标记（写剧名和简介时就写了）。
+            if is_marked_output(&path) {
+                continue;
+            }
             walk(&path, out, depth + 1);
         } else if path.is_file() {
             out.push(path);
@@ -100,6 +112,14 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     }
 }
 
+/// 这个目录是不是 DramaDist 自己的产出目录？
+///
+/// 判据是**有没有 `剧名.txt`** —— 那是产出目录一定会写的标记。
+/// 不用固定目录名判断，因为产出目录可能叫 `<源目录名>二创`，
+/// 也可能是以前用 AI 剧名建的旧目录。
+fn is_marked_output(dir: &Path) -> bool {
+    dir.join("剧名.txt").is_file()
+}
 /// 从候选里挑一个，优先名字带关键词的。
 fn pick_by_hint(candidates: &[PathBuf], hints: &[&str]) -> Option<PathBuf> {
     if candidates.is_empty() {
@@ -1383,15 +1403,25 @@ fn build_drama(dir: &Path, videos: &[PathBuf]) -> AppResult<SourceDrama> {
 }
 
 /// 默认的导出目录：源目录旁边加一个后缀，不污染原素材。
+/// 默认产出目录 = **源目录里面的 `<源目录名>二创`**。
+///
+/// 用户要的：一部剧的所有东西放在同一个文件夹里，不要散在盘上成两个兄弟目录。
+///
+/// ```text
+/// 弟弟结婚…\                      ← 源
+///     第01集.mp4 …
+///     弟弟结婚…二创\              ← 产出（固定名字，这一层是新增的）
+///         家庭首付的拉扯\         ← 原有的按 AI 剧名分，逻辑没动
+///             去重\ quzimu\ qiepian\ …
+/// ```
+///
+/// **扫描时必须跳过它**（见 `is_marked_output`），否则会把产出当成源片。
 pub fn default_out_dir(root: &Path, suffix: &str) -> PathBuf {
     let name = root
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "输出".to_string());
-    match root.parent() {
-        Some(parent) => parent.join(format!("{name}{suffix}")),
-        None => PathBuf::from(format!("{name}{suffix}")),
-    }
+    root.join(format!("{name}{suffix}"))
 }
 
 #[cfg(test)]
@@ -1592,10 +1622,42 @@ mod tests {
         assert_eq!(scan.dramas[0].name, "都市爽剧");
     }
 
+    /// 默认产出目录 = **源目录里面的 `<源目录名>二创`**。
+    ///
+    /// 用户要的：一部剧的所有东西放在同一个文件夹里，不要散成两个兄弟目录。
+    /// 产出的完整结构是：
+    ///
+    ///     <源目录>\<源目录名>二创\<AI剧名>\去重\…
+    ///     └─ 新增这一层（固定名）  └─ 原有的按剧名分（逻辑没动）
     #[test]
-    fn default_out_dir_sits_next_to_the_source() {
+    fn default_out_dir_is_inside_the_source() {
         let got = default_out_dir(Path::new("G:/10.12"), "二创");
-        assert_eq!(got, PathBuf::from("G:/10.12二创"));
+        assert_eq!(
+            got,
+            PathBuf::from("G:/10.12/10.12二创"),
+            "产出该在源目录里面，不是它旁边"
+        );
+        // **关键的连带约束**：产出放在源目录里之后，扫描必须跳过它，
+        // 否则下次跑会把用户加工过的产出当成源片再加工一遍。
+    }
+
+    /// **扫描必须跳过产出目录。**
+    ///
+    /// 判据是目录里有没有 `剧名.txt` —— AI 起的剧名每次变，按名字认不出来；
+    /// 而 `剧名.txt` 是产出目录一定会写的标记。
+    #[test]
+    fn scanning_skips_output_folders_inside_the_source() {
+        let t = TempTree::new("skipout");
+        t.file("第01集.mp4", b"x");
+        t.file("第02集.mp4", b"y");
+        // 源目录里放一个产出目录（模拟第二次跑）
+        t.file("某剧二创/剧名.txt", "某剧".as_bytes());
+        t.file("某剧二创/去重/第01集_去重.mp4", b"z");
+        t.file("某剧二创/quzimu/第01集_quzimu.mp4", b"w");
+
+        let scan = scan_source(t.path()).unwrap();
+        assert_eq!(scan.dramas.len(), 1, "产出目录不该被当成另一部剧");
+        assert_eq!(scan.dramas[0].episode_count, 2, "只该看到源片那 2 集");
     }
 
     #[test]
