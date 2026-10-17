@@ -125,14 +125,28 @@ def render(req):
     cursor_us = 0
     placed = []
     for ci, clip in enumerate(clips):
-        # 优先用调用方给的时长；没给才自己探（探不出来就当 10 秒，别整件事失败）
-        if ci < len(durations_ms) and durations_ms[ci] > 0:
-            dur = durations_ms[ci] * 1000
+        # **计划时长和实际时长取小的那个。**
+        #
+        # 踩过：数据库记的是「计划时长」（`end_ms - start_ms`），但切片时
+        # 源文件可能已经到头 —— 实际文件比计划短。
+        # `pyJianYingDraft` 会拿真实时长校验，超了就抛：
+        #   ValueError: 截取的素材时间范围 [start=0, end=3290000]
+        #             超出了素材时长(1567000)
+        #
+        # 所以先探真实的，再和计划值取 min。探不出来就退回计划值。
+        planned = durations_ms[ci] * 1000 if ci < len(durations_ms) and durations_ms[ci] > 0 else 0
+        try:
+            real = probe_duration_us(clip)
+        except Exception:
+            real = 0
+        if planned > 0 and real > 0:
+            dur = min(planned, real)
+        elif planned > 0:
+            dur = planned
+        elif real > 0:
+            dur = real
         else:
-            try:
-                dur = probe_duration_us(clip)
-            except Exception:
-                dur = 10_000_000
+            dur = 10_000_000
         if dur <= 0:
             continue
         # **拆了原声轨之后，视频轨必须静音** ——
@@ -159,14 +173,20 @@ def render(req):
                 # 没抽出来就按对应切片的时长跳过，别让后面的音画错位
                 cursor2 += placed[i]["dur_us"] if i < len(placed) else 0
                 continue
-            # 音频时长和对应切片一致（抽音频不改变时长）
-            if i < len(durations_ms) and durations_ms[i] > 0:
-                dur = durations_ms[i] * 1000
+            # 音频时长和对应切片一致（抽音频不改变时长），同样取 min
+            planned = durations_ms[i] * 1000 if i < len(durations_ms) and durations_ms[i] > 0 else 0
+            try:
+                real = probe_duration_us(a)
+            except Exception:
+                real = 0
+            if planned > 0 and real > 0:
+                dur = min(planned, real)
+            elif planned > 0:
+                dur = planned
+            elif real > 0:
+                dur = real
             else:
-                try:
-                    dur = probe_duration_us(a)
-                except Exception:
-                    dur = 10_000_000
+                dur = 10_000_000
             if dur <= 0:
                 cursor2 += placed[i]["dur_us"] if i + 1 < len(placed) else 0
                 continue
