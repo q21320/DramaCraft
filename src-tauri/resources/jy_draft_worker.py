@@ -82,6 +82,12 @@ def render(req):
     clips = [c for c in (req.get("clips") or []) if c]
     # 拆分出来的原声音频（和 clips 一一对应；空串表示这一片没抽出来）
     audios = [a or "" for a in (req.get("audios") or [])]
+    # **时长由调用方给**，不要自己猜。
+    #
+    # 踩过：`pymediainfo` 读不出很短的切片（0.5 秒的尾巴）的时长，
+    # 抛 `读不出时长`，整个草稿生成失败。
+    # 而调用方（Rust）本来就知道每片的 `end_ms - start_ms`，直接传就行。
+    durations_ms = [int(x) for x in (req.get("durations_ms") or [])]
     if not clips:
         raise RuntimeError("没有切片可以排")
 
@@ -118,8 +124,15 @@ def render(req):
     ATRACK = "BGM"
     cursor_us = 0
     placed = []
-    for clip in clips:
-        dur = probe_duration_us(clip)
+    for ci, clip in enumerate(clips):
+        # 优先用调用方给的时长；没给才自己探（探不出来就当 10 秒，别整件事失败）
+        if ci < len(durations_ms) and durations_ms[ci] > 0:
+            dur = durations_ms[ci] * 1000
+        else:
+            try:
+                dur = probe_duration_us(clip)
+            except Exception:
+                dur = 10_000_000
         if dur <= 0:
             continue
         # **拆了原声轨之后，视频轨必须静音** ——
@@ -146,9 +159,16 @@ def render(req):
                 # 没抽出来就按对应切片的时长跳过，别让后面的音画错位
                 cursor2 += placed[i]["dur_us"] if i < len(placed) else 0
                 continue
-            dur = probe_duration_us(a)
+            # 音频时长和对应切片一致（抽音频不改变时长）
+            if i < len(durations_ms) and durations_ms[i] > 0:
+                dur = durations_ms[i] * 1000
+            else:
+                try:
+                    dur = probe_duration_us(a)
+                except Exception:
+                    dur = 10_000_000
             if dur <= 0:
-                cursor2 += placed[i]["dur_us"] if i < len(placed) else 0
+                cursor2 += placed[i]["dur_us"] if i + 1 < len(placed) else 0
                 continue
             script.add_segment(AudioSegment(a, trange(cursor2, dur)), atrack)
             cursor2 += dur

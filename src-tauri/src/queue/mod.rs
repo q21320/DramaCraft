@@ -443,7 +443,7 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                         }
                     }
                 }
-                let (clips, srt_lines, label) = {
+                let (clips, durations_ms, srt_lines, label) = {
                     let conn = crate::commands::lock_db(&state)?;
                     let media = db::get_media(&conn, *mid)?;
                     let mut segs = db::list_segments(&conn, *mid)?;
@@ -456,6 +456,9 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                     }
                     let cues = db::list_cues(&conn, *mid)?;
                     let mut clips: Vec<String> = Vec::new();
+                    // 每片时长由这边算好传过去 —— worker 里 `pymediainfo`
+                    // 读不出很短切片的时长（0.5 秒的尾巴），会整件事失败。
+                    let mut durations_ms: Vec<i64> = Vec::new();
                     let mut srt: Vec<String> = Vec::new();
                     let mut timeline: i64 = 0;
                     let mut no = 0usize;
@@ -463,6 +466,7 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                     // 所以按「已累计时长 + (cue - 本片源起点)」搬到时间轴上。
                     for seg in &segs {
                         clips.push(seg.out_path.clone());
+                        durations_ms.push(seg.end_ms - seg.start_ms);
                         for c in cues
                             .iter()
                             .filter(|c| c.start_ms >= seg.start_ms && c.start_ms < seg.end_ms)
@@ -502,7 +506,7 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                     } else {
                         format!("{}-{}", p.draft_name, ep)
                     };
-                    (clips, srt, label)
+                    (clips, durations_ms, srt, label)
                 };
                 if clips.is_empty() {
                     continue;
@@ -558,7 +562,8 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                     "height": p.height,
                     "fps": p.fps,
                     "clips": clips,
-                "audios": audios,
+                    "audios": audios,
+                    "durations_ms": durations_ms,
                     "srt": srt_arg,
                     "bgm": p.bgm,
                     "bgm_volume": p.bgm_volume,
