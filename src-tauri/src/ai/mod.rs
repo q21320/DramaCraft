@@ -411,43 +411,100 @@ pub async fn rewrite_title_and_synopsis(
     Ok((new_title, new_synopsis))
 }
 
-/// 让视觉模型描述一张图的画面内容 —— 用来反推分镜。
+// `describe_frame` 已删 —— 换成 `reverse_shot`。
+//
+// 旧的只发一张图、只要一句 20 字描述；分镜证明要的是**一整个镜头**的
+// 反推：画面/台词/音效/光线/剧本摘要/角色/校验项 + 生成参数，而且
+// 要发 5 张图（同一镜头内的连续画面，单张推不出动作走向）。
+// 真实软件的日志也写着「附图 5 张」。
+
+/// 一个镜头的反推结果（分镜证明用）。
 ///
-/// 真实软件就是这么做的：日志里有「Ark 语言模型[分镜反推]：…（附图 5 张）」。
-/// 把抽出来的帧发给视觉模型，问"这一镜拍了什么"，结果就是分镜描述。
-pub async fn describe_frame(provider: &AiProvider, image: &std::path::Path) -> AppResult<String> {
+/// 照真实软件那份 JSON 的字段来：画面描述 / 台词 / 音效 / 光线 /
+/// 剧本摘要 / 角色 / 校验项，外加生成参数。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ShotReverse {
+    /// 中文画面描述（报备时人看得懂）
+    pub prompt: String,
+    /// 英文画面描述（喂 Seedance 更准）
+    pub prompt_en: String,
+    pub dialogue: String,
+    pub sfx: String,
+    pub lighting: String,
+    pub script_excerpt: String,
+    pub characters: Vec<String>,
+    pub checks: Vec<String>,
+    pub model: String,
+    pub seed: String,
+    pub resolution: String,
+    pub guidance: String,
+    pub duration_sec: String,
+    pub fps: String,
+}
+
+/// **一镜反推**：把同一个镜头的 5 张关键帧一起发过去，让它反推出分镜脚本。
+///
+/// 和 `describe_frame` 的区别：那个只输出一句画面描述，这个要出**结构化的一整段**
+/// （画面/台词/音效/光线/摘要/角色/校验 + 生成参数），而且要中英双语。
+///
+/// 5 张图一起发是因为**同一镜头内的画面是连续的** —— 单看一张推不出
+/// 动作走向和台词，给 5 张才能说出「从…到…」。真实软件也是「附图 5 张」。
+pub async fn reverse_shot(
+    provider: &AiProvider,
+    frames: &[std::path::PathBuf],
+    episode_label: &str,
+    time_range: &str,
+    duration_sec: f64,
+) -> AppResult<ShotReverse> {
     if let Some(early) = precheck(provider) {
         return Err(AppError::Msg(early.message));
     }
     if provider.text_model.trim().is_empty() {
         return Err(AppError::Msg(format!("「{}」没填语言模型", provider.label)));
     }
-    let data_url = image_data_url(image)?;
-    let endpoint = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
+    if frames.is_empty() {
+        return Err(AppError::Msg("这个镜头没有关键帧".into()));
+    }
 
+    let endpoint = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(180))
         .build()
         .map_err(|e| AppError::Msg(format!("建不了 HTTP 客户端：{e}")))?;
 
+    let instruction = format!(
+        "这是同一段视频（{episode_label} {time_range}，约 {duration_sec:.1} 秒）按时间顺序抽的 {} 张关键帧。\
+         请反推出这个「镜头」的分镜脚本，严格只输出一个 JSON 对象，不要任何解释、不要代码围栏：\n\
+         {{\n\
+           \"prompt\": \"中文画面描述：景别（特写/中景/远景）、机位（固定/推/拉/摇）、主体是谁、在哪、在做什么、\
+           环境与氛围。120 字以内。\",\n\
+           \"promptEn\": \"把上面那段翻成英文的镜头描述，给 AI 视频模型用\",\n\
+           \"dialogue\": \"画面里出现的台词；没有就留空字符串\",\n\
+           \"sfx\": \"这个镜头的环境音与音效，20 字以内\",\n\
+           \"lighting\": \"光线方向、色温、明暗对比，20 字以内\",\n\
+           \"scriptExcerpt\": \"一句话概括这段剧情\",\n\
+           \"characters\": [\"出现的人物名或身份\"],\n\
+           \"checks\": [\"角色一致性\", \"场景一致性\", \"光影一致性\", \"字幕可读\", \"画面清晰\"]\n\
+         }}",
+        frames.len()
+    );
+
+    let mut content = vec![serde_json::json!({ "type": "text", "text": instruction })];
+    for f in frames {
+        content.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": image_data_url(f)? }
+        }));
+    }
+
     let body = serde_json::json!({
         "model": provider.text_model.trim(),
-        "messages": [{
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "用一句不超过 20 字的中文描述这一镜的画面：谁、在哪、做什么。\
-                             只输出这一句，不要标点以外的任何解释。"
-                },
-                { "type": "image_url", "image_url": { "url": data_url } }
-            ]
-        }],
-        "temperature": 0.3,
-        // 描述画面同样不需要推理 —— 和 chat 那边一样关掉思维链。
-        // 分镜反推一次要发 5 张图，开着思考更贵。
+        "messages": [{ "role": "user", "content": content }],
+        "temperature": 0.4,
+        // 反推要发 5 张图，开着思维链更贵 —— 和 chat/describe 一样关掉。
         "thinking": { "type": "disabled" },
-        "max_tokens": 600,
+        "max_tokens": 900,
     });
 
     let resp = client
@@ -463,10 +520,64 @@ pub async fn describe_frame(provider: &AiProvider, image: &std::path::Path) -> A
         return Err(AppError::Msg(friendly_http(status, &text)));
     }
     let raw = extract_chat_text(&text)?;
-    // 描述要短 —— 模型很爱写成一段话
-    Ok(raw.trim().lines().next().unwrap_or("").trim().chars().take(40).collect())
+    let json_text = strip_code_fence(&raw);
+    let v: serde_json::Value = serde_json::from_str(&json_text)
+        .map_err(|e| AppError::Msg(format!("反推结果不是 JSON：{e}；原文：{}", tail(&raw, 200))))?;
+
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let arr = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|i| i.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default()
+    };
+    let mut checks: Vec<String> = arr("checks");
+    if checks.is_empty() {
+        checks = vec![
+            "角色一致性".into(),
+            "场景一致性".into(),
+            "光影一致性".into(),
+            "字幕可读".into(),
+            "画面清晰".into(),
+        ];
+    }
+
+    Ok(ShotReverse {
+        prompt: s("prompt"),
+        prompt_en: s("promptEn"),
+        dialogue: s("dialogue"),
+        sfx: s("sfx"),
+        lighting: s("lighting"),
+        script_excerpt: s("scriptExcerpt"),
+        characters: arr("characters"),
+        checks,
+        model: provider.text_model.trim().to_string(),
+        // Seed 用镜头时长算一个稳定的数字，真实软件也是给个具体值
+        seed: format!("{:.0}", (duration_sec * 18_527.0) as u64 % 900_000 + 100_000),
+        resolution: "720x1280".into(),
+        guidance: "0.82".into(),
+        duration_sec: format!("{duration_sec:.1}"),
+        fps: "25".into(),
+    })
 }
 
+/// 去掉模型偶尔吐出来的 ```json 围栏。
+fn strip_code_fence(raw: &str) -> String {
+    let t = raw.trim();
+    let t = t.strip_prefix("```json").or_else(|| t.strip_prefix("```")).unwrap_or(t);
+    let t = t.strip_suffix("```").unwrap_or(t);
+    t.trim().to_string()
+}
+
+/// 截尾部若干字符 —— 报错时给用户看个大概，不要把整段贴出来。
+fn tail(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n {
+        s.to_string()
+    } else {
+        chars[chars.len() - n..].iter().collect()
+    }
+}
 // ---------------- 剧名 / 简介改写 ----------------
 
 /// 从 OpenAI 兼容的 chat 返回体里取文本。

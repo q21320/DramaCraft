@@ -2793,14 +2793,38 @@ pub async fn dedup_media(
 /// 没有配 AI 服务时**退回无描述版**：只把抽出来的帧拼成图 ——
 /// 证明"这些画面确实存在"这一点仍然成立，只是没有文字说明。
 /// 排一个注定失败的任务不如给一个能用的降级产物。
+/// 秒 → `MM:SS`（分镜时间段显示用）。
+fn mmss(sec: f64) -> String {
+    let s = sec.max(0.0) as i64;
+    format!("{:02}:{:02}", s / 60, s % 60)
+}
+
 #[tauri::command]
 pub async fn build_storyboard(
     state: tauri::State<'_, AppState>,
     media_ids: Vec<i64>,
     out_dir: String,
-    frames_per_episode: i64,
-    shots_per_sheet: i64,
+    _frames_per_episode: i64,
+    _shots_per_sheet: i64,
 ) -> AppResult<StoryboardReport> {
+    //! 分镜证明：取 4 集去字幕产物 → 切镜头 → 每镜头抽 5 帧 → AI 反推
+    //! → 每 2 镜头排 1 页 JPG，同时写一份 Seedance 可用的 JSON。
+    //!
+    //! **算法照真实软件的日志**：
+    //!
+    //! ```text
+    //! 工程图 AI 辅助用片（AI去字幕后同一批）：第1集_quzimu.mp4 … 第4集_quzimu.mp4
+    //! 共 4 张图 × 每张 2 镜头（共 8 镜头，Seedance）
+    //! Ark 语言模型[分镜反推]：（附图 5 张）
+    //!   镜头01 反推 OK（第1集_quzimu.mp4 00:00–00:42）
+    //!   …
+    //! → 第1张（镜头01+02）…_分镜证明_01.jpg
+    //! ```
+    //!
+    //! 两个要点：
+    //! - **镜头按 ~42 秒切**，不是「每集固定 2 段」 —— 真实软件里第3集
+    //!   出了 3 个镜头（最后一个只剩 5 秒）、第4集只有 1 个
+    //! - **每镜头喂 5 张帧**（真实软件写着「附图 5 张」）
     if media_ids.is_empty() {
         return Err(AppError::Msg(
             "没有可用于做证明的集 —— 先跑「AI 去字幕」，它决定用哪几集".into(),
@@ -2813,15 +2837,14 @@ pub async fn build_storyboard(
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| AppError::Msg(format!("建不了输出目录：{e}")))?;
 
-    let (ffmpeg, provider, title) = {
+    let (ffmpeg, provider, title, python) = {
         let configured = lock_tools(&state)?.clone();
         let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let python = tools::require(&configured.python, "python")?;
         let conn = lock_db(&state)?;
         let provider = ai::usable_provider(&conn)?;
-        // 剧名：rewrite 写过就用新的
-        // 剧名.txt 写在**剧目录**下，而分镜证明输出在 `<剧目录>/分镜证明/` ——
-        // 只找本级会读不到，产出就变成「未命名_分镜证明_01.jpg」。
-        // 两级都找一遍。
+        // 剧名：rewrite 写过就用新的。`剧名.txt` 在**剧目录**下，
+        // 而分镜证明输出在 `<剧目录>/分镜证明/` —— 本级和父级都找一遍。
         let title = std::fs::read_to_string(out_dir.join("剧名.txt"))
             .or_else(|_| {
                 out_dir
@@ -2833,160 +2856,253 @@ pub async fn build_storyboard(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "未命名".to_string());
-        (ffmpeg, provider, title)
+        (ffmpeg, provider, title, python)
     };
 
-    let per_ep = frames_per_episode.clamp(1, 12) as usize;
-    let per_sheet = shots_per_sheet.clamp(1, 6) as usize;
+    // ---------- ① 定镜头：每集按 ~42 秒切，凑够 8 个 ----------
+    const SHOT_SECS: f64 = 42.0;
+    const MAX_SHOTS: usize = 8;
+    const FRAMES_PER_SHOT: usize = 5;
 
-    // 抽帧：每集从头到尾均匀取 per_ep 张
-    let mut frames: Vec<PathBuf> = Vec::new();
-    let frame_dir = out_dir.join("_frames");
-    std::fs::create_dir_all(&frame_dir)
-        .map_err(|e| AppError::Msg(format!("建不了抽帧目录：{e}")))?;
-
-    for (i, mid) in media_ids.iter().enumerate() {
-        let segs = {
+    struct Plan {
+        source: PathBuf,
+        ep_label: String,
+        start: f64,
+        end: f64,
+    }
+    let mut plans: Vec<Plan> = Vec::new();
+    for mid in &media_ids {
+        if plans.len() >= MAX_SHOTS {
+            break;
+        }
+        let (source, ep_label, dur) = {
             let conn = lock_db(&state)?;
-            db::list_segments(&conn, *mid)?
-                .into_iter()
-                .filter(|s| s.status == "ok")
-                .collect::<Vec<_>>()
+            let media = db::get_media(&conn, *mid)?;
+            let src = PathBuf::from(db::media_source_path(&conn, *mid)?);
+            (src, media.name.clone(), media.duration_ms as f64 / 1000.0)
         };
-        // 用这一集的**切片**抽帧 —— 和真实软件一致（它切 10s 片再抽）
-        let Some(seg) = segs.first() else {
-            continue;
-        };
-        let src = PathBuf::from(&seg.out_path);
-        if !src.is_file() {
+        if !source.is_file() || dur <= 1.0 {
             continue;
         }
-        for k in 0..per_ep {
-            // 均匀分布：第 k 张取在第 (k+0.5)/per_ep 处
-            let at = (seg.end_ms - seg.start_ms) as f64 / 1000.0 * (k as f64 + 0.5)
-                / per_ep as f64;
-            let dst = frame_dir.join(format!("ep{:02}_{:02}.jpg", i + 1, k + 1));
+        let mut at = 0.0f64;
+        while at < dur && plans.len() < MAX_SHOTS {
+            let end = (at + SHOT_SECS).min(dur);
+            // 太短的尾巴（不到 3 秒）并进上一段，别单独出一个 5 秒的镜头
+            if end - at < 3.0 {
+                if let Some(last) = plans.last_mut() {
+                    last.end = end;
+                }
+                break;
+            }
+            plans.push(Plan {
+                source: source.clone(),
+                ep_label: ep_label.clone(),
+                start: at,
+                end,
+            });
+            at = end;
+        }
+    }
+    if plans.is_empty() {
+        return Err(AppError::Msg(
+            "切不出镜头 —— 集太短或文件不在".into(),
+        ));
+    }
+
+    // ---------- ② 每镜头抽 5 帧 ----------
+    let frame_root = out_dir.join("_frames");
+    std::fs::create_dir_all(&frame_root)
+        .map_err(|e| AppError::Msg(format!("建不了抽帧目录：{e}")))?;
+
+    let mut frames_of: Vec<Vec<PathBuf>> = Vec::new();
+    for (i, p) in plans.iter().enumerate() {
+        let shot_dir = frame_root.join(format!("shot{:02}", i + 1));
+        std::fs::create_dir_all(&shot_dir)
+            .map_err(|e| AppError::Msg(format!("建不了镜头帧目录：{e}")))?;
+        let mut got = Vec::new();
+        for k in 0..FRAMES_PER_SHOT {
+            // 均匀分布在这个镜头内：第 k 帧取在 (k+0.5)/n 处
+            let frac = (k as f64 + 0.5) / FRAMES_PER_SHOT as f64;
+            let at = p.start + (p.end - p.start) * frac;
+            let name = if k == FRAMES_PER_SHOT - 1 {
+                // 最后一张兼作预览图（真实软件 `_frames\shotNN\preview.jpg`）
+                "preview.jpg".to_string()
+            } else {
+                format!("kf{}.jpg", k + 1)
+            };
+            let dst = shot_dir.join(&name);
             let ok = crate::proc::no_window(
-                std::process::Command::new(&ffmpeg).args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-ss",
-                    &format!("{at:.3}"),
-                ]),
+                std::process::Command::new(&ffmpeg).args(["-hide_banner", "-loglevel", "error", "-y", "-ss"]),
             )
+            .arg(format!("{at:.3}"))
             .arg("-i")
-            .arg(&src)
+            .arg(&p.source)
             .args(["-frames:v", "1", "-q:v", "3"])
             .arg(&dst)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-            if ok && dst.is_file() {
-                frames.push(dst);
+            if !ok || !dst.is_file() {
+                return Err(AppError::Msg(format!(
+                    "抽第 {} 个镜头的第 {} 帧失败（{} {:.1}s）",
+                    i + 1,
+                    k + 1,
+                    p.source.to_string_lossy(),
+                    at
+                )));
+            }
+            if name != "preview.jpg" {
+                got.push(dst);
             }
         }
+        frames_of.push(got);
     }
-
-    if frames.is_empty() {
-        return Err(AppError::Msg(
-            "一帧都没抽出来 —— 先跑「视频切片」，证明图是从切片里抽的".into(),
-        ));
-    }
-
-    // 反推分镜描述（没有 AI 服务就跳过，产出无描述版）
-    let mut descriptions: Vec<String> = Vec::new();
-    let mut used_ai = false;
-    if let Some(p) = &provider {
-        for f in &frames {
-            match ai::describe_frame(p, f).await {
-                Ok(text) => {
-                    descriptions.push(text);
-                    used_ai = true;
-                }
-                Err(e) => {
-                    eprintln!("DramaDist: 反推分镜失败，改用无描述版：{e}");
-                    descriptions.clear();
-                    used_ai = false;
-                    break;
-                }
-            }
-        }
-    }
-
-    // 拼图：每 per_sheet 个镜头一张
-    let shot_labels: Vec<String> = frames
-        .iter()
-        .enumerate()
-        .map(|(i, _)| match descriptions.get(i) {
-            Some(d) if !d.is_empty() => d.clone(),
-            _ => format!("镜头{:02}", i + 1),
-        })
+    let preview_of: Vec<PathBuf> = (0..plans.len())
+        .map(|i| frame_root.join(format!("shot{:02}", i + 1)).join("preview.jpg"))
         .collect();
 
-    let mut sheets = 0i64;
-    for (si, chunk) in frames.chunks(per_sheet).enumerate() {
-        let out = out_dir.join(format!("{title}_分镜证明_{:02}.jpg", si + 1));
-        let mut args: Vec<String> = vec![
-            "-hide_banner".into(),
-            "-loglevel".into(),
-            "error".into(),
-            "-y".into(),
-        ];
-        for f in chunk {
-            args.push("-i".into());
-            args.push(f.to_string_lossy().to_string());
-        }
-        // 横向并排，统一高度 720
-        let mut chain = String::new();
-        for (i, _) in chunk.iter().enumerate() {
-            chain.push_str(&format!("[{i}:v]scale=-2:720[v{i}];"));
-        }
-        let refs: Vec<String> = (0..chunk.len()).map(|i| format!("[v{i}]")).collect();
-        chain.push_str(&format!("{}hstack=inputs={}[out]", refs.join(""), chunk.len()));
-        args.push("-filter_complex".into());
-        args.push(chain);
-        args.push("-map".into());
-        args.push("[out]".into());
-        args.push("-frames:v".into());
-        args.push("1".into());
-        args.push("-q:v".into());
-        args.push("2".into());
-        args.push(out.to_string_lossy().to_string());
-
-        let ok = crate::proc::no_window(std::process::Command::new(&ffmpeg).args(&args))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok && out.is_file() {
-            sheets += 1;
-        }
+    // ---------- ③ AI 反推 ----------
+    let provider = provider.ok_or_else(|| {
+        AppError::Msg("分镜反推要 AI 服务 —— 先去「AI 服务」配一个，别的是纯本地".into())
+    })?;
+    let mut shots: Vec<ai::ShotReverse> = Vec::new();
+    for (i, p) in plans.iter().enumerate() {
+        let tr = format!("{}-{}", mmss(p.start), mmss(p.end));
+        let r = ai::reverse_shot(
+            &provider,
+            &frames_of[i],
+            &p.ep_label,
+            &tr,
+            p.end - p.start,
+        )
+        .await
+        .map_err(|e| {
+            AppError::Msg(format!(
+                "镜头{:02} 反推失败（{} {}）：{}",
+                i + 1,
+                p.ep_label,
+                tr,
+                crate::proc::tail(&e.to_string())
+            ))
+        })?;
+        shots.push(r);
     }
 
-    // 镜头清单：写一份文字版，报备时好看
-    let mut notes = vec![format!("共 {} 帧、{} 张证明图", frames.len(), sheets)];
-    if used_ai {
-        notes.push(format!("分镜描述由「{}」反推", provider.as_ref().unwrap().label));
-    } else {
-        notes.push("没有可用的 AI 服务，产出的是无描述版（只有画面，没有文字说明）".into());
+    // ---------- ④ 每 2 镜头排 1 页 + 写 JSON ----------
+    const SHOTS_PER_SHEET: usize = 2;
+    let total_pages = shots.len().div_ceil(SHOTS_PER_SHEET);
+    let mut pages = 0i64;
+    let safe_title = out_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| title.clone());
+    for page in 0..total_pages {
+        let from = page * SHOTS_PER_SHEET;
+        let to = (from + SHOTS_PER_SHEET).min(shots.len());
+        let mut page_shots = Vec::new();
+        let mut json_shots = Vec::new();
+        for idx in from..to {
+            let s = &shots[idx];
+            let r = &shots[idx];
+            let _ = r;
+            page_shots.push(serde_json::json!({
+                "shotIndex": idx + 1,
+                "timeRange": format!("{}-{}", mmss(plans[idx].start), mmss(plans[idx].end)),
+                "preview": preview_of[idx].to_string_lossy(),
+                "keyframes": frames_of[idx].iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+                "data": {
+                    "prompt": s.prompt,
+                    "promptEn": s.prompt_en,
+                    "dialogue": s.dialogue,
+                    "sfx": s.sfx,
+                    "lighting": s.lighting,
+                    "scriptExcerpt": s.script_excerpt,
+                    "characters": s.characters,
+                    "checks": s.checks,
+                    "params": {
+                        "model": "Seedance 2.0",
+                        "seed": s.seed,
+                        "resolution": s.resolution,
+                        "guidance": s.guidance,
+                        "durationSec": s.duration_sec,
+                        "fps": s.fps,
+                    }
+                }
+            }));
+            // 和真实软件一致的 JSON 形状：page + shots[].{shot_index, data}
+            json_shots.push(serde_json::json!({
+                "shot_index": idx + 1,
+                "data": {
+                    "prompt": s.prompt,
+                    "prompt_en": s.prompt_en,
+                    "dialogue": s.dialogue,
+                    "sfx": s.sfx,
+                    "lighting": s.lighting,
+                    "script_excerpt": s.script_excerpt,
+                    "characters": s.characters,
+                    "checks": s.checks,
+                    "params": {
+                        "model": "Seedance 2.0",
+                        "seed": s.seed,
+                        "resolution": s.resolution,
+                        "guidance": s.guidance,
+                        "duration_sec": s.duration_sec,
+                        "fps": s.fps,
+                    }
+                }
+            }));
+        }
+        let jpg = out_dir.join(format!("{}_分镜证明_{:02}.jpg", safe_title, page + 1));
+        let json_path = out_dir.join(format!("{}_分镜证明_{:02}.json", safe_title, page + 1));
+        let req = serde_json::json!({
+            "outPath": jpg.to_string_lossy(),
+            "title": safe_title,
+            "page": page + 1,
+            "totalPages": total_pages,
+            "shots": page_shots,
+        });
+        let worker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("storyboard_render.py");
+        let value = crate::proc::run_json_worker(
+            &python,
+            &worker,
+            &req,
+            std::time::Duration::from_secs(120),
+        )?;
+        if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let msg = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("未知错误");
+            return Err(AppError::Msg(format!("分镜证明页渲染失败：{msg}")));
+        }
+        let doc = serde_json::json!({
+            "page": page + 1,
+            "title": safe_title,
+            "shots": json_shots,
+        });
+        std::fs::write(
+            &json_path,
+            serde_json::to_string_pretty(&doc).unwrap_or_default(),
+        )
+        .map_err(|e| AppError::Msg(format!("写不了分镜 JSON：{e}")))?;
+        pages += 1;
     }
-    let list = out_dir.join("分镜清单.txt");
-    let _ = std::fs::write(
-        &list,
-        shot_labels
-            .iter()
-            .enumerate()
-            .map(|(i, s)| format!("镜头{:02}\t{}\n", i + 1, s))
-            .collect::<String>(),
-    );
 
     Ok(StoryboardReport {
-        sheets,
-        shots: frames.len() as i64,
-        used_ai,
-        frames_dir: frame_dir.to_string_lossy().to_string(),
-        notes,
+        sheets: pages,
+        shots: shots.len() as i64,
+        used_ai: true,
+        frames_dir: frame_root.to_string_lossy().to_string(),
+        notes: vec![format!(
+            "共 {} 张证明图 × 每张 {} 镜头（共 {} 镜头）｜反推模型：{}",
+            pages,
+            SHOTS_PER_SHEET,
+            shots.len(),
+            provider.label
+        )],
     })
 }
 
