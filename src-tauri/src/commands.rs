@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
 use tauri::{Emitter, Manager};
 
-fn lock_db<'a>(state: &'a tauri::State<'_, AppState>) -> AppResult<MutexGuard<'a, Connection>> {
+pub(crate) fn lock_db<'a>(
+    state: &'a tauri::State<'_, AppState>,
+) -> AppResult<MutexGuard<'a, Connection>> {
     state
         .db
         .lock()

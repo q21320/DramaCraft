@@ -206,7 +206,7 @@ fn decode_gbk(bytes: &[u8]) -> String {
 /// 「出字幕 / 导出成片 / 发布包」不在这个表里 —— 真实软件没有这几步
 /// （它的素材自带硬字幕，去重产物直接就能发）。这几个能力在
 /// 「单步工具」里单独用。
-pub const STAGES: [(&str, &str, bool, &str); 8] = [
+pub const STAGES: [(&str, &str, bool, &str); 9] = [
     (
         "rewrite",
         "AI 改剧名简介",
@@ -265,6 +265,14 @@ pub const STAGES: [(&str, &str, bool, &str); 8] = [
         true,
         "按模板生成成本配置比例报告（报备用）",
     ),
+    (
+        "draft",
+        "剪映草稿",
+        // **默认关** —— 原软件的 `jy\` 目录也是空的（建了但没生成）。
+        // 用得上的人自己勾。
+        false,
+        "把切片排好 + 字幕打成剪映草稿（不需要装剪映，拷到草稿目录就能打开）",
+    ),
 ];
 
 /// 这一步是**整部剧一步**吗？
@@ -282,7 +290,7 @@ pub fn is_drama_level(stage: &str) -> bool {
         // 它是**按集**的（真实软件日志「并发 4」），而且只做前 4 集 ——
         // 走这一支就会拿到一个整部剧级别的通用 payload，和它的执行器对不上。
         // 真实撞到过：任务跑到那一步报「参数无法解析（missing field media_id）」。
-        "rewrite" | "regroup" | "storyboard" | "cover" | "cost"
+        "rewrite" | "regroup" | "storyboard" | "cover" | "cost" | "draft"
     )
 }
 
@@ -862,6 +870,12 @@ pub fn stage_to_job_kind(stage: &str) -> &'static str {
         "storyboard" => "storyboard",
         "cover" => "cover",
         "cost" => "cost",
+        // **`draft` 要显式写上。**
+        //
+        // 漏了会落到 `_ => "verify"` —— 参数形状不对，跑到那一步才炸
+        // （实测：`missing field mediaId`，而 draft 的参数根本没有 mediaId）。
+        // 这条正是 `every_stage_payload_actually_parses` 那个测试抓出来的。
+        "draft" => "draft",
         _ => "verify",
     }
 }
@@ -909,6 +923,29 @@ fn drama_payload(
                 .to_string(),
             ))
         }
+        // **剪映草稿**：把切片排好 + 字幕打成能直接打开的草稿。
+        //
+        // 不需要装剪映 —— 草稿是纯 JSON，剪映只负责「打开」。
+        "draft" => Ok(Some(
+            serde_json::json!({
+                // 草稿根目录：`<剧目录>/jy/`，和真实软件的目录名一致。
+                // 草稿本体是它下面一个以**剧名**命名的子文件夹 ——
+                // 剪映的草稿列表按文件夹名显示，所以必须带剧名。
+                "draftRoot": drama_out.join("jy").to_string_lossy(),
+                "draftName": drama_out
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| drama.name.clone()),
+                "mediaIds": media_ids,
+                "width": 720,
+                "height": 1280,
+                "fps": 30,
+                // BGM 留成可选：设置里填了才加，空着就只有视频轨 + 字幕轨。
+                "bgm": "",
+                "bgmVolume": 0.35,
+            })
+            .to_string(),
+        )),
         "cost" => Ok(Some(
             serde_json::json!({
                 // **报告上写的是新剧名**，不是源剧名 —— 报告拿去申报，

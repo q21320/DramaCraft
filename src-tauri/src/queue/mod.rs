@@ -28,6 +28,7 @@ use crate::models::{
 };
 use crate::{commands, db, AppState};
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -51,6 +52,18 @@ pub const KINDS: [(&str, &str); 14] = [
     ("cover", "封面生成"),
     ("verify", "效果验证"),
 ];
+
+/// 毫秒 → SRT 时间码 `HH:MM:SS,mmm`。
+pub fn srt_time(ms: i64) -> String {
+    let ms = ms.max(0);
+    format!(
+        "{:02}:{:02}:{:02},{:03}",
+        ms / 3_600_000,
+        (ms / 60_000) % 60,
+        (ms / 1000) % 60,
+        ms % 1000
+    )
+}
 
 pub fn kind_label(kind: &str) -> String {
     KINDS
@@ -142,6 +155,37 @@ struct DedupPayload {
     prefix: String,
 }
 
+/// 整部剧一步：剪映草稿。
+///
+/// 草稿是**纯 JSON**，剪映只负责「打开」—— 不需要装剪映。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DraftPayload {
+    draft_root: String,
+    draft_name: String,
+    media_ids: Vec<i64>,
+    #[serde(default = "draft_w")]
+    width: i64,
+    #[serde(default = "draft_h")]
+    height: i64,
+    #[serde(default = "draft_fps")]
+    fps: i64,
+    #[serde(default)]
+    bgm: String,
+    #[serde(default)]
+    bgm_volume: f64,
+}
+
+fn draft_w() -> i64 {
+    720
+}
+fn draft_h() -> i64 {
+    1280
+}
+fn draft_fps() -> i64 {
+    30
+}
+
 fn default_intensity() -> String {
     "strong".to_string()
 }
@@ -226,14 +270,6 @@ struct AsrPayload {
     overwrite: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DraftPayload {
-    media_id: i64,
-    draft_root: String,
-    draft_name: String,
-    fps: Option<u32>,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -275,6 +311,7 @@ pub fn validate_payload(kind: &str, payload: &str) -> AppResult<()> {
     }
     match kind {
         "dedup" => check::<DedupPayload>(kind, payload),
+        "draft" => check::<DraftPayload>(kind, payload),
         "cost" => check::<CostPayload>(kind, payload),
         "storyboard" => check::<StoryboardPayload>(kind, payload),
         // 这两步的执行器会直接给出「还没实现 + 为什么」的说明，
@@ -288,7 +325,6 @@ pub fn validate_payload(kind: &str, payload: &str) -> AppResult<()> {
         "asr" => check::<AsrPayload>(kind, payload),
         "cloud" => check::<CloudPayload>(kind, payload),
         "export" => check::<ExportOptions>(kind, payload),
-        "draft" => check::<DraftPayload>(kind, payload),
         "publish" => check::<PublishPayload>(kind, payload),
         "verify" => check::<VerifyPayload>(kind, payload),
         other => Err(AppError::Msg(format!("不认识的任务类型：{other}"))),
@@ -354,6 +390,106 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                 // 不是失败 —— 本来就没字幕是正常情况，不该让整部剧红掉
                 Ok(report.note)
             }
+        }
+        // **剪映草稿**：切片排好 + 字幕打成 SRT 塞进去。
+        //
+        // 草稿引用切片的**绝对路径**（剪映的惯例，素材不复制进草稿）。
+        // **剪映草稿**：切片排好 + 字幕打成 SRT 塞进去。
+        //
+        // 草稿引用切片的**绝对路径**（剪映的惯例，素材不复制进草稿）。
+        "draft" => {
+            let p: DraftPayload = parse_payload(job)?;
+            let mut clips: Vec<String> = Vec::new();
+            let mut srt_lines: Vec<String> = Vec::new();
+            let mut timeline_ms: i64 = 0i64;
+            let mut cue_no = 0usize;
+            {
+                let conn = crate::commands::lock_db(&state)?;
+                for mid in &p.media_ids {
+                    let mut segs = db::list_segments(&conn, *mid)?;
+                    segs.retain(|s| {
+                        s.status == "ok" && std::path::Path::new(&s.out_path).is_file()
+                    });
+                    segs.sort_by_key(|s| s.start_ms);
+                    if segs.is_empty() {
+                        continue;
+                    }
+                    let cues = db::list_cues(&conn, *mid)?;
+                    for seg in &segs {
+                        clips.push(seg.out_path.clone());
+                        // **字幕要挪到拼接后的时间轴。**
+                        //
+                        // 切片是把若干集的 10 秒片段顺序拼起来的，而 cue 记的是
+                        // **原集时间**。不换算的话字幕会全挤在开头、错开几十秒。
+                        // 换算：时间轴位置 = 已累计时长 + (cue 起点 - 这一片的源起点)
+                        for c in cues
+                            .iter()
+                            .filter(|c| c.start_ms >= seg.start_ms && c.start_ms < seg.end_ms)
+                        {
+                            let at = timeline_ms + (c.start_ms - seg.start_ms);
+                            let dur = (c.end_ms - c.start_ms).clamp(300, 8_000);
+                            cue_no += 1;
+                            srt_lines.push(format!(
+                                "{}\n{} --> {}\n{}\n",
+                                cue_no,
+                                srt_time(at),
+                                srt_time(at + dur),
+                                c.text.trim().replace('\n', " ")
+                            ));
+                        }
+                        timeline_ms += seg.end_ms - seg.start_ms;
+                    }
+                }
+            }
+            if clips.is_empty() {
+                return Err(AppError::Msg(
+                    "没有切片可以做草稿 —— 先跑「视频切片」".into(),
+                ));
+            }
+            let srt_path = PathBuf::from(&p.draft_root).join("_字幕.srt");
+            if !srt_lines.is_empty() {
+                if let Some(dir) = srt_path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                std::fs::write(&srt_path, srt_lines.concat())
+                    .map_err(|e| AppError::Msg(format!("写不了 SRT：{e}")))?;
+            }
+            let python = {
+                let configured = crate::commands::lock_tools(&state)?;
+                crate::tools::require(&configured.python, "python")?
+            };
+            let worker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join("jy_draft_worker.py");
+            let req = serde_json::json!({
+                "draft_root": p.draft_root,
+                "draft_name": p.draft_name,
+                "width": p.width,
+                "height": p.height,
+                "fps": p.fps,
+                "clips": clips,
+                "srt": if srt_lines.is_empty() { String::new() } else { srt_path.to_string_lossy().to_string() },
+                "bgm": p.bgm,
+                "bgm_volume": p.bgm_volume,
+            });
+            let value = crate::proc::run_json_worker(
+                &python,
+                &worker,
+                &req,
+                std::time::Duration::from_secs(180),
+            )?;
+            if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                let msg = value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未知错误");
+                return Err(AppError::Msg(format!("剪映草稿生成失败：{msg}")));
+            }
+            Ok(format!(
+                "剪映草稿已生成（{} 个切片，字幕 {} 条）",
+                value.get("clips").and_then(|v| v.as_i64()).unwrap_or(0),
+                cue_no
+            ))
         }
         // 成本报告：出「成本配置比例情况报告」。
         //
@@ -577,22 +713,6 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
             Ok(format!(
                 "导出完成（{}）",
                 human_size(outcome.size_bytes)
-            ))
-        }
-        "draft" => {
-            let p: DraftPayload = parse_payload(job)?;
-            let report = commands::export_draft(
-                app.clone(),
-                state,
-                p.media_id,
-                p.draft_root,
-                p.draft_name,
-                p.fps.unwrap_or(30),
-            )
-            .await?;
-            Ok(format!(
-                "草稿已生成：{} 个片段 / {} 条字幕",
-                report.clip_count, report.cue_count
             ))
         }
         "publish" => {
