@@ -2793,6 +2793,24 @@ pub async fn dedup_media(
 /// 没有配 AI 服务时**退回无描述版**：只把抽出来的帧拼成图 ——
 /// 证明"这些画面确实存在"这一点仍然成立，只是没有文字说明。
 /// 排一个注定失败的任务不如给一个能用的降级产物。
+/// 把剧名变成合法的文件名片段（去掉路径分隔符和 Windows 不允许的字符）。
+fn safe_file_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    let t = cleaned.trim().trim_end_matches('.').to_string();
+    if t.is_empty() {
+        "未命名".to_string()
+    } else {
+        t
+    }
+}
+
 /// 秒 → `MM:SS`（分镜时间段显示用）。
 fn mmss(sec: f64) -> String {
     let s = sec.max(0.0) as i64;
@@ -2994,11 +3012,13 @@ pub async fn build_storyboard(
     const SHOTS_PER_SHEET: usize = 2;
     let total_pages = shots.len().div_ceil(SHOTS_PER_SHEET);
     let mut pages = 0i64;
-    let safe_title = out_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| title.clone());
+    // **文件名用剧名，不是输出目录名。**
+    //
+    // 踩过：输出目录叫「分镜证明」，取它的 `file_name()` 当剧名，
+    // 结果产出叫 `分镜证明_分镜证明_01.jpg` —— 剧名没了，还重复一遍。
+    //
+    // `title` 是从 `剧名.txt` 读出来的（rewrite 写过就是新剧名），那才是对的。
+    let safe_title = safe_file_name(&title);
     for page in 0..total_pages {
         let from = page * SHOTS_PER_SHEET;
         let to = (from + SHOTS_PER_SHEET).min(shots.len());
