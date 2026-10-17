@@ -743,6 +743,13 @@ pub fn start_pipeline(
             if is_drama_level(stage) {
                 match drama_payload(stage, drama, &drama_out, &media_ids, total_ms)? {
                     Some(payload) => {
+                        // 成本报告的落款（机构/法人/公章/签名）来自**设置**，
+                        // 一次配好每部剧都用；生成时那几项是空的，在这里补。
+                        let payload = if stage == "cost" {
+                            with_cost_stamp(conn, payload)
+                        } else {
+                            payload
+                        };
                         crate::db::enqueue_job_for(
                             conn,
                             None,
@@ -1009,6 +1016,36 @@ pub const COST_INVEST_WAN: f64 = 1.0;
 /// 演员总片酬占比（%）。表单要求 ＜40%。
 pub const COST_ACTOR_RATIO: f64 = 30.0;
 
+/// 成本报告的落款（报审机构 / 法人 / 公章 / 签名）来自**设置**，
+/// 一次配好每部剧都用 —— 放在流水线页的话，每跑一部都要重填。
+///
+/// 所以 `drama_payload` 生成时这几个字段是空的，在这里补进去。
+/// 读不出来就保持空 —— 报告照样出，只是落款空白。
+pub fn with_cost_stamp(conn: &rusqlite::Connection, payload: String) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&payload) else {
+        return payload;
+    };
+    let Ok(Some(raw)) = crate::db::get_setting(conn, "ui.cost.report") else {
+        return payload;
+    };
+    let Ok(stamp) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return payload;
+    };
+    let get = |k: &str| {
+        stamp
+            .get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("org".into(), serde_json::json!(get("org")));
+        obj.insert("legalPerson".into(), serde_json::json!(get("legalPerson")));
+        obj.insert("sealPath".into(), serde_json::json!(get("sealPath")));
+        obj.insert("signPath".into(), serde_json::json!(get("signPath")));
+    }
+    v.to_string()
+}
 /// 写出剧目录顶层那几个说明文件（照真实软件的产出）。
 ///
 /// 真实软件的剧目录顶层是：
@@ -1521,6 +1558,54 @@ mod tests {
         }
     }
 
+    /// 成本报告的落款从**设置**里补进 payload。
+    ///
+    /// 这几个值一次配好、每部剧都用，所以放在设置里；
+    /// `drama_payload` 生成时它们是空的，排任务前用 `with_cost_stamp` 补。
+    #[test]
+    fn cost_stamp_comes_from_settings() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate_for_tests(&conn).unwrap();
+        let base = serde_json::json!({
+            "title": "借车之后",
+            "episodeCount": 6,
+            "totalMs": 540_000,
+            "outPath": "E:/o/成本报告.docx",
+            "org": "",
+            "legalPerson": "",
+            "sealPath": "",
+            "signPath": "",
+        })
+        .to_string();
+
+        // 没配过：原样返回（落款留空，报告照样能出）
+        let same = with_cost_stamp(&conn, base.clone());
+        let v: serde_json::Value = serde_json::from_str(&same).unwrap();
+        assert_eq!(v["org"], "");
+
+        // 配过：四项都要补进来
+        crate::db::set_setting(
+            &conn,
+            "ui.cost.report",
+            &serde_json::json!({
+                "org": "某某科技有限公司",
+                "legalPerson": "张三",
+                "sealPath": "E:/seal.png",
+                "signPath": "E:/sign.png",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let stamped = with_cost_stamp(&conn, base);
+        let v: serde_json::Value = serde_json::from_str(&stamped).unwrap();
+        assert_eq!(v["org"], "某某科技有限公司");
+        assert_eq!(v["legalPerson"], "张三");
+        assert_eq!(v["sealPath"], "E:/seal.png");
+        assert_eq!(v["signPath"], "E:/sign.png");
+        // 其他字段不许被弄丢
+        assert_eq!(v["title"], "借车之后");
+        assert_eq!(v["episodeCount"], 6);
+    }
     #[test]
     fn scans_one_drama_with_episodes_synopsis_and_cover() {
         let t = TempTree::new("single");

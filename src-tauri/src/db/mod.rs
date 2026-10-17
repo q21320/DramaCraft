@@ -1788,19 +1788,12 @@ pub fn cancel_jobs_of_drama(conn: &Connection, drama_id: i64) -> AppResult<i64> 
     Ok(changed as i64)
 }
 
-/// 某部剧还有多少没跑的任务。
-///
-/// 用来判断「这部剧做完了没有」—— 任务全跑完就该把剧目标成完成，
-/// 否则它会永远停在「进行中」。真实素材那轮就是这样：
-/// 64 个任务早在两小时前就跑完了，界面上却显示还在跑，用户以为卡死。
-pub fn count_pending_jobs_of_drama(conn: &Connection, drama_id: i64) -> AppResult<i64> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM job WHERE pipeline_drama_id = ?1 AND status IN ('pending', 'running')",
-        params![drama_id],
-        |row| row.get(0),
-    )?;
-    Ok(n)
-}
+// `count_pending_jobs_of_drama` 已删 —— 换成 `drama_job_state`。
+//
+// 旧的只数 `pending`/`running`，而**某一步失败后 `cancel_jobs_of_drama`
+// 会把后面没跑的任务标成 `canceled`** —— 那一刻 pending 也是 0，
+// 于是这部「没做完」的剧被写成「全部步骤已完成」。
+// 踩过：成本报告没跑，剧目却显示完成。
 
 /// 某部剧的任务统计：`(还没跑完的, 失败的或被撤的)`。
 ///

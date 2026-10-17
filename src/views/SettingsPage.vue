@@ -20,6 +20,47 @@ const cloudSaving = ref(false);
 const cloudTesting = ref(false);
 const cloudResult = ref<CloudTestResult | null>(null);
 
+// 成本报告落款。存在 `ui.cost.report` 里（和云端配置一样走 ui 状态 KV），
+// 流水线排 cost 任务时读它填进 payload。
+const COST_KEY = "cost.report";
+const costForm = ref({ org: "", legalPerson: "", sealPath: "", signPath: "" });
+const costSaving = ref(false);
+
+async function loadCostForm() {
+  try {
+    const raw = await api.loadUiState(COST_KEY);
+    if (!raw) return;
+    const v = JSON.parse(raw) as Partial<typeof costForm.value>;
+    costForm.value = {
+      org: v.org ?? "",
+      legalPerson: v.legalPerson ?? "",
+      sealPath: v.sealPath ?? "",
+      signPath: v.signPath ?? "",
+    };
+  } catch {
+    // 读不出来就当没配过，不影响其他功能
+  }
+}
+
+async function saveCostForm() {
+  costSaving.value = true;
+  try {
+    await api.saveUiState(COST_KEY, JSON.stringify(costForm.value));
+    message.success("成本报告落款已保存");
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    costSaving.value = false;
+  }
+}
+
+async function pickCostFile(field: "sealPath" | "signPath") {
+  const picked = await open({
+    multiple: false,
+    filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] }],
+  });
+  if (typeof picked === "string") costForm.value[field] = picked;
+}
 function syncCloudForm() {
   const cfg = store.cloud;
   cloudForm.value = {
@@ -100,6 +141,8 @@ async function redetect() {
 onMounted(() => {
   draft.value = { ...store.tools };
   syncCloudForm();
+  // 成本报告落款：一次配好，每部剧都用
+  void loadCostForm();
 });
 </script>
 
@@ -270,6 +313,45 @@ pip install pyJianYingDraft         # 剪映草稿导出</pre>
         <li v-for="(w, i) in store.cloud.warnings" :key="i" class="dd-wrap">{{ w }}</li>
       </ul>
     </n-alert>
+  </div>
+
+  <!--
+    成本报告的落款 —— **一次配好，每部剧都用**，所以放在设置里，
+    不放流水线页。流水线页是「每跑一次可能变」的东西。
+  -->
+  <div class="dd-card">
+    <div class="dd-card-title">成本报告落款</div>
+    <div class="dd-card-desc">
+      生成「成本配置比例情况报告」时盖在落款处的信息。
+      <b>不填也能出报告</b>，只是落款空着，需要自己补。
+      公章和签名接受 PNG（推荐透明底）或 JPG。
+    </div>
+
+    <div class="dd-row" style="margin-bottom: 10px">
+      <span class="dd-muted" style="width: 90px">报审机构</span>
+      <n-input v-model:value="costForm.org" size="small" style="width: 420px" placeholder="填公司全称，留空则落款处空白" />
+    </div>
+
+    <div class="dd-row" style="margin-bottom: 10px">
+      <span class="dd-muted" style="width: 90px">法定代表人</span>
+      <n-input v-model:value="costForm.legalPerson" size="small" style="width: 420px" placeholder="填姓名，留空则落款处空白" />
+    </div>
+
+    <div class="dd-row" style="margin-bottom: 10px">
+      <span class="dd-muted" style="width: 90px">公章图片</span>
+      <n-input v-model:value="costForm.sealPath" size="small" style="width: 420px" placeholder="留空则不盖公章" />
+      <n-button size="small" @click="pickCostFile('sealPath')">选择</n-button>
+    </div>
+
+    <div class="dd-row" style="margin-bottom: 14px">
+      <span class="dd-muted" style="width: 90px">签名图片</span>
+      <n-input v-model:value="costForm.signPath" size="small" style="width: 420px" placeholder="留空则不贴签名图（仍会打上名字）" />
+      <n-button size="small" @click="pickCostFile('signPath')">选择</n-button>
+    </div>
+
+    <n-space>
+      <n-button size="small" type="primary" :loading="costSaving" @click="saveCostForm">保存</n-button>
+    </n-space>
   </div>
 
   <div class="dd-card">
