@@ -155,6 +155,53 @@ async function refreshRuns() {
   }
 }
 
+// 复制日志 —— 贴给别人看、或者自己存档。
+//
+// **不用 clipboard 插件**：Tauri 的 webview 里 `navigator.clipboard` 有时被拦，
+// 所以带一个 `execCommand('copy')` 的兜底 —— 那个虽然过时，但到哪都能用。
+const copying = ref(false);
+
+function logsToText(): string {
+  return logs.value
+    .map((l) => {
+      const t = new Date(l.createdAt).toLocaleString("zh-CN", { hour12: false });
+      // 对齐一点，贴出去好读：时间 + 级别 + 内容
+      const lv = (l.level || "info").padEnd(5);
+      return `${t}  ${lv}  ${l.message}`;
+    })
+    .join("\n");
+}
+
+async function copyLogs() {
+  if (logs.value.length === 0) {
+    message.warning("还没有日志可复制");
+    return;
+  }
+  const text = logsToText();
+  copying.value = true;
+  try {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // 兜底：塞一个隐藏 textarea 再用 execCommand
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (!ok) throw new Error("浏览器不允许写剪贴板");
+    }
+    message.success(`已复制 ${logs.value.length} 行日志`);
+  } catch (e) {
+    message.error(`复制失败：${e}`);
+  } finally {
+    copying.value = false;
+  }
+}
+
 async function clearAll() {
   try {
     const n = await api.clearLogs();
@@ -207,6 +254,7 @@ onUnmounted(() => {
       <n-space :size="10" align="center">
         <span v-if="busy" class="dd-live"><span class="dd-dot" />正在跑</span>
         <span v-else class="dd-muted">空闲</span>
+        <n-button size="small" :loading="copying" @click="copyLogs">复制日志</n-button>
         <n-button size="small" @click="clearAll">清空日志</n-button>
       </n-space>
     </div>
