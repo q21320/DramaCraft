@@ -447,8 +447,22 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                     let conn = crate::commands::lock_db(&state)?;
                     let media = db::get_media(&conn, *mid)?;
                     let mut segs = db::list_segments(&conn, *mid)?;
+                    // 只要**真的有内容**的切片。
+                    //
+                    // 踩过：第01集 81 秒 → 8 个整 10 秒 + 1 秒尾巴，
+                    // 但 `quzimu` 的实际时长比数据库记的短一点点，那 1 秒
+                    // 落在正文之外 —— ffmpeg 只写出一个 **321 字节的空容器**。
+                    // 状态还是 ok、文件也在，`pymediainfo`/`ffprobe` 都读不出时长，
+                    // 一路把草稿生成搞崩。
+                    //
+                    // **10KB 以下的 mp4 一定不是有效视频**，直接跳过。
                     segs.retain(|s| {
-                        s.status == "ok" && std::path::Path::new(&s.out_path).is_file()
+                        if s.status != "ok" {
+                            return false;
+                        }
+                        let p = std::path::Path::new(&s.out_path);
+                        p.is_file()
+                            && std::fs::metadata(p).map(|m| m.len() > 10_000).unwrap_or(false)
                     });
                     segs.sort_by_key(|s| s.start_ms);
                     if segs.is_empty() {
