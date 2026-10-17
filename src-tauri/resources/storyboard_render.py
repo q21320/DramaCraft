@@ -87,6 +87,20 @@ def emit(payload):
     sys.stdout.flush()
 
 
+def pick(req, *keys, default=None):
+    """从请求里按顺序取第一个非空的 key。
+
+    **两套命名都认**（snake_case 和 camelCase）—— 调用方是 Rust，
+    字段名两边必须逐字一致。踩过一次：Rust 写 `outPath`、这里读
+    `out_path`，报「没给 out_path」，而报错完全看不出是 key 名对不上。
+    在边界上两种都接受，改一边不会突然断。
+    """
+    for k in keys:
+        v = req.get(k)
+        if v is not None and v != "":
+            return v
+    return default
+
 def wrap_cjk(draw, text, font, max_w, max_lines=None):
     """按像素宽度折行。中文按字切；英文尽量按空格切。"""
     text = (text or "").replace("\r", "")
@@ -163,9 +177,9 @@ def render(req):
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
 
-    title = (req.get("title") or "未命名").strip()
-    page = int(req.get("page") or 1)
-    total_pages = int(req.get("total_pages") or 1)
+    title = str(pick(req, "title", default="未命名")).strip()
+    page = int(pick(req, "page", default=1))
+    total_pages = int(pick(req, "total_pages", "totalPages", default=1))
     shots = req.get("shots") or []
 
     # ---------------- 顶栏 ----------------
@@ -203,8 +217,8 @@ def render(req):
             continue
 
         data = shot.get("data") or {}
-        sindex = shot.get("shot_index") or (idx + 1)
-        trange = shot.get("time_range") or ""
+        sindex = shot.get("shot_index") or shot.get("shotIndex") or (idx + 1)
+        trange = shot.get("time_range") or shot.get("timeRange") or ""
         lx = 26
         mx = lx + left_w + gap
         rx = mx + mid_w + gap
@@ -269,21 +283,21 @@ def render(req):
         # PROMPT
         d.text((hx, yy), "PROMPT", font=f_label, fill=MUTED)
         yy += 24
-        prompt = (data.get("prompt") or "").strip()
+        prompt = str(pick(data, "prompt", "PROMPT", default="")).strip()
         plines = wrap_cjk(d, prompt, f_body, mid_w - 32, max_lines=9)
         yy = draw_lines(d, plines, hx, yy, f_body, TEXT) + 10
 
         # 台词与音效
         d.text((hx, yy), "台词与音效", font=f_label, fill=MUTED)
         yy += 24
-        dl = (data.get("dialogue") or "").strip()
-        sfx = (data.get("sfx") or "").strip()
+        dl = str(pick(data, "dialogue", default="")).strip()
+        sfx = str(pick(data, "sfx", default="")).strip()
         body = []
         if dl:
             body.append("台词：" + dl.replace("\n", " / "))
         if sfx:
             body.append("音效：" + sfx)
-        lt = (data.get("lighting") or "").strip()
+        lt = str(pick(data, "lighting", default="")).strip()
         if lt:
             body.append("光线：" + lt)
         lines = wrap_cjk(d, "\n".join(body), f_body, mid_w - 32, max_lines=6)
@@ -292,13 +306,13 @@ def render(req):
         # 生成参数
         d.text((hx, yy), "生成参数", font=f_label, fill=MUTED)
         yy += 24
-        p = data.get("params") or {}
+        params = data.get("params") or {}
         params = [
-            ("模型", p.get("model", "Seedance 2.0")),
-            ("Seed", p.get("seed", "—")),
-            ("分辨率", p.get("resolution", "720x1280")),
-            ("引导", p.get("guidance", "—")),
-            ("时长", f"{p.get('duration_sec', '—')}s / {p.get('fps', '25')}fps"),
+            ("模型", pick(params, "model", default="Seedance 2.0")),
+            ("Seed", pick(params, "seed", default="—")),
+            ("分辨率", pick(params, "resolution", default="720x1280")),
+            ("引导", pick(params, "guidance", default="—")),
+            ("时长", f"{pick(params, 'duration_sec', 'durationSec', default='—')}s / {pick(params, 'fps', default='25')}fps"),
         ]
         for label, val in params:
             d.text((hx, yy), f"{label}  ", font=f_small, fill=MUTED)
@@ -318,7 +332,7 @@ def render(req):
         # ---- 右列 ----
         rh = (block_h - 3 * 10) // 4
         sections = [
-            ("脚本摘要", wrap_cjk(d, data.get("script_excerpt") or "", f_small, right_w - 28, max_lines=4)),
+            ("脚本摘要", wrap_cjk(d, str(pick(data, "script_excerpt", "scriptExcerpt", default="")), f_small, right_w - 28, max_lines=4)),
             ("画面校验", None),
             ("角色资产", None),
             ("生成记录", ["v1 初版 · 通过", "v2 复核 · 通过", f"v3 镜头 {sindex:02d} 导出"]),
@@ -329,17 +343,19 @@ def render(req):
             d.text((rx + 14, ry + 10), name, font=f_label, fill=MUTED)
             cy = ry + 36
             if name == "画面校验":
-                checks = data.get("checks") or []
+                checks = data.get("checks") or data.get("校验") or []
                 for c in checks[:5]:
                     # 只取冒号前的名字，太长就截断
                     short = str(c).split("：")[0].split(":")[0]
                     short = short[:12]
-                    d.rectangle([rx + 14, cy + 3, rx + 25, cy + 14], outline=OK, width=2)
-                    d.text((rx + 30, cy), f"✓ {short}", font=f_small, fill=TEXT)
+                    # 一个框、框里打勾，**别画成「空框 + ✓」两个符号**
+                    d.rectangle([rx + 14, cy + 3, rx + 27, cy + 16], outline=OK, width=2)
+                    d.text((rx + 16, cy - 1), "✓", font=f_small, fill=OK)
+                    d.text((rx + 34, cy), short, font=f_small, fill=TEXT)
                     cy += 24
             elif name == "角色资产":
                 cx = rx + 14
-                for ch in (data.get("characters") or [])[:6]:
+                for ch in (data.get("characters") or data.get("角色") or [])[:6]:
                     label = str(ch)[:6]
                     cw2 = d.textlength(label, font=f_small) + 20
                     if cx + cw2 > rx + right_w - 14:
@@ -356,7 +372,7 @@ def render(req):
     foot = f"分镜证明 {page:02d}/{total_pages:02d} · Seedance 2.0"
     d.text((26, H - 34), foot, font=f_foot, fill=MUTED)
 
-    out = req.get("out_path") or ""
+    out = str(pick(req, "out_path", "outPath", default="") or "")
     if not out:
         raise RuntimeError("没给 out_path")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

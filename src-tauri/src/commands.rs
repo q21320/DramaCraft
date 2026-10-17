@@ -3007,8 +3007,8 @@ pub async fn build_storyboard(
             let r = &shots[idx];
             let _ = r;
             page_shots.push(serde_json::json!({
-                "shotIndex": idx + 1,
-                "timeRange": format!("{}-{}", mmss(plans[idx].start), mmss(plans[idx].end)),
+                "shot_index": idx + 1,
+                "time_range": format!("{}-{}", mmss(plans[idx].start), mmss(plans[idx].end)),
                 "preview": preview_of[idx].to_string_lossy(),
                 "keyframes": frames_of[idx].iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
                 "data": {
@@ -3055,11 +3055,16 @@ pub async fn build_storyboard(
         }
         let jpg = out_dir.join(format!("{}_分镜证明_{:02}.jpg", safe_title, page + 1));
         let json_path = out_dir.join(format!("{}_分镜证明_{:02}.json", safe_title, page + 1));
+        // **key 必须和 `storyboard_render.py` 读的一致（snake_case）。**
+        //
+        // 这里踩过一次：Rust 写 `outPath`、Python 读 `out_path`，
+        // 渲染器报「没给 out_path」，而报错完全看不出是 key 名对不上。
+        // **跨语言的边界上，字段名就是契约，两边得逐字一样。**
         let req = serde_json::json!({
-            "outPath": jpg.to_string_lossy(),
+            "out_path": jpg.to_string_lossy(),
             "title": safe_title,
             "page": page + 1,
-            "totalPages": total_pages,
+            "total_pages": total_pages,
             "shots": page_shots,
         });
         let worker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
