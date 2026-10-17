@@ -158,6 +158,46 @@ def render(req):
     script.save()
 
     draft_dir = os.path.join(draft_root, draft_name)
+
+    # ---------- ④ 补 draft_name + 写使用说明 ----------
+    #
+    # `pyJianYingDraft` 生成的 `draft_meta_info.json` 里 `draft_name` 是**空的**；
+    # 剪映的草稿列表按**文件夹名**显示，所以我们靠文件夹名带上剧名。
+    # 这里顺手把 `draft_name` 也填上 —— 有的版本会读它。
+    meta_path = os.path.join(draft_dir, "draft_meta_info.json")
+    try:
+        meta = json.load(open(meta_path, encoding="utf-8"))
+        meta["draft_name"] = draft_name
+        meta["draft_fold_path"] = draft_dir.replace("\\", "/")
+        meta["draft_root_path"] = os.path.abspath(draft_root).replace("\\", "/")
+        json.dump(meta, open(meta_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    readme = [
+        "这个文件夹是剪映草稿（DramaDist 生成）。",
+        "",
+        "【怎么用】",
+        "1. 把「" + draft_name + "」整个文件夹拷到剪映的草稿目录；",
+        "   默认在 C:\\Users\\<你>\\AppData\\Local\\JianyingPro\\User Data\\Projects\\com.lveditor.draft",
+        "2. 打开剪映，草稿列表里就有它了。",
+        "",
+        "【注意】",
+        "草稿引用的是下面这些切片，**不要移动或改名**，否则剪映会提示素材丢失：",
+    ]
+    readme += ["    " + c for c in clips]
+    readme += [
+        "",
+        "【本草稿内容】",
+        "    视频轨：" + str(len(placed)) + " 个切片按顺序排好，总长 " + str(round(total_us / 1_000_000, 1)) + " 秒",
+        "    字幕轨：" + ("有（" + os.path.basename(srt) + "）" if srt and os.path.isfile(srt) else "无"),
+        "    BGM 轨：" + ("有（" + os.path.basename(bgm) + "）" if bgm and os.path.isfile(bgm) else "无"),
+        "",
+        "换台机器用：连上面那些切片一起搬，并且保持盘符路径一致；",
+        "或者打开剪映后按提示手动「重新链接素材」。",
+    ]
+    with open(os.path.join(draft_dir, "说明.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(readme))
     return {
         "ok": True,
         "draft_dir": draft_dir,
