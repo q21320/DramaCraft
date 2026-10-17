@@ -1802,6 +1802,24 @@ pub fn count_pending_jobs_of_drama(conn: &Connection, drama_id: i64) -> AppResul
     Ok(n)
 }
 
+/// 某部剧的任务统计：`(还没跑完的, 失败的或被撤的)`。
+///
+/// **两个都要看。** 只看「还没跑完的 == 0」会误判 —— 某一步失败后
+/// `cancel_jobs_of_drama` 把后面没跑的任务标成 `canceled`，那时
+/// pending 也是 0，但这部剧明明没做完。
+///
+/// 踩过：成本报告被撤掉，剧目却显示「全部步骤已完成」，产出少一份。
+pub fn drama_job_state(conn: &Connection, drama_id: i64) -> AppResult<(i64, i64)> {
+    let row: (i64, i64) = conn.query_row(
+        "SELECT
+           COALESCE(SUM(CASE WHEN status IN ('pending','running') THEN 1 ELSE 0 END), 0),
+           COALESCE(SUM(CASE WHEN status IN ('failed','canceled') THEN 1 ELSE 0 END), 0)
+         FROM job WHERE pipeline_drama_id = ?1",
+        params![drama_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(row)
+}
 /// 清掉已结束的任务（done / failed / canceled），返回删除条数。
 pub fn clear_finished_jobs(conn: &Connection) -> AppResult<i64> {
     let changed = conn.execute(

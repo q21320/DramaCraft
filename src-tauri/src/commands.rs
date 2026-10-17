@@ -33,7 +33,9 @@ fn lock_db<'a>(state: &'a tauri::State<'_, AppState>) -> AppResult<MutexGuard<'a
         .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))
 }
 
-fn lock_tools<'a>(state: &'a tauri::State<'_, AppState>) -> AppResult<MutexGuard<'a, ToolPaths>> {
+pub(crate) fn lock_tools<'a>(
+    state: &'a tauri::State<'_, AppState>,
+) -> AppResult<MutexGuard<'a, ToolPaths>> {
     state
         .tools
         .lock()
@@ -421,6 +423,38 @@ fn worker_script(app: &tauri::AppHandle, file_name: &str) -> PathBuf {
         .join(file_name)
 }
 
+/// 把成本报告渲染成 JPG（照真实软件的产出：`zhengming/<剧名>_成本配置比例情况报告.jpg`）。
+///
+/// 真实软件那份产出就是 **JPG**（1241×1754，A4 竖版），不是 docx。
+/// 我们两份都出：docx 好改，jpg 直接能交。
+///
+/// 版式由 `resources/cost_report_render.py` 用 PIL 画 —— 打包环境里没有
+/// LibreOffice/Word，docx 转图片这条路走不通。
+///
+/// **报审机构 / 法人 / 公章 / 签名都由调用方传，这里不预填任何公司名。**
+/// 真实软件那份里的公司名和签名是用户自己的材料，不能写死在代码里。
+pub fn render_cost_report_jpg(
+    app: &tauri::AppHandle,
+    python: &Path,
+    req: &serde_json::Value,
+) -> AppResult<()> {
+    let worker = worker_script(app, "cost_report_render.py");
+    if !worker.is_file() {
+        return Err(AppError::Msg(format!(
+            "找不到成本报告渲染脚本：{}",
+            worker.to_string_lossy()
+        )));
+    }
+    let value = proc::run_json_worker(python, &worker, req, std::time::Duration::from_secs(120))?;
+    if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let msg = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        return Err(AppError::Msg(format!("成本报告渲染失败：{msg}")));
+    }
+    Ok(())
+}
 /// 跑一次本地 ASR 并把结果整片覆盖到该素材的字幕上。长任务，走 blocking 线程池。
 ///
 /// 与 OCR / 云端转写一致：已有字幕时默认**拒绝执行**，必须显式 `overwrite`。

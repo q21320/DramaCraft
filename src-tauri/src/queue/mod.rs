@@ -164,6 +164,15 @@ struct CostPayload {
     /// 法定代表人姓名；空着就只留签字位置
     #[serde(default)]
     legal_person: String,
+    /// 公章图片（PNG/JPG）。空着就不盖章。
+    #[serde(default)]
+    seal_path: String,
+    /// 手写签名图片。空着就只打名字。
+    #[serde(default)]
+    sign_path: String,
+    /// 落款日期；空着就写「年 月 日」留空。
+    #[serde(default)]
+    date: String,
 }
 
 /// 整部剧一步：分镜证明。
@@ -353,22 +362,54 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         "cost" => {
             let p: CostPayload = parse_payload(job)?;
             let minutes = (p.total_ms as f64 / 60000.0).max(0.0);
+            let invest_wan = if p.invest_wan > 0.0 { p.invest_wan } else { 1.0 };
+            let actor_ratio = p.actor_ratio.max(0.0);
+            let out_path = p.out_path.clone();
             let report = commands::generate_cost_report(
                 vec![crate::models::CostReportRow {
                     name: p.title.clone(),
                     episodes: p.episode_count,
                     total_minutes: minutes,
-                    // 表单要求「需＜100万」「需＜40%」，默认给保守值。
-                    // 真实数字该由用户填 —— 这是拿去申报的东西。
-                    invest_wan: if p.invest_wan > 0.0 { p.invest_wan } else { 1.0 },
-                    actor_ratio: p.actor_ratio.max(0.0),
+                    invest_wan,
+                    actor_ratio,
                 }],
-                p.org,
-                p.legal_person,
-                String::new(),
-                p.out_path,
+                p.org.clone(),
+                p.legal_person.clone(),
+                p.date.clone(),
+                out_path.clone(),
             )?;
-            Ok(format!("成本报告已生成（{}）", report.out_path))
+            // **再出一份 JPG** —— 真实软件的产出就是 JPG（拿来直接交的那种）。
+            // docx 留着好改，jpg 可直接用，两份都出。
+            //
+            // 渲染失败**不让整个任务失败**：docx 已经出来了，成本报告这一份
+            // 是能用的，JPG 只是更方便。日志里说清楚哪份少了。
+            let jpg_path = std::path::Path::new(&out_path)
+                .with_extension("jpg")
+                .to_string_lossy()
+                .to_string();
+            let mut note = String::new();
+            let (python,) = {
+                let configured = crate::commands::lock_tools(&state)?;
+                (crate::tools::require(&configured.python, "python")?,)
+            };
+            let req = serde_json::json!({
+                "out_path": jpg_path,
+                "title": p.title,
+                "episodes": p.episode_count,
+                "minutes": minutes.round() as i64,
+                "invest_wan": invest_wan,
+                "actor_ratio": actor_ratio,
+                "org": p.org,
+                "legal_person": p.legal_person,
+                "date": p.date,
+                "seal_path": p.seal_path,
+                "sign_path": p.sign_path,
+            });
+            match commands::render_cost_report_jpg(app, &python, &req) {
+                Ok(_) => {}
+                Err(e) => note = format!("｜JPG 没出：{}", crate::proc::tail(&e.to_string())),
+            }
+            Ok(format!("成本报告已生成（{}）{note}", report.out_path))
         }
         // 分镜证明：抽帧 → 视觉模型反推 → 拼成证明图
         "storyboard" => {
@@ -857,7 +898,21 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                         // 少了这一步，剧目会永远停在「进行中」——
                         // 真实素材那轮 64 个任务两个多小时前就跑完了，
                         // 界面上却还在转，用户以为卡死。
-                        if db::count_pending_jobs_of_drama(&conn, drama_id)? == 0 {
+                        // **两个数都要看：没跑完的 = 0，还不够；还得没有失败/被撤的。**
+                        //
+                        // `canceled` 是某一步失败后自动撤掉后续任务产生的。
+                        // 只数 pending/running 的话，那一刻也是 0 —— 于是这部剧被
+                        // 写成「全部步骤已完成」，而成本报告根本没跑。
+                        let (pending, bad) = db::drama_job_state(&conn, drama_id)?;
+                        if pending == 0 && bad == 0 {
+                            // **已经标成失败的就别再改成完成。**
+                            //
+                            // 踩过：某一步失败后，`cancel_jobs_of_drama` 把后面还没跑的
+                            // 任务标成 `canceled`；而完成判定只数 `pending`/`running`，
+                            // `canceled` 不算 → 于是这部剧被写成「全部步骤已完成」，
+                            // 而成本报告根本没跑。用户看到「完成」，产出却少一份。
+                            //
+                            // **失败就是失败，剩下的没跑不代表做完了。**
                             db::update_pipeline_drama(
                                 &conn,
                                 drama_id,
@@ -865,6 +920,9 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                                 "done",
                                 "全部步骤已完成",
                             )?;
+                        } else if pending == 0 && bad > 0 {
+                            // 任务都处置完了，但有失败的/被撤的 —— 这部剧**没做完**。
+                            // 保留原来的 fail 状态，别覆盖成完成。
                         }
                     }
                     Err(e) => {

@@ -904,7 +904,12 @@ fn drama_payload(
         }
         "cost" => Ok(Some(
             serde_json::json!({
-                "title": drama.name,
+                // **报告上写的是新剧名**，不是源剧名 —— 报告拿去申报，
+                // 名字要和产出目录、封面、简介一致。从导出目录名取。
+                "title": drama_out
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| drama.name.clone()),
                 "episodeCount": drama.episode_count,
                 "totalMs": total_ms,
                 // **文件名用新剧名**（从导出目录名取 —— 它已经是最终名字了）。
@@ -915,9 +920,16 @@ fn drama_payload(
                         drama_out.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
                     ))
                     .to_string_lossy(),
-                // 报备用的默认值：投资额由用户在报告里改
-                "investWan": 100.0,
-                "actorRatio": 30.0,
+                // 默认值跟着真实软件的实际产出走：成本 1 万、片酬 30%。
+                // 表单要求「需＜100 万」「需＜40%」。
+                "investWan": COST_INVEST_WAN,
+                "actorRatio": COST_ACTOR_RATIO,
+                // 报审机构 / 法人 / 公章 / 签名：界面上填，**这里不预填公司名**。
+                "org": "",
+                "legalPerson": "",
+                "sealPath": "",
+                "signPath": "",
+                "date": "",
             })
             .to_string(),
         )),
