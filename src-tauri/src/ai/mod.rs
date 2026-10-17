@@ -427,8 +427,6 @@ pub async fn rewrite_title_and_synopsis(
 pub struct ShotReverse {
     /// 中文画面描述（报备时人看得懂）
     pub prompt: String,
-    /// 英文画面描述（喂 Seedance 更准）
-    pub prompt_en: String,
     pub dialogue: String,
     pub sfx: String,
     pub lighting: String,
@@ -454,6 +452,8 @@ pub async fn reverse_shot(
     provider: &AiProvider,
     frames: &[std::path::PathBuf],
     episode_label: &str,
+    shot_index: usize,
+    _shot_count: usize,
     time_range: &str,
     duration_sec: f64,
 ) -> AppResult<ShotReverse> {
@@ -473,21 +473,41 @@ pub async fn reverse_shot(
         .build()
         .map_err(|e| AppError::Msg(format!("建不了 HTTP 客户端：{e}")))?;
 
+    // **提示词照原软件原文。**
+    //
+    // 从它的二进制里挖出来的（函数名 `storyboard_reverse_prompt`，
+    // 参数 `drama_name` / `shot_index` / `shot_count` / `time_range` / `duration_sec`）。
+    //
+    // 我自己先编了一版，和它差得远：
+    // - 原版明确写着「**用于证明该视频由 AI 生成**」—— 这是这份材料的用途
+    // - 每个字段都有具体约束（`script_excerpt` 要 20～60 字、
+    //   `seed` 要 6 位数字字符串、`checks` 五项固定）
+    // - `params` 的形状是定死的，`model` 必须是 Seedance 2.0、`resolution` 必须 720x1280
+    // - `duration_sec` 在提示词里**就预填好实际值**，不是让模型猜
+    //
+    // **这类提示词不该自己发挥** —— 它直接决定产出长什么样。
     let instruction = format!(
-        "这是同一段视频（{episode_label} {time_range}，约 {duration_sec:.1} 秒）按时间顺序抽的 {} 张关键帧。\
-         请反推出这个「镜头」的分镜脚本，严格只输出一个 JSON 对象，不要任何解释、不要代码围栏：\n\
-         {{\n\
-           \"prompt\": \"中文画面描述：景别（特写/中景/远景）、机位（固定/推/拉/摇）、主体是谁、在哪、在做什么、\
-           环境与氛围。120 字以内。\",\n\
-           \"promptEn\": \"把上面那段翻成英文的镜头描述，给 AI 视频模型用\",\n\
-           \"dialogue\": \"画面里出现的台词；没有就留空字符串\",\n\
-           \"sfx\": \"这个镜头的环境音与音效，20 字以内\",\n\
-           \"lighting\": \"光线方向、色温、明暗对比，20 字以内\",\n\
-           \"scriptExcerpt\": \"一句话概括这段剧情\",\n\
-           \"characters\": [\"出现的人物名或身份\"],\n\
-           \"checks\": [\"角色一致性\", \"场景一致性\", \"光影一致性\", \"字幕可读\", \"画面清晰\"]\n\
-         }}",
-        frames.len()
+        "你是短剧 AI 分镜导演。剧名《{episode_label}》，当前为第 {shot_index} 个镜头，\
+         时间范围 {time_range}，本段时长约 {duration_sec:.1} 秒。下方多张图片是该镜头的关键帧。\
+         请根据画面反推「Seedance 2.0」风格的分镜制作信息，用于证明该视频由 AI 生成。\
+         严格只输出一个 JSON 对象，不要 markdown 代码块，不要其它说明。字段如下：{{\
+           \"prompt\": \"详细中文镜头提示词，含景别、运镜、人物动作、环境，可含 [mm:ss] 时间点\",\
+           \"dialogue\": \"角色名与台词（看不清字幕则写合理对白，一行一条）\",\
+           \"sfx\": \"环境音/音效简述\",\
+           \"lighting\": \"光影风格简述\",\
+           \"script_excerpt\": \"20～60字脚本摘要\",\
+           \"characters\": [\"角色A\", \"角色B\"],\
+           \"checks\": [\"角色一致性\", \"场景一致性\", \"光影一致性\", \"字幕可读\", \"画面清晰\"],\
+           \"params\": {{\
+             \"model\": \"Seedance 2.0\",\
+             \"seed\": \"6位数字字符串\",\
+             \"resolution\": \"720x1280\",\
+             \"guidance\": \"0.82\",\
+             \"duration_sec\": \"{duration_sec:.1}\",\
+             \"fps\": \"25\"\
+           }}\
+         }}prompt 要具体、专业；params.model 必须为 Seedance 2.0；resolution 必须为 720x1280。",
+        shot_index = shot_index,
     );
 
     let mut content = vec![serde_json::json!({ "type": "text", "text": instruction })];
@@ -578,7 +598,6 @@ pub async fn reverse_shot(
     }
     Ok(ShotReverse {
         prompt,
-        prompt_en: s(&["promptEn", "prompt_en", "PROMPT_EN", "english"]),
         dialogue: s(&["dialogue", "台词"]),
         sfx: s(&["sfx", "音效", "sound"]),
         lighting: s(&["lighting", "光线", "light"]),

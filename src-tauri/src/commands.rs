@@ -2972,6 +2972,8 @@ pub async fn build_storyboard(
             &provider,
             &frames_of[i],
             &p.ep_label,
+            i + 1,
+            plans.len(),
             &tr,
             p.end - p.start,
         )
@@ -3013,7 +3015,6 @@ pub async fn build_storyboard(
                 "keyframes": frames_of[idx].iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
                 "data": {
                     "prompt": s.prompt,
-                    "promptEn": s.prompt_en,
                     "dialogue": s.dialogue,
                     "sfx": s.sfx,
                     "lighting": s.lighting,
@@ -3035,7 +3036,6 @@ pub async fn build_storyboard(
                 "shot_index": idx + 1,
                 "data": {
                     "prompt": s.prompt,
-                    "prompt_en": s.prompt_en,
                     "dialogue": s.dialogue,
                     "sfx": s.sfx,
                     "lighting": s.lighting,
