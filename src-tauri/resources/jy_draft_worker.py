@@ -170,6 +170,12 @@ def render(req):
         meta["draft_name"] = draft_name
         meta["draft_fold_path"] = draft_dir.replace("\\", "/")
         meta["draft_root_path"] = os.path.abspath(draft_root).replace("\\", "/")
+        # **`tm_duration` 必须填。**
+        #
+        # 剪映的草稿列表读这个字段显示时长，`pyJianYingDraft` 生成时是 0 ——
+        # 实测列表里显示「89.9M | 00:00」，点开才知道其实是 374 秒。
+        # 单位是**微秒**，和 `draft_content.json` 里的 `duration` 一样。
+        meta["tm_duration"] = total_us
         json.dump(meta, open(meta_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     except Exception:
         pass
