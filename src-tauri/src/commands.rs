@@ -2280,37 +2280,14 @@ pub async fn pipeline_start(
                     // 总比因为一次网络抖动就什么都出不来强。
                     match ai::rewrite_title_and_synopsis(&p, &drama.name, &drama.synopsis).await {
                         Ok((new_title, new_synopsis)) => {
-                            // 上一次的导出目录改成新名字，而不是再建一个。
-                            // 不这么做的话，AI 每次起新名 = 每跑一次多一个文件夹。
+                            // **每次跑都新建一个剧目录，旧的不动。**
                             //
-                            // **「上一次叫什么」以工程名为准，不是源剧名。**
-                            // 产出目录一直用的是**AI 起的剧名**，用源剧名去找
-                            // 永远匹配不上 —— 实测一个二创目录里堆了 4 个剧名文件夹。
-                            let old_dir = {
-                                let conn = lock_db(&state)?;
-                                match db::find_project_by_root(&conn, &drama.dir)? {
-                                    Some(proj) => {
-                                        out_root.join(pipeline::safe_drama_name(&proj.name))
-                                    }
-                                    None => out_root
-                                        .join(pipeline::safe_drama_name(&drama.name)),
-                                }
-                            };
-                            let new_dir = out_root.join(pipeline::safe_drama_name(&new_title));
-                            if old_dir.is_dir() && !new_dir.exists() && old_dir != new_dir {
-                                match std::fs::rename(&old_dir, &new_dir) {
-                                    Ok(_) => log_line(
-                                        &state,
-                                        "info",
-                                        "上一次的导出目录已改名为新剧名（不新建，避免越跑越多）",
-                                    ),
-                                    Err(e) => log_line(
-                                        &state,
-                                        "warn",
-                                        &format!("旧导出目录改名失败（不影响这次跑）：{e}"),
-                                    ),
-                                }
-                            }
+                            // 用户要的：AI 起了新剧名，就在「二创」下**新建**一个
+                            // 以新剧名命名的文件夹，**保留之前生成的，不覆盖任何东西**。
+                            //
+                            // 之前我做反了 —— 把上一次的目录改名成新剧名，
+                            // 结果旧产出被「搬走」、`jy\` 里几轮的草稿混在一起，
+                            // 看着像数据错乱。
 
                             log_line(
                                 &state,
