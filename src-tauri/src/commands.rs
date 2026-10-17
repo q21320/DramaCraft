@@ -209,9 +209,9 @@ pub async fn run_slice(
     let (input_path, plans, ffmpeg) = {
         let configured = lock_tools(&state)?.clone();
         let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let ffprobe = configured.ffprobe.clone();
         let conn = lock_db(&state)?;
         let target = db::get_media(&conn, media_id)?;
-        let plans = media::plan::build_plan(target.duration_ms, &mode);
         // 源文件的优先级：
         //
         // 1. **AI 去字幕产物**（`第N集_quzimu.mp4`）—— 真实软件就是切它
@@ -224,6 +224,19 @@ pub async fn run_slice(
             Some(p) if std::path::Path::new(&p).is_file() => p,
             _ => db::media_source_path(&conn, media_id)?,
         };
+
+        // **切片计划用量「实际时长」，不是数据库里记的那个。**
+        //
+        // 踩过：数据库记 81 秒，但 `quzimu` 实际只有 80 秒出头 ——
+        // 计划里的最后一片（80~81 秒）落在正文之外，ffmpeg 只写出一个
+        // **321 字节的空容器**。状态还是 ok、文件也在，下游读不出时长就崩。
+        //
+        // 探不出来就退回数据库的值（探测本身失败不该阻断切片）。
+        let actual_ms = media::probe(Path::new(&ffprobe), Path::new(&source))
+            .map(|p| p.duration_ms)
+            .unwrap_or(0);
+        let plan_ms = if actual_ms > 0 { actual_ms } else { target.duration_ms };
+        let plans = media::plan::build_plan(plan_ms, &mode);
         (source, plans, ffmpeg)
     };
 
