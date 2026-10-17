@@ -525,34 +525,6 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                 if clips.is_empty() {
                     continue;
                 }
-                // **抽原声轨。**
-                //
-                // 真实软件有「整轨原声」这一条 —— 音频单独一条轨，
-                // 音量、淡入淡出、和 BGM 的配比才能单独调。
-                //
-                // 抽完视频轨要静音（worker 里做的），否则声音翻倍。
-                let audio_dir = PathBuf::from(&p.draft_root).join("_音频");
-                let _ = std::fs::create_dir_all(&audio_dir);
-                let mut audios: Vec<String> = Vec::new();
-                for (i, clip) in clips.iter().enumerate() {
-                    let dst = audio_dir.join(format!("{label}_{:03}.m4a", i + 1));
-                    let ok = crate::proc::no_window(
-                        std::process::Command::new(&ffmpeg).args([
-                            "-hide_banner", "-loglevel", "error", "-y", "-i",
-                        ]),
-                    )
-                    .arg(clip)
-                    .args(["-vn", "-c:a", "aac", "-b:a", "192k"])
-                    .arg(&dst)
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                    audios.push(if ok && dst.is_file() {
-                        dst.to_string_lossy().to_string()
-                    } else {
-                        String::new()
-                    });
-                }
                 // 中间文件放进 `_字幕/`，别散在 jy 根目录下 ——
                 // 那里应该只有 4 个草稿文件夹，加一堆 .srt 显得很乱。
                 let srt_path = PathBuf::from(&p.draft_root)
@@ -576,7 +548,15 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                     "height": p.height,
                     "fps": p.fps,
                     "clips": clips,
-                    "audios": audios,
+                    // **不拆原声轨。**
+                    //
+                    // 原软件也不拆 —— 它的素材池里全是 `分镜NNN.mp4`，
+                    // 说明声音是**留在视频里**的。我先前多抽了一条 `.m4a`
+                    // 原声轨，结果素材池里全是音频文件、看不到分镜视频。
+                    //
+                    // 所以传空数组：worker 看到 audios 为空 → 视频轨不静音、
+                    // 不建原声轨。声音照常从视频里出。
+                    "audios": Vec::<String>::new(),
                     "durations_ms": durations_ms,
                     "srt": srt_arg,
                     "bgm": p.bgm,
