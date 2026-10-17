@@ -524,7 +524,10 @@ pub async fn reverse_shot(
         "temperature": 0.4,
         // 反推要发 5 张图，开着思维链更贵 —— 和 chat/describe 一样关掉。
         "thinking": { "type": "disabled" },
-        "max_tokens": 900,
+        // **900 不够。** 反推要返回 scene / 角色 / 动作 / checks / params
+        // 五六段结构，实测会被截断 —— 截断的 JSON 解析必然失败，
+        // 整个「分镜证明」就 0 产出。
+        "max_tokens": 1600,
     });
 
     let resp = client
@@ -541,8 +544,25 @@ pub async fn reverse_shot(
     }
     let raw = extract_chat_text(&text)?;
     let json_text = strip_code_fence(&raw);
-    let v: serde_json::Value = serde_json::from_str(&json_text)
-        .map_err(|e| AppError::Msg(format!("反推结果不是 JSON：{e}；原文：{}", tail(&raw, 200))))?;
+    // **先试整体解析，失败再抓最外层那对花括号重试。**
+    //
+    // 模型有时候会前缀一句「好的，这是反推结果：」或者尾部多一个句号，
+    // 整体解析过不了，但里面那段 JSON 其实是好的。
+    let v: serde_json::Value = match serde_json::from_str(&json_text) {
+        Ok(v) => v,
+        Err(first) => {
+            let inner = balanced_json(&json_text).unwrap_or_default();
+            match serde_json::from_str::<serde_json::Value>(&inner) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(AppError::Msg(format!(
+                        "反推结果不是 JSON：{first}；原文：{}",
+                        tail(&raw, 200)
+                    )))
+                }
+            }
+        }
+    };
 
     // **宽容取字段**：模型可能把 key 写成 `prompt` / `PROMPT` / `description`，
     // 也可能直接给个中文 key。挨个试一遍，别因为大小写就把整段丢掉。
@@ -615,6 +635,44 @@ pub async fn reverse_shot(
 }
 
 /// 去掉模型偶尔吐出来的 ```json 围栏。
+/// 从一段文字里抓出**最外层的平衡花括号块**。
+///
+/// 模型的回答常常是「好的，这是结果：{...}」或者「{...}。以上。」，
+/// `serde_json::from_str` 对这类前后带话的文本一律失败。
+/// 这个函数不管括号里是字符串还是转义，按深度数到配平为止。
+fn balanced_json(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let start = s.find('{')?;
+    let mut depth = 0i64;
+    let mut in_str = false;
+    let mut escaped = false;
+    for i in start..bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return s.get(start..=i).map(|x| x.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn strip_code_fence(raw: &str) -> String {
     let t = raw.trim();
     let t = t.strip_prefix("```json").or_else(|| t.strip_prefix("```")).unwrap_or(t);

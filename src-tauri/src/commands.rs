@@ -3004,17 +3004,30 @@ pub async fn build_storyboard(
             &tr,
             p.end - p.start,
         )
-        .await
-        .map_err(|e| {
-            AppError::Msg(format!(
-                "镜头{:02} 反推失败（{} {}）：{}",
-                i + 1,
-                p.ep_label,
-                tr,
-                crate::proc::tail(&e.to_string())
-            ))
-        })?;
-        shots.push(r);
+        .await;
+        match r {
+            Ok(r) => shots.push(r),
+            Err(e) => {
+                // **一个镜头失败不该让整块「分镜证明」归零。**
+                //
+                // 踩过：8 个镜头里第 2 个反推失败（模型返回的 JSON 被
+                // `max_tokens` 截断），整个步骤直接报错、0 张产出 ——
+                // 前面那个镜头白跑了，用户什么也没拿到。
+                //
+                // 跳过它，接着做后面的；最后在日志里说明少了几个。
+                log_line(
+                    &state,
+                    "warn",
+                    &format!(
+                        "镜头{:02} 反推失败，已跳过（{} {}）：{}",
+                        i + 1,
+                        p.ep_label,
+                        tr,
+                        crate::proc::tail(&e.to_string())
+                    ),
+                );
+            }
+        }
     }
 
     // ---------- ④ 每 2 镜头排 1 页 + 写 JSON ----------
