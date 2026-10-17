@@ -2849,9 +2849,10 @@ pub async fn build_storyboard(
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| AppError::Msg(format!("建不了输出目录：{e}")))?;
 
-    let (ffmpeg, provider, title, python) = {
+    let (ffmpeg, ffprobe, provider, title, python) = {
         let configured = lock_tools(&state)?.clone();
         let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        let ffprobe = configured.ffprobe.clone();
         let python = tools::require(&configured.python, "python")?;
         let conn = lock_db(&state)?;
         let provider = ai::usable_provider(&conn)?;
@@ -2868,7 +2869,7 @@ pub async fn build_storyboard(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "未命名".to_string());
-        (ffmpeg, provider, title, python)
+        (ffmpeg, ffprobe, provider, title, python)
     };
 
     // ---------- ① 定镜头：每集按 ~42 秒切，凑够 8 个 ----------
@@ -2891,7 +2892,21 @@ pub async fn build_storyboard(
             let conn = lock_db(&state)?;
             let media = db::get_media(&conn, *mid)?;
             let src = PathBuf::from(db::media_source_path(&conn, *mid)?);
-            (src, media.name.clone(), media.duration_ms as f64 / 1000.0)
+            // **时长要用实际文件的，不是数据库记的。**
+            //
+            // 踩过：数据库记 200 秒、实际去重产物只有 104.7 秒 ——
+            // 按数据库排出来的第 5 个镜头落在 170 秒之后，抽帧时
+            // `-ss 170` 早就越过文件末尾，ffmpeg 直接失败，
+            // 整个「分镜证明」0 产出。
+            let actual = crate::media::probe(std::path::Path::new(&ffprobe), &src)
+                .map(|m| m.duration_ms as f64 / 1000.0)
+                .unwrap_or(0.0);
+            let d = if actual > 0.0 {
+                actual
+            } else {
+                media.duration_ms as f64 / 1000.0
+            };
+            (src, media.name.clone(), d)
         };
         if !source.is_file() || dur <= 1.0 {
             continue;

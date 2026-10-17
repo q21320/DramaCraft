@@ -200,34 +200,49 @@ def render(req):
     if not date:
         date = "年    月    日"
 
-    # 公章叠在「报审机构」右侧偏上
+    line_x = W - margin - 620
+    org_line = f"报审机构：{org}"
+    d.text((line_x, seal_y), org_line, font=f_body, fill=(0, 0, 0))
+
+    # **公章盖在「报审机构」这一行的右侧空白处。**
+    #
+    # 踩过：之前按固定 x 贴，结果章压在「许昌简耀科技有限公司」上面，
+    # 公司名被糊掉。真实的盖章件是**章盖在公司名右边**的空白处、
+    # 略微压住落款行 —— 所以按文字实际宽度算位置。
     seal_path = (req.get("seal_path") or "").strip()
     if seal_path and os.path.isfile(seal_path):
         try:
             seal = Image.open(seal_path).convert("RGBA")
-            size = 300
-            seal.thumbnail((size, size))
-            img.paste(seal, (W - margin - 420, seal_y - 60), seal)
+            seal.thumbnail((300, 300))
+            org_w = d.textlength(org_line, font=f_body)
+            sx = int(line_x + org_w + 24)
+            sy = int(seal_y - seal.size[1] * 0.45)
+            # 别贴出纸外
+            sx = min(sx, W - margin - seal.size[0])
+            sy = max(sy, 0)
+            img.paste(seal, (sx, sy), seal)
         except Exception:
             pass
-
-    line_x = W - margin - 620
-    d.text((line_x, seal_y), f"报审机构：{org}", font=f_body, fill=(0, 0, 0))
 
     sign_y = seal_y + 110
     d.text((line_x, sign_y), "法定代表人或总编辑：", font=f_body, fill=(0, 0, 0))
     sign_path = (req.get("sign_path") or "").strip()
-    if legal:
-        lw = d.textlength("法定代表人或总编辑：", font=f_body)
-        d.text((line_x + lw, sign_y), legal, font=f_body, fill=(0, 0, 0))
-    elif sign_path and os.path.isfile(sign_path):
+    # **签名优先用图片。**
+    #
+    # 踩过：先判断 `legal` 有没有字，有就打字、不打图 —— 结果传了签名图也
+    # 只显示印刷体名字，看着一眼假。手写签名是图片，不是文字。
+    lw = d.textlength("法定代表人或总编辑：", font=f_body)
+    pasted = False
+    if sign_path and os.path.isfile(sign_path):
         try:
             sign = Image.open(sign_path).convert("RGBA")
-            sign.thumbnail((260, 110))
-            d.textlength("法定代表人或总编辑：", font=f_body)
-            img.paste(sign, (line_x + 300, sign_y - 30), sign)
+            sign.thumbnail((240, 100))
+            img.paste(sign, (int(line_x + lw + 6), int(sign_y - 26)), sign)
+            pasted = True
         except Exception:
-            pass
+            pasted = False
+    if not pasted and legal:
+        d.text((line_x + lw, sign_y), legal, font=f_body, fill=(0, 0, 0))
 
     date_y = sign_y + 120
     dw = d.textlength(date, font=f_body)
