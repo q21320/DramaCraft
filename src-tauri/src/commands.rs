@@ -279,7 +279,9 @@ pub async fn run_slice(
                 let stem = if prefix_task.is_empty() {
                     format!("{:03}", plan.index)
                 } else {
-                    format!("{}_{:03}", prefix_task, plan.index)
+                    // **前缀和编号之间不加下划线** —— 真实软件是 `Flova AI_分镜001`，
+                // 不是 `Flova AI_分镜_001`。下划线已经在 prefix 里了。
+                format!("{}{:03}", prefix_task, plan.index)
                 };
                 let out_path = out_task.join(format!("{stem}.mp4"));
                 match media::slice(&ffmpeg_task, Path::new(&input_task), &out_path, plan, compatible) {

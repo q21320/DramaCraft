@@ -1231,7 +1231,12 @@ pub fn stage_payload(
             "outDir": out_dir.join("qiepian").join(group).to_string_lossy(),
             // 前缀用中性的「分镜」。真实软件写的是「Flova AI_分镜」——
             // 那是它自己配套工具的名字，照抄进用户的产出里不合适。
-            "prefix": "分镜",
+            // **切片文件名照真实软件的格式**：`Flova AI_分镜001.mp4`。
+            //
+            // 用户明确要求这个格式（原软件就是这么命名的）。我之前用的中性
+            // 「分镜」—— 那个更干净，但用户要的是「和原视频生成文件名格式一样」。
+            // 这是他的产出、他的选择。
+            "prefix": "Flova AI_分镜",
             // **切 AI 去字幕的产物，不是去重产物。**
             //
             // 真实软件日志：「视频切片（流水线 · AI去字幕结果）」。去重产物是
@@ -2082,8 +2087,9 @@ mod tests {
         );
 
         // **唯一性靠目录，不靠文件名** —— 一源一文件夹，每集都从 001 开始编号。
-        assert_eq!(pa["prefix"], "分镜");
-        assert_eq!(pb["prefix"], "分镜");
+        // 真实软件的文件名格式：`Flova AI_分镜001.mp4`
+        assert_eq!(pa["prefix"], "Flova AI_分镜");
+        assert_eq!(pb["prefix"], "Flova AI_分镜");
         // 覆盖与否的关键是目录不同 —— 上面已经断言过 outDir 不相等
     }
 

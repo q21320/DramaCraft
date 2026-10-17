@@ -397,7 +397,7 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         // 一个草稿塞 40 片是错的：那是「整部剧」，不是「一集」。
         "draft" => {
             let p: DraftPayload = parse_payload(job)?;
-            let (python, ffmpeg) = {
+            let (python, _ffmpeg) = {
                 let configured = crate::commands::lock_tools(&state)?;
                 (
                     crate::tools::require(&configured.python, "python")?,
