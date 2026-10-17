@@ -116,8 +116,14 @@ def wrap_cjk(draw, text, font, max_w, max_lines=None):
             else:
                 line = trial
             i = j
-    if line:
-        lines.append(line)
+        # **收尾这一句必须在循环里。**
+        #
+        # 原来它被顶格写在 `for` 外面，于是文本为空时（`"".split("\n")`
+        # 得到 `[""]`，循环体全走 `continue`）`line` 一次都没赋值 ——
+        # 直接 `UnboundLocalError: cannot access local variable 'line'`。
+        # 真实跑分镜证明时就是这么崩的：某个镜头 AI 没返回 `prompt`。
+        if line:
+            lines.append(line)
     if max_lines and len(lines) > max_lines:
         lines = lines[:max_lines]
         if lines:

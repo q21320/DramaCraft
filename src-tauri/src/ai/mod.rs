@@ -524,14 +524,34 @@ pub async fn reverse_shot(
     let v: serde_json::Value = serde_json::from_str(&json_text)
         .map_err(|e| AppError::Msg(format!("反推结果不是 JSON：{e}；原文：{}", tail(&raw, 200))))?;
 
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    // **宽容取字段**：模型可能把 key 写成 `prompt` / `PROMPT` / `description`，
+    // 也可能直接给个中文 key。挨个试一遍，别因为大小写就把整段丢掉。
+    let s = |keys: &[&str]| {
+        for k in keys {
+            if let Some(x) = v.get(*k).and_then(|x| x.as_str()) {
+                let x = x.trim();
+                if !x.is_empty() {
+                    return x.to_string();
+                }
+            }
+        }
+        String::new()
+    };
     let arr = |k: &str| {
         v.get(k)
             .and_then(|x| x.as_array())
             .map(|a| a.iter().filter_map(|i| i.as_str().map(|s| s.to_string())).collect())
             .unwrap_or_default()
     };
-    let mut checks: Vec<String> = arr("checks");
+    // 数组字段同样宽容
+    let mut checks: Vec<String> = {
+        let a: Vec<String> = arr("checks");
+        if a.is_empty() {
+            arr("校验")
+        } else {
+            a
+        }
+    };
     if checks.is_empty() {
         checks = vec![
             "角色一致性".into(),
@@ -542,13 +562,27 @@ pub async fn reverse_shot(
         ];
     }
 
+    // **prompt 为空就直接报错，并把模型原文带上。**
+    //
+    // 踩过：模型返回了合法 JSON 但字段名不对，`prompt` 取到空串 →
+    // 一路传到渲染器，最后报个 `UnboundLocalError`（渲染器那边的空文本 bug）。
+    // 那种报错完全看不出根因在模型输出上。
+    //
+    // **在源头就拦住，并把原文贴出来** —— 下次一看就知道模型说了什么。
+    let prompt = s(&["prompt", "PROMPT", "description", "画面描述", "描述"]);
+    if prompt.is_empty() {
+        return Err(AppError::Msg(format!(
+            "分镜反推没拿到画面描述（可能是模型没按 JSON 输出）。模型原文：{}",
+            tail(&raw, 300)
+        )));
+    }
     Ok(ShotReverse {
-        prompt: s("prompt"),
-        prompt_en: s("promptEn"),
-        dialogue: s("dialogue"),
-        sfx: s("sfx"),
-        lighting: s("lighting"),
-        script_excerpt: s("scriptExcerpt"),
+        prompt,
+        prompt_en: s(&["promptEn", "prompt_en", "PROMPT_EN", "english"]),
+        dialogue: s(&["dialogue", "台词"]),
+        sfx: s(&["sfx", "音效", "sound"]),
+        lighting: s(&["lighting", "光线", "light"]),
+        script_excerpt: s(&["scriptExcerpt", "script_excerpt", "剧本摘要", "摘要"]),
         characters: arr("characters"),
         checks,
         model: provider.text_model.trim().to_string(),
