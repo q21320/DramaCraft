@@ -103,10 +103,18 @@ pub fn open_with_system(path: &Path) -> AppResult<()> {
 pub fn reveal_in_explorer(path: &Path) -> AppResult<()> {
     #[cfg(windows)]
     {
-        // /select, 后面紧跟路径，中间不能有空格
+        // **路径必须用引号包起来。**
+        //
+        // 踩过：`explorer /select,D:\a b\c.mp4` 或路径里带逗号、全角标点时，
+        // explorer 解析不了这个参数，于是**退回打开「文档」文件夹** ——
+        // 用户点「打开文件夹」看到的是文档目录，还以为程序坏了。
+        //
+        // Rust 的 `arg()` 会按它自己的规则转义，而 explorer 只认
+        // 「/select,"完整路径"」这种原始形式，所以用 `raw_arg` 原样传。
+        use std::os::windows::process::CommandExt as _;
         let mut cmd = Command::new("explorer");
         no_window(&mut cmd);
-        cmd.arg(format!("/select,{}", path.to_string_lossy()));
+        cmd.raw_arg(format!("/select,\"{}\"", path.to_string_lossy()));
         // explorer 选中成功也常返回非 0，所以不看退出码
         cmd.spawn()
             .map_err(|e| AppError::Msg(format!("打不开资源管理器：{e}")))?;
