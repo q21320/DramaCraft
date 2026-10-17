@@ -753,10 +753,10 @@ pub fn start_pipeline(
                     Some(payload) => {
                         // 成本报告的落款（机构/法人/公章/签名）来自**设置**，
                         // 一次配好每部剧都用；生成时那几项是空的，在这里补。
-                        let payload = if stage == "cost" {
-                            with_cost_stamp(conn, payload)
-                        } else {
-                            payload
+                        let payload = match stage.as_str() {
+                            "cost" => with_cost_stamp(conn, payload),
+                            "draft" => with_draft_audio(conn, payload),
+                            _ => payload,
                         };
                         crate::db::enqueue_job_for(
                             conn,
@@ -1052,6 +1052,47 @@ pub const DESUBTITLE_EPISODES: usize = 4;
 pub const COST_INVEST_WAN: f64 = 1.0;
 /// 演员总片酬占比（%）。表单要求 ＜40%。
 pub const COST_ACTOR_RATIO: f64 = 30.0;
+
+/// 剪映草稿的 BGM 来自**设置** —— 一次配好，每部剧都用。
+///
+/// 真实软件也是这么做的：它有个「音乐库」，要用户自己放音乐文件进去，
+/// 然后随机抽（二进制里那句话：「u请提供两段背景音乐文件」）。
+/// 所以 BGM 不是从视频里提的，是外部的。
+///
+/// 读不出来就保持空 —— 草稿照样出，只是没有 BGM 轨。
+pub fn with_draft_audio(conn: &rusqlite::Connection, payload: String) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&payload) else {
+        return payload;
+    };
+    let Ok(Some(raw)) = crate::db::get_setting(conn, "ui.draft.audio") else {
+        return payload;
+    };
+    let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return payload;
+    };
+    let bgm = cfg
+        .get("bgmPath")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // 文件不在就当没配 —— 否则草稿里会引用一个坏路径
+    let bgm = if std::path::Path::new(&bgm).is_file() {
+        bgm
+    } else {
+        String::new()
+    };
+    let vol = cfg
+        .get("bgmVolume")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.35)
+        .clamp(0.0, 1.0);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("bgm".into(), serde_json::json!(bgm));
+        obj.insert("bgmVolume".into(), serde_json::json!(vol));
+    }
+    v.to_string()
+}
 
 /// 成本报告的落款（报审机构 / 法人 / 公章 / 签名）来自**设置**，
 /// 一次配好每部剧都用 —— 放在流水线页的话，每跑一部都要重填。

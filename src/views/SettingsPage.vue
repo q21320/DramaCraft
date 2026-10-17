@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { NAlert, NButton, NInput, NSelect, NSpace, NTag, useMessage } from "naive-ui";
+import { NAlert, NButton, NInput, NInputNumber, NSelect, NSpace, NTag, useMessage } from "naive-ui";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/api";
 import { useAppStore } from "@/stores/app";
@@ -25,6 +25,45 @@ const cloudResult = ref<CloudTestResult | null>(null);
 const COST_KEY = "cost.report";
 const costForm = ref({ org: "", legalPerson: "", sealPath: "", signPath: "" });
 const costSaving = ref(false);
+
+// 剪映草稿的 BGM。存在 `ui.draft.audio` 里，和成本落款一样走 ui 状态 KV。
+const DRAFT_AUDIO_KEY = "draft.audio";
+const draftAudio = ref<{ bgmPath: string; bgmVolume: number }>({ bgmPath: "", bgmVolume: 0.35 });
+const draftAudioSaving = ref(false);
+
+async function loadDraftAudio() {
+  try {
+    const raw = await api.loadUiState(DRAFT_AUDIO_KEY);
+    if (!raw) return;
+    const v = JSON.parse(raw) as Partial<typeof draftAudio.value>;
+    draftAudio.value = {
+      bgmPath: v.bgmPath ?? "",
+      bgmVolume: typeof v.bgmVolume === "number" ? v.bgmVolume : 0.35,
+    };
+  } catch {
+    // 读不出来当没配过
+  }
+}
+
+async function saveDraftAudio() {
+  draftAudioSaving.value = true;
+  try {
+    await api.saveUiState(DRAFT_AUDIO_KEY, JSON.stringify(draftAudio.value));
+    message.success("剪映草稿音频已保存");
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    draftAudioSaving.value = false;
+  }
+}
+
+async function pickBgm() {
+  const picked = await open({
+    multiple: false,
+    filters: [{ name: "音频", extensions: ["mp3", "wav", "m4a", "aac", "flac"] }],
+  });
+  if (typeof picked === "string") draftAudio.value.bgmPath = picked;
+}
 
 async function loadCostForm() {
   try {
@@ -143,6 +182,7 @@ onMounted(() => {
   syncCloudForm();
   // 成本报告落款：一次配好，每部剧都用
   void loadCostForm();
+  void loadDraftAudio();
 });
 </script>
 
@@ -313,6 +353,35 @@ pip install pyJianYingDraft         # 剪映草稿导出</pre>
         <li v-for="(w, i) in store.cloud.warnings" :key="i" class="dd-wrap">{{ w }}</li>
       </ul>
     </n-alert>
+  </div>
+
+  <!--
+    BGM 是一次配好、每部剧都用的东西。真实软件也是这么做的 ——
+    它有个「音乐库」，要用户自己放音乐文件进去，然后随机抽。
+  -->
+  <div class="dd-card">
+    <div class="dd-card-title">剪映草稿音频</div>
+    <div class="dd-card-desc">
+      生成剪映草稿时铺在 BGM 轨上的音乐。<b>不填也能出草稿</b>，
+      只是没有 BGM 轨（切片自带的对白和音效还在）。
+      支持 mp3 / wav / m4a。
+    </div>
+
+    <div class="dd-row" style="margin-bottom: 10px">
+      <span class="dd-muted" style="width: 90px">BGM 文件</span>
+      <n-input v-model:value="draftAudio.bgmPath" size="small" style="width: 420px" placeholder="留空则不加 BGM 轨" />
+      <n-button size="small" @click="pickBgm">选择</n-button>
+    </div>
+
+    <div class="dd-row" style="margin-bottom: 14px">
+      <span class="dd-muted" style="width: 90px">BGM 音量</span>
+      <n-input-number v-model:value="draftAudio.bgmVolume" size="small" :min="0" :max="1" :step="0.05" style="width: 120px" />
+      <span class="dd-muted" style="margin-left: 8px; font-size: 12px">0~1，默认 0.35（别盖过对白）</span>
+    </div>
+
+    <n-space>
+      <n-button size="small" type="primary" :loading="draftAudioSaving" @click="saveDraftAudio">保存</n-button>
+    </n-space>
   </div>
 
   <!--
