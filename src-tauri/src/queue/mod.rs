@@ -391,21 +391,27 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                 Ok(report.note)
             }
         }
-        // **剪映草稿**：切片排好 + 字幕打成 SRT 塞进去。
+        // **剪映草稿：一集一个。**
         //
-        // 草稿引用切片的**绝对路径**（剪映的惯例，素材不复制进草稿）。
-        // **剪映草稿**：切片排好 + 字幕打成 SRT 塞进去。
-        //
-        // 草稿引用切片的**绝对路径**（剪映的惯例，素材不复制进草稿）。
+        // 真实软件就是这么做的 —— 4 集出 4 个草稿、4 张工程图。
+        // 一个草稿塞 40 片是错的：那是「整部剧」，不是「一集」。
         "draft" => {
             let p: DraftPayload = parse_payload(job)?;
-            let mut clips: Vec<String> = Vec::new();
-            let mut srt_lines: Vec<String> = Vec::new();
-            let mut timeline_ms: i64 = 0i64;
-            let mut cue_no = 0usize;
-            {
-                let conn = crate::commands::lock_db(&state)?;
-                for mid in &p.media_ids {
+            let python = {
+                let configured = crate::commands::lock_tools(&state)?;
+                crate::tools::require(&configured.python, "python")?
+            };
+            let worker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join("jy_draft_worker.py");
+            let mut made = 0i64;
+            let mut cues_total = 0usize;
+            let mut notes: Vec<String> = Vec::new();
+
+            for mid in &p.media_ids {
+                let (clips, srt_lines, label) = {
+                    let conn = crate::commands::lock_db(&state)?;
+                    let media = db::get_media(&conn, *mid)?;
                     let mut segs = db::list_segments(&conn, *mid)?;
                     segs.retain(|s| {
                         s.status == "ok" && std::path::Path::new(&s.out_path).is_file()
@@ -415,80 +421,100 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                         continue;
                     }
                     let cues = db::list_cues(&conn, *mid)?;
+                    let mut clips: Vec<String> = Vec::new();
+                    let mut srt: Vec<String> = Vec::new();
+                    let mut timeline: i64 = 0;
+                    let mut no = 0usize;
+                    // 这一集内部的字幕：cue 记的是本集时间，切片是本集的连续片段，
+                    // 所以按「已累计时长 + (cue - 本片源起点)」搬到时间轴上。
                     for seg in &segs {
                         clips.push(seg.out_path.clone());
-                        // **字幕要挪到拼接后的时间轴。**
-                        //
-                        // 切片是把若干集的 10 秒片段顺序拼起来的，而 cue 记的是
-                        // **原集时间**。不换算的话字幕会全挤在开头、错开几十秒。
-                        // 换算：时间轴位置 = 已累计时长 + (cue 起点 - 这一片的源起点)
                         for c in cues
                             .iter()
                             .filter(|c| c.start_ms >= seg.start_ms && c.start_ms < seg.end_ms)
                         {
-                            let at = timeline_ms + (c.start_ms - seg.start_ms);
+                            let at = timeline + (c.start_ms - seg.start_ms);
                             let dur = (c.end_ms - c.start_ms).clamp(300, 8_000);
-                            cue_no += 1;
-                            srt_lines.push(format!(
+                            no += 1;
+                            srt.push(format!(
                                 "{}\n{} --> {}\n{}\n",
-                                cue_no,
+                                no,
                                 srt_time(at),
                                 srt_time(at + dur),
                                 c.text.trim().replace('\n', " ")
                             ));
                         }
-                        timeline_ms += seg.end_ms - seg.start_ms;
+                        timeline += seg.end_ms - seg.start_ms;
                     }
+                    // 剧集标签：`借车之后-第01集`
+                    let ep = media.name.trim().to_string();
+                    let label = if ep.is_empty() {
+                        p.draft_name.clone()
+                    } else {
+                        format!("{}-{}", p.draft_name, ep)
+                    };
+                    (clips, srt, label)
+                };
+                if clips.is_empty() {
+                    continue;
                 }
-            }
-            if clips.is_empty() {
-                return Err(AppError::Msg(
-                    "没有切片可以做草稿 —— 先跑「视频切片」".into(),
-                ));
-            }
-            let srt_path = PathBuf::from(&p.draft_root).join("_字幕.srt");
-            if !srt_lines.is_empty() {
-                if let Some(dir) = srt_path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
+                let srt_path = PathBuf::from(&p.draft_root).join(format!("_{label}.srt"));
+                let srt_arg = if srt_lines.is_empty() {
+                    String::new()
+                } else {
+                    if let Some(dir) = srt_path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    std::fs::write(&srt_path, srt_lines.concat())
+                        .map_err(|e| AppError::Msg(format!("写不了 SRT：{e}")))?;
+                    cues_total += srt_lines.len();
+                    srt_path.to_string_lossy().to_string()
+                };
+                let req = serde_json::json!({
+                    "draft_root": p.draft_root,
+                    "draft_name": label,
+                    "width": p.width,
+                    "height": p.height,
+                    "fps": p.fps,
+                    "clips": clips,
+                    "srt": srt_arg,
+                    "bgm": p.bgm,
+                    "bgm_volume": p.bgm_volume,
+                });
+                let value = crate::proc::run_json_worker(
+                    &python,
+                    &worker,
+                    &req,
+                    std::time::Duration::from_secs(180),
+                )?;
+                if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                    let msg = value
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("未知错误");
+                    notes.push(format!("{label}：{msg}"));
+                    continue;
                 }
-                std::fs::write(&srt_path, srt_lines.concat())
-                    .map_err(|e| AppError::Msg(format!("写不了 SRT：{e}")))?;
+                made += 1;
             }
-            let python = {
-                let configured = crate::commands::lock_tools(&state)?;
-                crate::tools::require(&configured.python, "python")?
-            };
-            let worker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("resources")
-                .join("jy_draft_worker.py");
-            let req = serde_json::json!({
-                "draft_root": p.draft_root,
-                "draft_name": p.draft_name,
-                "width": p.width,
-                "height": p.height,
-                "fps": p.fps,
-                "clips": clips,
-                "srt": if srt_lines.is_empty() { String::new() } else { srt_path.to_string_lossy().to_string() },
-                "bgm": p.bgm,
-                "bgm_volume": p.bgm_volume,
-            });
-            let value = crate::proc::run_json_worker(
-                &python,
-                &worker,
-                &req,
-                std::time::Duration::from_secs(180),
-            )?;
-            if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                let msg = value
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("未知错误");
-                return Err(AppError::Msg(format!("剪映草稿生成失败：{msg}")));
+
+            if made == 0 {
+                return Err(AppError::Msg(format!(
+                    "一个草稿都没生成 —— 先跑「视频切片」{}",
+                    if notes.is_empty() {
+                        String::new()
+                    } else {
+                        format!("（{}）", notes.join("；"))
+                    }
+                )));
             }
             Ok(format!(
-                "剪映草稿已生成（{} 个切片，字幕 {} 条）",
-                value.get("clips").and_then(|v| v.as_i64()).unwrap_or(0),
-                cue_no
+                "剪映草稿已生成 {made} 个（一集一个，字幕共 {cues_total} 条）{}",
+                if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!("｜失败 {} 个", notes.len())
+                }
             ))
         }
         // 成本报告：出「成本配置比例情况报告」。
