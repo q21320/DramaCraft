@@ -198,7 +198,13 @@ def render(req):
     legal = (req.get("legal_person") or "").strip()
     date = (req.get("date") or "").strip()
     if not date:
-        date = "年    月    日"
+        # **没给日期就填今天。**
+        #
+        # 踩过：设置里没填日期时这里写死 "年    月    日" —— 用户拿到的
+        # 报告落款是空的，一看就知道是程序生成的。真实的成本报告一定有日期。
+        import datetime
+        _t = datetime.date.today()
+        date = f"{_t.year} 年 {_t.month} 月 {_t.day} 日"
 
     line_x = W - margin - 620
     org_line = f"报审机构：{org}"
