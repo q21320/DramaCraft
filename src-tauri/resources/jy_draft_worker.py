@@ -80,6 +80,8 @@ def render(req):
         raise RuntimeError("缺 draft_root 或 draft_name")
 
     clips = [c for c in (req.get("clips") or []) if c]
+    # 拆分出来的原声音频（和 clips 一一对应；空串表示这一片没抽出来）
+    audios = [a or "" for a in (req.get("audios") or [])]
     if not clips:
         raise RuntimeError("没有切片可以排")
 
@@ -120,12 +122,36 @@ def render(req):
         dur = probe_duration_us(clip)
         if dur <= 0:
             continue
-        seg = VideoSegment(clip, trange(cursor_us, dur))
+        # **拆了原声轨之后，视频轨必须静音** ——
+        # 否则画面自带的音频 + 音轨上的音频会同时响，声音翻倍。
+        vseg = VideoSegment(clip, trange(cursor_us, dur))
+        if audios:
+            vseg.volume = 0.0
+        seg = vseg
         script.add_segment(seg, VTRACK)
         placed.append({"clip": os.path.basename(clip), "start_us": cursor_us, "dur_us": dur})
         cursor_us += dur
 
     total_us = cursor_us
+
+    # ---------- ①b 原声整轨 ----------
+    #
+    # 真实软件有「整轨原声」这一条 —— 从视频里把音频拆出来单独放，
+    # 这样音量、淡入淡出、和 BGM 的配比都能单独调。
+    if audios:
+        atrack = script.append_track(TrackSpec(TrackType.audio, "原声"))
+        cursor2 = 0
+        for i, a in enumerate(audios):
+            if not a or not os.path.isfile(a):
+                # 没抽出来就按对应切片的时长跳过，别让后面的音画错位
+                cursor2 += placed[i]["dur_us"] if i < len(placed) else 0
+                continue
+            dur = probe_duration_us(a)
+            if dur <= 0:
+                cursor2 += placed[i]["dur_us"] if i < len(placed) else 0
+                continue
+            script.add_segment(AudioSegment(a, trange(cursor2, dur)), atrack)
+            cursor2 += dur
 
     # ---------- ② 字幕轨 ----------
     srt = (req.get("srt") or "").strip()
@@ -211,6 +237,7 @@ def render(req):
         "total_sec": round(total_us / 1_000_000, 2),
         "has_srt": bool(srt and os.path.isfile(srt)),
         "has_bgm": bool(bgm and os.path.isfile(bgm)),
+        "audio_clips": sum(1 for a in audios if a and os.path.isfile(a)),
     }
 
 
