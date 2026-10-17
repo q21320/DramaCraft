@@ -2128,7 +2128,7 @@ pub fn pipeline_scan(root: String) -> AppResult<SourceScan> {
     pipeline::scan_source(Path::new(root))
 }
 
-/// 默认导出目录：源目录旁边加「二创」，不污染原素材。
+/// 默认导出目录：**源目录里面的 `<源目录名>二创`**，一部剧的东西放在一个文件夹里。
 #[tauri::command]
 pub fn pipeline_default_out_dir(root: String) -> AppResult<String> {
     if root.trim().is_empty() {
@@ -2246,7 +2246,20 @@ pub async fn pipeline_start(
                         Ok((new_title, new_synopsis)) => {
                             // 上一次的导出目录改成新名字，而不是再建一个。
                             // 不这么做的话，AI 每次起新名 = 每跑一次多一个文件夹。
-                            let old_dir = out_root.join(pipeline::safe_drama_name(&drama.name));
+                            //
+                            // **「上一次叫什么」以工程名为准，不是源剧名。**
+                            // 产出目录一直用的是**AI 起的剧名**，用源剧名去找
+                            // 永远匹配不上 —— 实测一个二创目录里堆了 4 个剧名文件夹。
+                            let old_dir = {
+                                let conn = lock_db(&state)?;
+                                match db::find_project_by_root(&conn, &drama.dir)? {
+                                    Some(proj) => {
+                                        out_root.join(pipeline::safe_drama_name(&proj.name))
+                                    }
+                                    None => out_root
+                                        .join(pipeline::safe_drama_name(&drama.name)),
+                                }
+                            };
                             let new_dir = out_root.join(pipeline::safe_drama_name(&new_title));
                             if old_dir.is_dir() && !new_dir.exists() && old_dir != new_dir {
                                 match std::fs::rename(&old_dir, &new_dir) {

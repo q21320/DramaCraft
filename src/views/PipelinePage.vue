@@ -41,16 +41,13 @@ const willRewrite = computed(() => picked.value.includes("rewrite"));
 
 
 const root = ref("");
-/** 导出目录：**界面上不再给改**，固定是源目录里面的 `<源目录名>二创`。
- *  还留着这个 ref 是因为保存/恢复表单状态时它是个字段，删了要改序列化。 */
-const outDir = ref("");
 
 /**
  * 实际会导出到哪 —— 和后端 `pipeline::default_out_dir` 一个规则：
  * 源目录旁边建一个「二创」。留空时就把这个算出来给用户看，
  * 免得他到处找产出。
  *
- * 注意**必须声明在 root / outDir 之后**：写在前面虽然因为 computed 是
+ * 注意**必须声明在 root 之后**：写在前面虽然因为 computed 是
  * 延迟求值而侥幸能用，但那是踩在暂时性死区的边上，没必要。
  */
 const effectiveOutDir = computed(() => {
@@ -152,11 +149,6 @@ async function pickRoot() {
   if (typeof p !== "string") return;
   root.value = p;
   scan.value = null;
-  try {
-    outDir.value = await api.pipelineDefaultOutDir(p);
-  } catch {
-    outDir.value = "";
-  }
 }
 
 
@@ -210,7 +202,9 @@ async function start() {
 
     const run = await api.pipelineStart(
       root.value.trim(),
-      outDir.value.trim(),
+      // **永远传空** —— 导出位置是设计决定，不再给用户改。
+      // 传空后端就用 `default_out_dir`：`<源目录>/<源目录名>二创`。
+      "",
       picked.value,
       sliceSeconds.value,
       model.value,
@@ -279,7 +273,6 @@ const UI_KEY = "pipeline.form";
 
 type UiForm = {
   root: string;
-  outDir: string;
   picked: string[];
   sliceSeconds: number;
   model: string;
@@ -293,7 +286,6 @@ type UiForm = {
 function snapshot(): UiForm {
   return {
     root: root.value,
-    outDir: outDir.value,
     picked: [...picked.value],
     sliceSeconds: sliceSeconds.value,
     model: model.value,
@@ -312,7 +304,6 @@ async function loadForm(): Promise<boolean> {
     if (!raw) return false;
     const f = JSON.parse(raw) as Partial<UiForm>;
     if (typeof f.root === "string") root.value = f.root;
-    if (typeof f.outDir === "string") outDir.value = f.outDir;
     if (Array.isArray(f.picked)) picked.value = f.picked;
     if (typeof f.sliceSeconds === "number") sliceSeconds.value = f.sliceSeconds;
     if (typeof f.model === "string") model.value = f.model;
@@ -362,7 +353,7 @@ onMounted(async () => {
   }
   // 任何一项变了就记下来
   watch(
-    [root, outDir, picked, sliceSeconds, model, labelEnabled, labelText, labelSeconds, labelPosition, labelAlways],
+    [root, picked, sliceSeconds, model, labelEnabled, labelText, labelSeconds, labelPosition, labelAlways],
     () => scheduleSave(),
     { deep: true },
   );

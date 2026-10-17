@@ -343,6 +343,16 @@ pub fn get_setting(conn: &Connection, key: &str) -> AppResult<Option<String>> {
 
 // ---------- project ----------
 
+/// 改工程名。
+///
+/// **必须在「AI 起了新剧名」之后调用** —— 工程名就是「上一次的产出目录名」，
+/// 不改的话下次跑找不到要改名的旧目录，产出文件夹就会一次多一个。
+/// 实测踩过：一个二创目录里堆了 4 个剧名文件夹（家庭首付的拉扯 / 姜南星的接亲车
+/// / 借车之后 / 首付车与亲情的边界）。
+pub fn rename_project(conn: &Connection, id: i64, name: &str) -> AppResult<()> {
+    conn.execute("UPDATE project SET name = ?2 WHERE id = ?1", params![id, name])?;
+    Ok(())
+}
 pub fn create_project(conn: &Connection, name: &str, root_dir: &str) -> AppResult<Project> {
     let created_at = now();
     conn.execute(

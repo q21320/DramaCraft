@@ -574,6 +574,14 @@ pub fn start_pipeline(
         let project = match crate::db::find_project_by_root(conn, &drama.dir)? {
             Some(existing) => {
                 reused_projects += 1;
+                // **工程名跟着剧名走。**
+                //
+                // 工程名记的是「上一次的产出目录叫什么」—— 改名逻辑靠它
+                // 找旧目录。不更新的话，下次跑又找不到旧目录，
+                // 每跑一次就在二创目录里多堆一个剧名文件夹。
+                if existing.name != display_name {
+                    crate::db::rename_project(conn, existing.id, &display_name)?;
+                }
                 // 复用的工程可能积着历史残留 —— 源目录内容换过之后，
                 // 旧素材记录一直在，界面上会显示成"68 集"（实际只有 6 集）。
                 // 只清**原片真的不在了**的那些，有任务在跑的也不动。
