@@ -409,6 +409,37 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
             let mut notes: Vec<String> = Vec::new();
 
             for mid in &p.media_ids {
+                // **没字幕就先跑一遍本地 ASR。**
+                //
+                // 草稿的字幕轨来自 `cue` 表，而 `cue` 只有跑过「语音转字幕」才有。
+                // 用户勾了剪映草稿却没跑 ASR，字幕轨就是空的（实测「字幕 0 条」）。
+                //
+                // 这里**自动补跑**，用内置的 small 模型、中文。已经有字幕就不动
+                // （`overwrite=false`），避免把用户手工改过的字幕冲掉。
+                {
+                    let has_cues = {
+                        let conn = crate::commands::lock_db(&state)?;
+                        !db::list_cues(&conn, *mid)?.is_empty()
+                    };
+                    if !has_cues {
+                        match commands::asr_transcribe(
+                            app.clone(),
+                            state.clone(),
+                            *mid,
+                            "small".to_string(),
+                            "zh".to_string(),
+                            Some(false),
+                        )
+                        .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                let msg = crate::proc::tail(&e.to_string());
+                                notes.push(format!("素材 #{mid} 字幕没出：{msg}"));
+                            }
+                        }
+                    }
+                }
                 let (clips, srt_lines, label) = {
                     let conn = crate::commands::lock_db(&state)?;
                     let media = db::get_media(&conn, *mid)?;
