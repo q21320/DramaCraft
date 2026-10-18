@@ -605,6 +605,34 @@ pub fn set_media_processed(conn: &Connection, media_id: i64, path: &str) -> AppR
     Ok(())
 }
 
+/// 用新探测到的元信息覆盖素材记录。
+///
+/// 用在「文件被重下过」时：换了清晰度或换了另一条流，宽高、时长都会变，
+/// 而库里的旧值会被当成去重的裁切目标 —— 滤镜会报
+/// "Invalid too big or non positive size"，用户只看到一集莫名失败。
+pub fn update_media_probe(
+    conn: &Connection,
+    media_id: i64,
+    probe: &MediaProbe,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE media
+            SET duration_ms = ?2, width = ?3, height = ?4, has_audio = ?5,
+                size_bytes = ?6, format_name = ?7
+          WHERE id = ?1",
+        params![
+            media_id,
+            probe.duration_ms,
+            probe.width,
+            probe.height,
+            probe.has_audio as i64,
+            probe.size_bytes,
+            probe.format_name
+        ],
+    )?;
+    Ok(())
+}
+
 /// 切片该读哪个文件：**优先去重产物**，没有才读原片。
 ///
 /// 这是「先去重再切片」这条链路的接口 —— 真实软件就是这个顺序，
@@ -1438,6 +1466,20 @@ pub fn count_done_jobs_of_kind(conn: &Connection, run_id: i64, kind: &str) -> Ap
     )?)
 }
 
+/// 同一步骤里失败的任务数。
+///
+/// 汇总行只报「完成 n 个」时，失败的那一集会被这句话盖过去 ——
+/// 用户看到「全部完成」就以为真的全成了。
+pub fn count_failed_jobs_of_kind(conn: &Connection, run_id: i64, kind: &str) -> AppResult<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM job
+          WHERE status = 'failed' AND kind = ?2
+            AND pipeline_drama_id IN (SELECT id FROM pipeline_drama WHERE run_id = ?1)",
+        params![run_id, kind],
+        |r| r.get(0),
+    )?)
+}
+
 /// 写一行日志。
 ///
 /// **失败不抛错**：日志写不进去不该让流水线挂掉。调用方也不必处理错误。
@@ -1494,6 +1536,13 @@ pub fn attach_recent_logs_to_run(conn: &Connection, run_id: i64, mark: i64) -> A
 /// 按运行过滤时，**这次运行开始之后写的、还没归属运行的日志也要带上**：
 /// 下载原片、手工操作发生在建 run 之前或运行之间，不带的话用户按运行
 /// 过滤就看不到「刚才下载失败在哪一集」。
+///
+/// 下界取运行自己的 `created_at`，不取它的第一条日志：某个 run 一集
+/// 日志都没有时 `MIN(id)` 是 NULL，COALESCE 兜到底就成了「什么都不显示」——
+/// 用户看到的就是一个空日志页。
+///
+/// 两种情形要分开：run 有日志时仍用第一条日志的 id（精确，不会把运行前
+/// 同一秒的旧日志卷进来）；只有它一条都没有时才退回按时间筛。
 pub fn list_logs(
     conn: &Connection,
     run_id: Option<i64>,
@@ -1508,10 +1557,18 @@ pub fn list_logs(
                 "SELECT id, run_id, drama_id, level, message, artifact, created_at FROM run_log
                   WHERE (
                       run_id = ?1
-                      -- 这次运行开始之后写、还没归属的日志（比如下载原片）
-                      OR (run_id IS NULL AND id > COALESCE(
-                            (SELECT MIN(id) FROM run_log WHERE run_id = ?1),
-                            9223372036854775807
+                      OR (run_id IS NULL AND (
+                          -- 这次运行已经有日志：以第一条为界（精确）
+                          id > (SELECT MIN(id) FROM run_log WHERE run_id = ?1)
+                          -- 一条都没有（比如刚建就失败）：退回用开始时间，
+                          -- 否则 COALESCE 到极限值会把下载日志全滤掉
+                          OR (
+                              NOT EXISTS (SELECT 1 FROM run_log WHERE run_id = ?1)
+                              AND created_at >= COALESCE(
+                                  (SELECT created_at FROM pipeline_run WHERE id = ?1),
+                                  ''
+                              )
+                          )
                       ))
                   )
                     AND id > ?2 ORDER BY id ASC LIMIT ?3",
@@ -2031,6 +2088,40 @@ mod tests {
 
         delete_project(&conn, p.id).unwrap();
         assert_eq!(list_media(&conn, p.id).unwrap().len(), 0);
+    }
+
+    /// 文件被重下过（换了清晰度/换了流）：宽高和时长要能改，其他字段别动。
+    #[test]
+    fn media_probe_can_be_refreshed_after_redownload() {
+        let conn = mem();
+        let p = create_project(&conn, "p", "").unwrap();
+        let old = MediaProbe {
+            duration_ms: 61_741,
+            width: 360,
+            height: 640,
+            has_audio: true,
+            size_bytes: 900_000,
+            format_name: "mov,mp4".into(),
+        };
+        let m = add_media(&conn, p.id, "D:/源/第08集.mp4", "第08集.mp4", &old).unwrap();
+
+        let fresh = MediaProbe {
+            duration_ms: 72_075,
+            width: 1280,
+            height: 720,
+            has_audio: true,
+            size_bytes: 2_100_000,
+            format_name: "mov,mp4".into(),
+        };
+        assert!(!fresh.matches(&m), "文件变了就该认出来");
+        update_media_probe(&conn, m.id, &fresh).unwrap();
+
+        let got = get_media(&conn, m.id).unwrap();
+        assert_eq!((got.width, got.height), (1280, 720), "宽高要用新值");
+        assert_eq!(got.duration_ms, 72_075);
+        assert_eq!(got.size_bytes, 2_100_000);
+        assert!(fresh.matches(&got), "更新后应判定一致，不再重复写库");
+        assert_eq!(got.path, "D:/源/第08集.mp4", "路径不该被动");
     }
 
     #[test]
@@ -2911,6 +3002,27 @@ mod tests {
         assert_eq!(rows.len(), 2, "运行之前的旧日志不该混进来");
         assert_eq!(rows[0].message, "运行开始");
         assert_eq!(rows[1].message, "这次运行旁边的下载失败");
+    }
+
+    /// 某个运行一条自己的日志都没写过时，它旁边的下载日志也得看得见。
+    ///
+    /// 真实撞到过：只下载没开流水线，最新的 run 是早先失败的那次，
+    /// 它没有任何 run_log —— `MIN(id)` 为 NULL，日志页一片空白。
+    #[test]
+    fn logs_fall_back_to_run_start_time_when_run_has_no_logs() {
+        let conn = mem();
+        append_log(&conn, None, None, "info", "这次下载写了这一行");
+        conn.execute(
+            "INSERT INTO pipeline_run(root_dir, out_dir, stages, status, created_at, updated_at)
+             VALUES('D:/src', '', '[]', 'failed', '2000-01-01 00:00:00', '2000-01-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+        let run_id = conn.last_insert_rowid();
+
+        let rows = list_logs(&conn, Some(run_id), 0, 100).unwrap();
+        assert_eq!(rows.len(), 1, "运行没有日志时，按开始时间把下载日志带上");
+        assert_eq!(rows[0].message, "这次下载写了这一行");
     }
 
     #[test]

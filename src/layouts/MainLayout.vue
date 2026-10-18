@@ -8,7 +8,6 @@ import {
   NLayoutHeader,
   NLayoutSider,
   NMenu,
-  NSelect,
   NSpace,
   NTag,
   NText,
@@ -55,10 +54,6 @@ const expandedKeys = computed(() => {
   return group ? [`group:${group.key}`] : [];
 });
 
-const projectOptions = computed(() =>
-  store.projects.map((p) => ({ label: p.name, value: p.id })),
-);
-
 const toolWarning = computed(() => {
   if (store.loading) return "";
   const missing = store.toolReports.filter((r) => !r.available).map((r) => r.name);
@@ -93,15 +88,6 @@ const toolWarning = computed(() => {
             <n-tag v-if="store.info" size="small" :bordered="false">
               v{{ store.info.version }}
             </n-tag>
-            <n-select
-              v-if="store.projects.length > 0"
-              :value="store.currentProjectId"
-              :options="projectOptions"
-              size="small"
-              style="width: 200px"
-              placeholder="选择项目"
-              @update:value="(v: number) => store.selectProject(v)"
-            />
           </n-space>
         </div>
       </n-layout-header>

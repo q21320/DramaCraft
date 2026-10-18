@@ -9,7 +9,8 @@ use crate::models::{
     AiConfigView, AiProvider, AiProviderView, AiTestResult, CostReportRow, DedupReport,
     DesubtitleReport, RewriteOutcome, StoryboardReport, CoverReport, CoverRequest, EmailConfigView,
     EmailTestResult, HeaderLabel,
-    FanqieCategoryPage, FanqieDownloadReport, FanqieDownloadRequest, FanqiePlayInfo,
+    FanqieCategoryPage, FanqieDownloadBatchReport, FanqieDownloadEpisode, FanqieDownloadPick,
+    FanqieDownloadReport, FanqieDownloadRequest, FanqieDownloadState, FanqiePlayInfo,
     FanqiePreparedVideo, FanqieSelectItems, FanqieSelectorRow, FanqieSeriesDetail, FanqieVideoInfo,
     IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
     PipelineStage, PlatformOption, Project,
@@ -45,6 +46,15 @@ pub(crate) fn lock_tools<'a>(
         .tools
         .lock()
         .map_err(|_| AppError::Msg("工具配置锁被污染，请重启应用".into()))
+}
+
+pub(crate) fn lock_download<'a>(
+    state: &'a tauri::State<'_, AppState>,
+) -> AppResult<MutexGuard<'a, FanqieDownloadState>> {
+    state
+        .download
+        .lock()
+        .map_err(|_| AppError::Msg("下载状态锁被污染，请重启应用".into()))
 }
 
 // ---------------- 应用与设置 ----------------
@@ -209,7 +219,7 @@ pub async fn run_slice(
     source_override: Option<String>,
 ) -> AppResult<Vec<Segment>> {
     let compatible = compatible.unwrap_or(false);
-    let (input_path, plans, ffmpeg) = {
+    let (input_path, plans, ffmpeg, fell_back) = {
         let configured = lock_tools(&state)?.clone();
         let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
         let ffprobe = configured.ffprobe.clone();
@@ -223,9 +233,13 @@ pub async fn run_slice(
         //
         // 第 1 条由调用方算好传进来（它才知道剧目录在哪）；
         // 第 2、3 条 `media_source_path` 自己处理。
-        let source = match source_override {
-            Some(p) if std::path::Path::new(&p).is_file() => p,
-            _ => db::media_source_path(&conn, media_id)?,
+        //
+        // **给了去字幕产物却不在，不能一声不响地换源。**
+        // 切出来的东西和证明图那条链就不是一回事了，至少要留一行 warn。
+        let (source, fell_back) = match source_override {
+            Some(p) if std::path::Path::new(&p).is_file() => (p, false),
+            Some(_) => (db::media_source_path(&conn, media_id)?, true),
+            None => (db::media_source_path(&conn, media_id)?, false),
         };
 
         // **切片计划用量「实际时长」，不是数据库里记的那个。**
@@ -240,8 +254,16 @@ pub async fn run_slice(
             .unwrap_or(0);
         let plan_ms = if actual_ms > 0 { actual_ms } else { target.duration_ms };
         let plans = media::plan::build_plan(plan_ms, &mode);
-        (source, plans, ffmpeg)
+        (source, plans, ffmpeg, fell_back)
     };
+
+    if fell_back {
+        log_line(
+            &state,
+            "warn",
+            &format!("第 {media_id} 集没找到 AI 去字幕产物，切片退回用去重产物"),
+        );
+    }
 
     if plans.is_empty() {
         return Err(AppError::Msg(
@@ -1503,9 +1525,9 @@ pub async fn desubtitle_media(
     //
     // `bottom_ratio` 是给「识别字幕」用的：让 ffmpeg 只抽下半部分，OCR 快一点。
     // 但**定位**要的是**全画面坐标** —— 裁过之后 OCR 返回的框是相对裁剪图的
-    // （0~864），而 `subtitle_band` 按全画面判「在不在下方」
+    // （0~864），而 `text_bands` 按全画面判「在不在下方」
     // （要求 y ≥ 1920×0.55 = 1056），结果**所有框都被滤掉**，
-    // 报「没找到硬字幕」—— 明明有。下方筛选在 `subtitle_band` 里自己做。
+    // 报「没找到硬字幕」—— 明明有。下方筛选在 `text_bands` 里自己做。
     opts.bottom_ratio = 1.0;
 
     // **少抽几帧。**
@@ -1550,25 +1572,28 @@ pub async fn desubtitle_media(
     if fw <= 0 || fh <= 0 {
         return Err(AppError::Msg("探不到画面尺寸，无法定位字幕".into()));
     }
-    let band = crate::desubtitle::subtitle_band(&ocr_frames, fw, fh);
-    let Some(band) = band else {
+    let bands = crate::desubtitle::text_bands(&ocr_frames, fw, fh);
+    if bands.is_empty() {
         // **找不到就说找不到。** 不硬盖一块 —— 那会毁掉画面。
         return Ok(DesubtitleReport {
             out_path: String::new(),
             band: None,
+            bands: Vec::new(),
             sampled_frames: sampled,
             engine,
             removed: false,
-            note: "没找到硬字幕（下半部分没扫到稳定的文字）。片源可能本来就没硬字幕，\
-                   或者字幕位置比较特殊。"
+            note: "没找到硬字幕或水印（下半部分没扫到稳定的文字）。片源可能本来就没有，\
+                   或者文字位置比较特殊。"
                 .to_string(),
         });
-    };
+    }
 
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let filter = crate::desubtitle::delogo_filter(&band);
+    // **字幕 + 水印全部串上。** 用户的原话：「字幕 水印都要擦的」。
+    // 一个区域一个 `delogo`，ffmpeg 按顺序各擦一遍。
+    let filter = crate::desubtitle::delogo_filter(&bands);
 
     // **这一段用 GPU 编码。**
     //
@@ -1619,27 +1644,35 @@ pub async fn desubtitle_media(
         .map_err(|e| AppError::Msg(format!("调 ffmpeg 失败：{e}")))?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
+        let areas = bands
+            .iter()
+            .map(|b| format!("{}×{} @ ({}, {})", b.w, b.h, b.x, b.y))
+            .collect::<Vec<_>>()
+            .join("、");
         return Err(AppError::Msg(format!(
-            "去字幕失败（字幕带 {}×{} @ ({}, {})，画面 {}×{}）：{}",
-            band.w,
-            band.h,
-            band.x,
-            band.y,
-            fw,
-            fh,
+            "去字幕失败（文字区域 {areas}，画面 {fw}×{fh}）：{}",
             proc::tail(err.trim())
         )));
     }
 
     Ok(DesubtitleReport {
         out_path: out.to_string_lossy().to_string(),
-        band: Some(band),
+        band: bands.first().copied(),
+        bands: bands.clone(),
         sampled_frames: sampled,
         engine,
         removed: true,
         note: format!(
-            "字幕带 {}×{} @ ({}, {})，扫了 {sampled} 帧命中 {} 帧",
-            band.w, band.h, band.x, band.y, band.hit_frames
+            "擦了 {} 处文字：{}（扫了 {sampled} 帧）",
+            bands.len(),
+            bands
+                .iter()
+                .map(|b| format!(
+                    "{}×{} @ ({}, {}) 命中 {}/{} 帧",
+                    b.w, b.h, b.x, b.y, b.hit_frames, b.total_frames
+                ))
+                .collect::<Vec<_>>()
+                .join("、")
         ),
     })
 }
@@ -2260,6 +2293,19 @@ fn remember_download_log_mark(state: &tauri::State<'_, AppState>) -> AppResult<(
     )
 }
 
+/// 同时下载几集存在这个 ui 状态键里（设置页可改，默认 3）。
+const DOWNLOAD_CONCURRENCY_KEY: &str = "ui.download.concurrency";
+
+/// 读用户设的并发数。存坏了就当默认值 —— 读设置不该让下载开不了。
+fn download_concurrency(state: &tauri::State<'_, AppState>) -> usize {
+    lock_db(state)
+        .ok()
+        .and_then(|conn| db::get_setting(&conn, DOWNLOAD_CONCURRENCY_KEY).ok().flatten())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(fanqie::DEFAULT_DOWNLOAD_CONCURRENCY)
+        .clamp(1, fanqie::MAX_DOWNLOAD_CONCURRENCY)
+}
+
 /// 开始一条流水线。
 ///
 /// 做四件事：
@@ -2807,8 +2853,25 @@ pub async fn dedup_media(
     let (ffmpeg, ffprobe, media) = {
         let configured = lock_tools(&state)?.clone();
         let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
+        // ffprobe 不是去重的必需品（只用来对尺寸/校验规范），按可选工具拿
+        let ffprobe_tool = tools::resolve(&configured.ffprobe, "ffprobe");
         let conn = lock_db(&state)?;
-        let media = db::get_media(&conn, media_id)?;
+        let mut media = db::get_media(&conn, media_id)?;
+        // **处理前先对一遍文件。**
+        //
+        // 文件可能被重下过：上次那条流坏了、换了一条流重下，宽高和时长都会变，
+        // 而库里存的还是导入时的旧值。拿旧宽高当裁切目标，滤镜会报
+        // "Invalid too big or non positive size" —— 用户只看到一集莫名失败。
+        if let Some(ffprobe_tool) = ffprobe_tool.as_deref() {
+            if Path::new(&media.path).is_file() {
+                if let Ok(fresh) = media::probe(ffprobe_tool, Path::new(&media.path)) {
+                    if !fresh.matches(&media) {
+                        db::update_media_probe(&conn, media.id, &fresh)?;
+                        media = db::get_media(&conn, media.id)?;
+                    }
+                }
+            }
+        }
         (ffmpeg, configured.ffprobe, media)
     };
 
@@ -2935,6 +2998,12 @@ pub async fn build_storyboard(
     out_dir: String,
     _frames_per_episode: i64,
     _shots_per_sheet: i64,
+    // 和 `media_ids` 一一对应的 AI 去字幕产物。
+    //
+    // 空 = 没勾去字幕（或那几集没产出），这时退回去重产物。
+    // 为什么要它：证明图展示的应该是**实际发布出去的画面**，
+    // 而发布前的最后一道画面处理就是去字幕。
+    quzimu_paths: Option<Vec<String>>,
 ) -> AppResult<StoryboardReport> {
     //! 分镜证明：取 4 集去字幕产物 → 切镜头 → 每镜头抽 5 帧 → AI 反推
     //! → 每 2 镜头排 1 页 JPG，同时写一份 Seedance 可用的 JSON。
@@ -2999,16 +3068,35 @@ pub async fn build_storyboard(
         ep_label: String,
         start: f64,
         end: f64,
+        /// 源是不是 AI 去字幕产物（假 = 退回了去重产物）
+        from_quzimu: bool,
     }
     let mut plans: Vec<Plan> = Vec::new();
-    for mid in &media_ids {
+    for (idx, mid) in media_ids.iter().enumerate() {
         if plans.len() >= MAX_SHOTS {
             break;
         }
-        let (source, ep_label, dur) = {
+        let (source, ep_label, dur, from_quzimu) = {
             let conn = lock_db(&state)?;
             let media = db::get_media(&conn, *mid)?;
-            let src = PathBuf::from(db::media_source_path(&conn, *mid)?);
+            // **优先 AI 去字幕产物。**
+            //
+            // 用户报过：「分镜切的视频好像是去重的啊，怎么不是去字幕的视频啊」——
+            // 对。以前这里只走 `media_source_path`（优先取去重产物），
+            // 证明图里就带着硬字幕，和真正发布出去的画面对不上。
+            //
+            // 路径由流水线算好传进来（和切片用的是同一个函数）；
+            // 文件不在（没勾去字幕 / 没找到字幕带）就退回去重产物。
+            let quzimu = quzimu_paths
+                .as_ref()
+                .and_then(|v| v.get(idx))
+                .map(PathBuf::from)
+                .filter(|p| p.is_file());
+            let from_quzimu = quzimu.is_some();
+            let src = match quzimu {
+                Some(p) => p,
+                None => PathBuf::from(db::media_source_path(&conn, *mid)?),
+            };
             // **时长要用实际文件的，不是数据库记的。**
             //
             // 踩过：数据库记 200 秒、实际去重产物只有 104.7 秒 ——
@@ -3023,7 +3111,7 @@ pub async fn build_storyboard(
             } else {
                 media.duration_ms as f64 / 1000.0
             };
-            (src, media.name.clone(), d)
+            (src, media.name.clone(), d, from_quzimu)
         };
         if !source.is_file() || dur <= 1.0 {
             continue;
@@ -3043,6 +3131,7 @@ pub async fn build_storyboard(
                 ep_label: ep_label.clone(),
                 start: at,
                 end,
+                from_quzimu,
             });
             at = end;
         }
@@ -3051,6 +3140,38 @@ pub async fn build_storyboard(
         return Err(AppError::Msg(
             "切不出镜头 —— 集太短或文件不在".into(),
         ));
+    }
+    // **取源要写进日志。**
+    //
+    // 用户拿证明图去对照发布片时，最先要确认的就是「这张图是从哪个文件抽的」。
+    // 默默退回去重产物的话，图上带着字幕会被当成去字幕没生效 —— 实际是这里没取对。
+    let sources: std::collections::BTreeSet<_> = plans.iter().map(|p| &p.source).collect();
+    let qz_sources = plans.iter().filter(|p| p.from_quzimu).count();
+    if qz_sources == 0 {
+        log_line(
+            &state,
+            "warn",
+            "分镜证明没找到 AI 去字幕产物，退回用去重产物 —— 证明图上会保留硬字幕",
+        );
+    } else if qz_sources < plans.len() {
+        log_line(
+            &state,
+            "warn",
+            &format!(
+                "分镜证明：{} 个镜头里只有 {qz_sources} 个用上了 AI 去字幕产物，其余没有去字幕文件，退回去重产物",
+                plans.len()
+            ),
+        );
+    } else {
+        log_line(
+            &state,
+            "info",
+            &format!(
+                "分镜证明取源：{} 集 AI 去字幕产物（共 {} 个镜头）",
+                sources.len(),
+                plans.len()
+            ),
+        );
     }
 
     // ---------- ② 每镜头抽 5 帧 ----------
@@ -4048,7 +4169,7 @@ pub async fn fanqie_prepare_video(
         let configured = lock_tools(&state)?.ffmpeg.clone();
         tools::resolve(&configured, "ffmpeg")
     };
-    fanqie::prepare_video(&app, &vid, quality.as_deref(), ffmpeg, false).await
+    fanqie::prepare_video(&app, &vid, quality.as_deref(), ffmpeg, false, "").await
 }
 
 /// App 播放接口给的元信息：时长、全部清晰度、是否加密。
@@ -4203,6 +4324,7 @@ pub async fn fanqie_download_series(
         tools::resolve(&configured, "ffmpeg")
     };
     let copy_video = !transcode.unwrap_or(false);
+    let concurrency = download_concurrency(&state);
     let report = fanqie::download_series(
         &app,
         &req,
@@ -4210,6 +4332,9 @@ pub async fn fanqie_download_series(
         quality.as_deref(),
         ffmpeg,
         copy_video,
+        // 单部命令没有批次状态可写；事件仍会以完整状态的形式发出
+        None,
+        concurrency,
     )
     .await?;
     // 记下 seriesId → 目录。列表页靠它标「已下载」—— 拿剧名当键，
@@ -4220,6 +4345,212 @@ pub async fn fanqie_download_series(
         }
     }
     Ok(report)
+}
+
+/// 批量下载：整批交给后端跑，页面刷新/切页都不影响。
+///
+/// 以前是前端 `for` 循环逐部调 `fanqie_download_series` —— 循环活在页面里，
+/// 刷新一下循环就没了，右下角进度也跟着消失。现在循环搬进 Rust，
+/// 进度存在 `AppState.download` 里（并落一份到 setting），
+/// 页面刷新后重新挂载读一次就能接着看，应用重开后也知道上次停在哪。
+#[tauri::command]
+pub async fn fanqie_download_batch(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    picks: Vec<FanqieDownloadPick>,
+    out_root: String,
+    quality: Option<String>,
+    transcode: Option<bool>,
+) -> AppResult<FanqieDownloadBatchReport> {
+    let root = PathBuf::from(out_root.trim());
+    if !root.is_dir() {
+        return Err(AppError::Msg("下载目录不存在，请重新发起下载".into()));
+    }
+    if picks.is_empty() {
+        return Err(AppError::Msg("先勾选要下载的短剧".into()));
+    }
+    if lock_download(&state)?.running {
+        return Err(AppError::Msg("已经有一批下载在跑，等它结束再开新的".into()));
+    }
+
+    // 一整批只划一条线：这批下载日志要跟随后那次流水线运行一起显示。
+    let _ = remember_download_log_mark(&state);
+    let ffmpeg = {
+        let configured = lock_tools(&state)?.ffmpeg.clone();
+        tools::resolve(&configured, "ffmpeg")
+    };
+    let copy_video = !transcode.unwrap_or(false);
+    let concurrency = download_concurrency(&state);
+    let series_total = picks.len() as i64;
+
+    let mut report = FanqieDownloadBatchReport {
+        root: root.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+
+    for (i, pick) in picks.iter().enumerate() {
+        // 每部一个 tracker：它记着「这部剧开始前整批完成了多少」，
+        // 面板上的累计值才不会从头再数。
+        let tracker = fanqie::DownloadTracker::new(
+            app.clone(),
+            state.download.clone(),
+            i as i64,
+            series_total,
+            report.downloaded + report.skipped,
+            report.failed.len() as i64,
+        );
+        tracker.begin_series(
+            &pick.title,
+            pick.episode_count.max(0),
+            "正在获取分集列表…",
+        );
+
+        let detail = match fanqie::series_detail(&pick.series_id).await {
+            Ok(d) => d,
+            Err(e) => {
+                report.failed.push(format!("《{}》：{e}", pick.title));
+                tracker.update(|s| {
+                    s.failed = report.failed.len() as i64;
+                    s.message = format!("《{}》没拿到分集列表", pick.title);
+                });
+                continue;
+            }
+        };
+
+        let episodes: Vec<FanqieDownloadEpisode> = detail
+            .episodes
+            .iter()
+            .filter(|e| !e.vid.trim().is_empty())
+            .map(|e| FanqieDownloadEpisode {
+                vid: e.vid.clone(),
+                index: e.index,
+            })
+            .collect();
+        if episodes.is_empty() {
+            report
+                .failed
+                .push(format!("《{}》：没有可下载的分集", pick.title));
+            tracker.update(|s| {
+                s.failed = report.failed.len() as i64;
+                s.message = format!("《{}》没有可下载的分集", pick.title);
+            });
+            continue;
+        }
+
+        // 落盘目录用详情接口的标题（前端列表的标题可能带后缀）
+        let title = if detail.title.trim().is_empty() {
+            pick.title.clone()
+        } else {
+            detail.title.clone()
+        };
+        tracker.begin_series(&title, episodes.len() as i64, "开始下载…");
+
+        let req = FanqieDownloadRequest {
+            series_id: pick.series_id.clone(),
+            title,
+            intro: detail.intro.clone(),
+            cover: detail.cover.clone(),
+            episodes,
+        };
+        match fanqie::download_series(
+            &app,
+            &req,
+            &root,
+            quality.as_deref(),
+            ffmpeg.clone(),
+            copy_video,
+            Some(&tracker),
+            concurrency,
+        )
+        .await
+        {
+            Ok(r) => {
+                report.downloaded += r.downloaded;
+                report.skipped += r.skipped;
+                report.failed.extend(r.failed.iter().cloned());
+                if r.downloaded + r.skipped > 0 {
+                    report.landed.push(r.title.clone());
+                    // 列表页靠 seriesId → 目录标「已下载」；标题会变，不能当键
+                    if let Ok(conn) = lock_db(&state) {
+                        let _ = db::upsert_download(&conn, &req.series_id, &r.title, &r.dir);
+                    }
+                }
+                // 累计值当场更新，别等下一部开始才补
+                tracker.update(|s| {
+                    s.done = report.downloaded + report.skipped;
+                    s.failed = report.failed.len() as i64;
+                });
+            }
+            Err(e) => {
+                report.failed.push(format!("《{}》：{e}", req.title));
+                tracker.update(|s| {
+                    s.failed = report.failed.len() as i64;
+                    s.message = format!("《{}》下载失败", req.title);
+                });
+            }
+        }
+    }
+
+    // 收尾：状态落到「不在跑」，结果和原因一起写进去。
+    // 若这次是被杀进程打断的，这条就不会走到 —— 下次启动由 lib.rs 补中断说明。
+    let finished = {
+        let mut st = lock_download(&state)?;
+        st.running = false;
+        st.series_index = series_total.saturating_sub(1);
+        st.done = report.downloaded + report.skipped;
+        st.failed = report.failed.len() as i64;
+        st.landed = report.landed.clone();
+        st.message = if report.landed.is_empty() {
+            "一集都没下载成功".to_string()
+        } else {
+            format!(
+                "下载结束：新下 {} 集、跳过 {} 集、失败 {} 项",
+                report.downloaded,
+                report.skipped,
+                report.failed.len()
+            )
+        };
+        st.error = if report.landed.is_empty() {
+            "没有可跑的源片，已停在列表页；可以重试或换个清晰度。".to_string()
+        } else if !report.failed.is_empty() {
+            format!(
+                "有 {} 项没下下来，已停在列表页；再点一次「下载」会只补缺的集。",
+                report.failed.len()
+            )
+        } else {
+            String::new()
+        };
+        st.clone()
+    };
+    fanqie::save_download_state(&app, &finished);
+    let _ = app.emit("fanqie:download", &finished);
+
+    Ok(report)
+}
+
+/// 当前/最后一次批量下载的状态。页面刷新后靠它把进度面板检回来。
+#[tauri::command]
+pub fn fanqie_download_state(state: tauri::State<'_, AppState>) -> AppResult<FanqieDownloadState> {
+    Ok(lock_download(&state)?.clone())
+}
+
+/// 用户把下载面板关掉时清掉错误信息 —— 否则下次刷新页面又会弹回来。
+/// 下载中不处理：那下面板本来就不让关。
+#[tauri::command]
+pub fn fanqie_download_dismiss(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<()> {
+    let snapshot = {
+        let mut st = lock_download(&state)?;
+        if st.running {
+            return Ok(());
+        }
+        st.error.clear();
+        st.clone()
+    };
+    fanqie::save_download_state(&app, &snapshot);
+    Ok(())
 }
 
 /// 把 HEIC 封面转成 JPEG 并缓存；本来就是 JPEG 的原样返回地址。

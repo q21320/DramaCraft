@@ -125,6 +125,36 @@ async function pickDownloadRoot() {
     downloadRootSaving.value = false;
   }
 }
+
+// 同时下载几个文件。存 `ui.download.concurrency`，后端开下载时读它。
+// 番茄限流时失败变多，降到 2 最稳；网络好想快一点就 5。
+const DOWNLOAD_CONCURRENCY_KEY = "download.concurrency";
+const downloadConcurrency = ref(3);
+const concurrencyOptions = [
+  { label: "2 个（更稳）", value: 2 },
+  { label: "3 个（默认）", value: 3 },
+  { label: "5 个（更快）", value: 5 },
+];
+
+async function loadConcurrency() {
+  try {
+    const raw = await api.loadUiState(DOWNLOAD_CONCURRENCY_KEY);
+    const n = Number(raw);
+    if (n === 2 || n === 3 || n === 5) downloadConcurrency.value = n;
+  } catch {
+    // 读不出来用默认值
+  }
+}
+
+async function saveConcurrency(v: number) {
+  downloadConcurrency.value = v;
+  try {
+    await api.saveUiState(DOWNLOAD_CONCURRENCY_KEY, String(v));
+    message.success(`已改为同时下载 ${v} 个文件`);
+  } catch (e) {
+    message.error(String(e));
+  }
+}
 // 完成通知邮件：队列跑完后发一封。
 // 授权码和 AI Key 一样只留在后端，前端只拿打码后的提示。
 const email = ref<EmailConfigView | null>(null);
@@ -139,11 +169,18 @@ const emailSaving = ref(false);
 const emailTesting = ref(false);
 const emailPreset = ref<string | null>(null);
 
+/**
+ * 只列**国内能直接用**的两家。
+ *
+ * Gmail / Outlook 本来也在这里，但它们的帮助页和 SMTP 服务器在国内
+ * 都访问不了 —— 放上去只会让用户点了打不开，还得自己判断「为什么不行」。
+ *
+ * 其他邮箱（企业邮、自建邮局）不在这份清单里不代表不支持：下面
+ * SMTP 服务器 / 端口 / 发件邮箱几个框都是手填的，填什么用什么。
+ */
 const EMAIL_PRESETS = [
   { label: "QQ 邮箱", value: "qq" },
   { label: "网易 163", value: "163" },
-  { label: "Gmail", value: "gmail" },
-  { label: "Outlook", value: "outlook" },
 ];
 
 /**
@@ -170,18 +207,6 @@ const EMAIL_HELP: Record<string, { url: string; hint: string }> = {
     url: "https://help.mail.163.com/faqDetail.do?code=d7a5dc8471cd0c0e8b4b8f4f8e49998b374173cfe9171305fa1ce630d7f67ac286624f309a1a7089",
     hint: "163 邮箱：设置 → POP3/SMTP/IMAP → 开启 SMTP 服务 → 新增授权码",
   },
-  gmail: {
-    // Google 官方帮助页「使用应用专用密码登录」（简体中文版）。
-    // 直接给 myaccount.google.com/apppasswords 也能用，但那页要登录后
-    // 才看得到，而且**没开两步验证的人进去是一片空白** —— 帮助页把
-    // 前置条件写清楚了。
-    url: "https://support.google.com/accounts/answer/185833?hl=zh-Hans",
-    hint: "Gmail：先开启两步验证 → 到「应用专用密码」生成 16 位密码（不是 Google 登录密码）",
-  },
-  outlook: {
-    url: "https://account.microsoft.com/security",
-    hint: "Outlook：安全 → 高级安全选项 → 应用密码",
-  },
 };
 
 /** 选了预设之后要显示的那条指引（没选就是 null）。 */
@@ -198,8 +223,6 @@ async function openHelp(url: string) {
 const EMAIL_HOSTS: Record<string, { host: string; port: number }> = {
   qq: { host: "smtp.qq.com", port: 465 },
   "163": { host: "smtp.163.com", port: 465 },
-  gmail: { host: "smtp.gmail.com", port: 465 },
-  outlook: { host: "smtp.office365.com", port: 587 },
 };
 
 function applyEmailPreset(value: string | null) {
@@ -314,6 +337,7 @@ onMounted(() => {
   void loadCostForm();
   void loadDraftAudio();
   void loadDownloadRoot();
+  void loadConcurrency();
   void loadEmail();
 });
 </script>
@@ -329,6 +353,19 @@ onMounted(() => {
     <div class="dd-row" style="margin-bottom: 4px">
       <n-input :value="downloadRoot" readonly size="small" style="width: 480px" placeholder="还没有设置" />
       <n-button size="small" :loading="downloadRootSaving" @click="pickDownloadRoot">选择目录</n-button>
+    </div>
+    <div class="dd-row" style="margin-top: 10px">
+      <span class="dd-muted" style="width: 90px">同时下载</span>
+      <n-select
+        :value="downloadConcurrency"
+        :options="concurrencyOptions"
+        size="small"
+        style="width: 150px"
+        @update:value="(v: number) => void saveConcurrency(v)"
+      />
+      <span class="dd-muted" style="font-size: 12px">
+        个文件；失败多就降到 2，网络好可以 5
+      </span>
     </div>
   </div>
 

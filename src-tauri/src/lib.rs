@@ -35,7 +35,7 @@ use models::ToolPaths;
 use rusqlite::Connection;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 
 /// 去掉 Windows 的扩展长度路径前缀 `\\?\`。
@@ -55,6 +55,69 @@ fn strip_extended_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
+/// 把窗口里那套「浏览器行为」关掉。
+///
+/// WebView2 默认就是个 Edge：右键弹「刷新 / 另存为 / 检查元素」，F5 或 Ctrl+R
+/// 整页重载（没提交的输入全丢），Ctrl+F 顶出查找条，Ctrl+滚轮把界面放大，
+/// F12 打开开发者工具 —— 每一处都在提醒用户「这只是个网页」。
+///
+/// **必须在 WebView2 这一层关**：`AreBrowserAcceleratorKeysEnabled = false`
+/// 之后 F5 / Ctrl+R 根本不会进页面，JS 的 `keydown` 收都收不到。
+/// 页面侧还有一层兜底（`src/utils/shell.ts`），管别的平台和漏网的组合键。
+///
+/// `Settings3` 之后的接口要新版 WebView2 运行时才有；旧运行时 `cast` 失败就
+/// 跳过 —— 老系统上少关几项，总比启动失败强。
+///
+/// 调试要用 DevTools：临时注释掉 `SetAreDevToolsEnabled(false)` 那一行即可。
+#[cfg(windows)]
+fn tame_webview(window: &tauri::WebviewWindow) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Settings3, ICoreWebView2Settings4, ICoreWebView2Settings5,
+        ICoreWebView2Settings6,
+    };
+    use windows_core::Interface;
+
+    let result = window.with_webview(|webview| unsafe {
+        let Ok(core) = webview.controller().CoreWebView2() else {
+            return;
+        };
+        let Ok(settings) = core.Settings() else { return };
+
+        // 右键菜单：返回 / 刷新 / 另存为 / 检查元素
+        let _ = settings.SetAreDefaultContextMenusEnabled(false);
+        // 左下角悬停链接时的地址预览条
+        let _ = settings.SetIsStatusBarEnabled(false);
+        // Ctrl + 滚轮、Ctrl + +/-/0
+        let _ = settings.SetIsZoomControlEnabled(false);
+        // 开发者工具：F12 / Ctrl+Shift+I 已被上面的快捷键开关挡住，这里再从根上关掉
+        let _ = settings.SetAreDevToolsEnabled(false);
+
+        if let Ok(s) = settings.cast::<ICoreWebView2Settings3>() {
+            // F5 / Ctrl+R 刷新、Ctrl+F 查找、Ctrl+P 打印、F12
+            let _ = s.SetAreBrowserAcceleratorKeysEnabled(false);
+        }
+        if let Ok(s) = settings.cast::<ICoreWebView2Settings4>() {
+            // 表单自动填充下拉、密码保存提示
+            let _ = s.SetIsGeneralAutofillEnabled(false);
+            let _ = s.SetIsPasswordAutosaveEnabled(false);
+        }
+        if let Ok(s) = settings.cast::<ICoreWebView2Settings5>() {
+            // 触控板双指捏合缩放
+            let _ = s.SetIsPinchZoomEnabled(false);
+        }
+        if let Ok(s) = settings.cast::<ICoreWebView2Settings6>() {
+            // 触屏左右滑动前进 / 后退
+            let _ = s.SetIsSwipeNavigationEnabled(false);
+        }
+
+        eprintln!("DramaDist: 已关闭右键菜单 / 浏览器快捷键 / 缩放 / DevTools");
+    });
+
+    if let Err(e) = result {
+        eprintln!("DramaDist: 关闭浏览器行为失败：{e}");
+    }
+}
+
 pub struct AppState {
     pub db: Mutex<Connection>,
     pub tools: Mutex<ToolPaths>,
@@ -64,6 +127,9 @@ pub struct AppState {
     pub queue_paused: AtomicBool,
     /// 停止请求：同样在当前任务跑完后生效
     pub queue_cancel: AtomicBool,
+    /// 批量下载的当前进度。住在这里而不是前端页面里：
+    /// 页面刷新、切页都不会把下载和进度一起带走。
+    pub download: Arc<Mutex<models::FanqieDownloadState>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -73,6 +139,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
+            // 窗口一起来就按桌面应用的样子摆好，别让用户先看见一秒的「网页」
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                tame_webview(&window);
+            }
+
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             // 内置运行时：安装后在资源目录下，开发时在源码的 resources/ 下。
@@ -132,6 +204,28 @@ pub fn run() {
 
             let conn = db::open(&data_dir.join("dramadist.db"))?;
 
+            // 下载状态也从盘上检回来：上次可能是边下边被关掉的。
+            // 那批下载已经没了，但得让用户知道停在哪、再点一次会只补缺的集。
+            let mut download_state = db::get_setting(&conn, fanqie::DOWNLOAD_STATE_KEY)
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str::<models::FanqieDownloadState>(&raw).ok())
+                .unwrap_or_default();
+            if download_state.running {
+                download_state.running = false;
+                download_state.error = if download_state.title.trim().is_empty() {
+                    "上次下载在应用关闭时中断了。再点一次「下载」会只补缺的集。".to_string()
+                } else {
+                    format!(
+                        "上次下载《{}》时应用被关闭了，已停止。再点一次「下载」会只补缺的集。",
+                        download_state.title
+                    )
+                };
+                if let Ok(raw) = serde_json::to_string(&download_state) {
+                    let _ = db::set_setting(&conn, fanqie::DOWNLOAD_STATE_KEY, &raw);
+                }
+            }
+
             // 断点续跑第一步：进程被杀后库里会留下假的 running —— 没有人在跑它。
             // 必须退回 pending，否则这些任务永远不会再被拾起。
             let recovered = db::recover_interrupted_jobs(&conn)?;
@@ -158,6 +252,7 @@ pub fn run() {
                 queue_running: AtomicBool::new(false),
                 queue_paused: AtomicBool::new(false),
                 queue_cancel: AtomicBool::new(false),
+                download: Arc::new(Mutex::new(download_state)),
             });
 
             if recovered > 0 {
@@ -318,6 +413,9 @@ pub fn run() {
             commands::set_fanqie_download_root,
             commands::fanqie_downloaded,
             commands::fanqie_download_series,
+            commands::fanqie_download_batch,
+            commands::fanqie_download_state,
+            commands::fanqie_download_dismiss,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

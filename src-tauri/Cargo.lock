@@ -726,6 +726,8 @@ dependencies = [
  "tauri-plugin-shell",
  "thiserror 1.0.69",
  "tokio",
+ "webview2-com",
+ "windows-core",
 ]
 
 [[package]]

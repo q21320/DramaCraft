@@ -805,7 +805,7 @@ pub fn start_pipeline(
             // 整部剧一步的（封面、成本报告等）：**只排一个任务**，不按集排。
             // 60 集排 60 个「生成封面」= 白跑 60 次。
             if is_drama_level(stage) {
-                match drama_payload(stage, drama, &drama_out, &media_ids, total_ms)? {
+                match drama_payload(stage, drama, &drama_out, &media_groups, total_ms)? {
                     Some(payload) => {
                         // 成本报告的落款（机构/法人/公章/签名）来自**设置**，
                         // 一次配好每部剧都用；生成时那几项是空的，在这里补。
@@ -944,7 +944,9 @@ fn drama_payload(
     stage: &str,
     drama: &SourceDrama,
     drama_out: &Path,
-    media_ids: &[i64],
+    // 集和它在剧目录里的组名。分镜证明要按组名算去字幕产物的路径，
+    // 只给 id 的话它只能自己去猜。
+    media_groups: &[(i64, String)],
     total_ms: i64,
 ) -> AppResult<Option<String>> {
     match stage {
@@ -992,7 +994,7 @@ fn drama_payload(
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| drama.name.clone()),
-                "mediaIds": media_ids,
+                "mediaIds": media_groups.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
                 "width": 720,
                 "height": 1280,
                 "fps": 30,
@@ -1037,13 +1039,27 @@ fn drama_payload(
             // **只做前 4 集** —— 和真实软件一致。
             // 全剧都做的话，抽帧 + 视觉模型反推的费用是它的十几倍，
             // 而报备只需要能说明"这些画面出自本剧"。
-            let first: Vec<i64> = media_ids.iter().take(4).copied().collect();
+            let first: Vec<&(i64, String)> = media_groups.iter().take(DESUBTITLE_EPISODES).collect();
             if first.is_empty() {
                 return Ok(None);
             }
+            // **抽帧要抽去字幕的产物，不是去重产物。**
+            //
+            // 用户报过：「分镜切的视频好像是去重的啊，怎么不是去字幕的视频啊」——
+            // 对。只传 mediaId 时执行器只能走 `media_source_path`
+            // （优先取去重产物），证明图里就会带着硬字幕，和发布片对不上。
+            //
+            // 路径用和切片**同一个函数**算，两条链必须对得上；
+            // 文件不存在时执行器自己会退回去重产物。
+            let ids: Vec<i64> = first.iter().map(|(id, _)| *id).collect();
+            let quzimu: Vec<String> = first
+                .iter()
+                .map(|(_, group)| quzimu_path(drama_out, group).to_string_lossy().to_string())
+                .collect();
             Ok(Some(
                 serde_json::json!({
-                    "mediaIds": first,
+                    "mediaIds": ids,
+                    "quzimuPaths": quzimu,
                     "outDir": drama_out.join("分镜证明").to_string_lossy(),
                     "framesPerEpisode": 5,
                     "shotsPerSheet": 2,
@@ -2831,6 +2847,10 @@ mod tests {
             warnings: Vec::new(),
         };
         let mut checked = 0;
+        // 集 + 组名（分组名就是剧目录里的子目录名）
+        let groups: Vec<(i64, String)> = (1..=3)
+            .map(|i| (i as i64, format!("某剧-第{i:02}集")))
+            .collect();
         for (stage, _, _, _) in STAGES {
             // **改剧名不是队列里的一步** —— 它在排任务之前就跑完了，
             // 所以它不该有对应的队列类型。
@@ -2841,7 +2861,7 @@ mod tests {
             let kind = stage_to_job_kind(stage);
             if is_drama_level(stage) {
                 // 整部剧一步：参数里带齐简介和封面，否则会被跳过（那也算正常）
-                let Some(payload) = drama_payload(stage, &drama, Path::new("E:/out"), &[1, 2, 3], 180_000)
+                let Some(payload) = drama_payload(stage, &drama, Path::new("E:/out"), &groups, 180_000)
                     .unwrap_or_else(|e| panic!("{stage} 生成参数失败：{e}"))
                 else {
                     continue;
@@ -3003,19 +3023,61 @@ mod tests {
             warnings: Vec::new(),
         };
         let out = Path::new("E:/out");
-        assert!(drama_payload("rewrite", &drama, out, &[1, 2, 3], 180_000).unwrap().is_none(), "没简介该跳过");
-        assert!(drama_payload("cover", &drama, out, &[1, 2, 3], 180_000).unwrap().is_none(), "没封面该跳过");
+        let groups: Vec<(i64, String)> = (1..=3)
+            .map(|i| (i as i64, format!("某剧-第{i:02}集")))
+            .collect();
+        assert!(drama_payload("rewrite", &drama, out, &groups, 180_000).unwrap().is_none(), "没简介该跳过");
+        assert!(drama_payload("cover", &drama, out, &groups, 180_000).unwrap().is_none(), "没封面该跳过");
 
         drama.synopsis = "简介".into();
         drama.cover = "D:/某剧/poster.jpg".into();
-        assert!(drama_payload("rewrite", &drama, out, &[1, 2, 3], 180_000).unwrap().is_some());
-        assert!(drama_payload("cover", &drama, out, &[1, 2, 3], 180_000).unwrap().is_some());
+        assert!(drama_payload("rewrite", &drama, out, &groups, 180_000).unwrap().is_some());
+        assert!(drama_payload("cover", &drama, out, &groups, 180_000).unwrap().is_some());
 
         // 封面要带上兜底剧名：rewrite 没跑或没写出 剧名.txt 时还能用
-        let raw = drama_payload("cover", &drama, out, &[1, 2, 3], 180_000).unwrap().unwrap();
+        let raw = drama_payload("cover", &drama, out, &groups, 180_000).unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["fallbackTitle"], "某剧");
         assert_eq!(v["poster"], "D:/某剧/poster.jpg");
+    }
+
+    #[test]
+    fn storyboard_payload_points_at_desubtitled_files() {
+        // 用户报过：「分镜切的视频好像是去重的啊」——
+        // 分镜证明必须抽去字幕的产物，参数里要把路径带齐。
+        let drama = SourceDrama {
+            name: "某剧".into(),
+            dir: "D:/某剧".into(),
+            episode_count: 6,
+            episodes: Vec::new(),
+            synopsis: "简介".into(),
+            synopsis_path: String::new(),
+            cover: String::new(),
+            warnings: Vec::new(),
+        };
+        let groups: Vec<(i64, String)> = (1..=6)
+            .map(|i| (100 + i as i64, format!("新剧名-第{i:02}集")))
+            .collect();
+        let raw = drama_payload("storyboard", &drama, Path::new("E:/out"), &groups, 1)
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["mediaIds"],
+            serde_json::json!([101, 102, 103, 104]),
+            "还是只做前 4 集"
+        );
+        let q = v["quzimuPaths"].as_array().unwrap();
+        assert_eq!(q.len(), 4, "一集一个去字幕路径，和 mediaIds 对齐");
+        for (i, p) in q.iter().enumerate() {
+            let p = p.as_str().unwrap().replace('\\', "/");
+            assert!(
+                p.ends_with(&format!("quzimu/新剧名-第{:02}集_quzimu.mp4", i + 1)),
+                "去字幕路径要按组名算：{p}"
+            );
+        }
+        // 队列执行器必须能接住这些字段
+        crate::queue::validate_payload("storyboard", &raw).expect("storyboard 参数要过校验");
     }
 
     #[test]

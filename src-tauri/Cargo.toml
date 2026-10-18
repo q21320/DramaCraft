@@ -32,6 +32,12 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 
+# 关掉 WebView2 的「浏览器行为」：右键菜单、F5 刷新、Ctrl+F 查找、缩放、
+# 开发者工具。版本跟着 tauri 自己依赖的那份走（见 Cargo.lock）。
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows-core = "0.62"
+
 [lib]
 name = "dramadist_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

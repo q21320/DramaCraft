@@ -223,8 +223,15 @@ struct CostPayload {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoryboardPayload {
-    /// 从哪几集的切片抽帧（去字幕后的那几集）
+    /// 从哪几集抽帧（去字幕后的那几集）
     media_ids: Vec<i64>,
+    /// 和 `media_ids` **一一对应**的 AI 去字幕产物路径。
+    ///
+    /// 空 = 没勾去字幕 / 没产出，执行器退回去重产物。
+    /// 不传这个的话只能走 `media_source_path`（优先去重产物），
+    /// 证明图上会带着硬字幕 —— 用户报过这个。
+    #[serde(default)]
+    quzimu_paths: Vec<String>,
     out_dir: String,
     #[serde(default = "default_frames_per_episode")]
     frames_per_episode: i64,
@@ -657,6 +664,11 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         // 分镜证明：抽帧 → 视觉模型反推 → 拼成证明图
         "storyboard" => {
             let p: StoryboardPayload = parse_payload(job)?;
+            let quzimu = if p.quzimu_paths.is_empty() {
+                None
+            } else {
+                Some(p.quzimu_paths)
+            };
             let report = commands::build_storyboard(
                 app.clone(),
                 state,
@@ -664,6 +676,7 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                 p.out_dir,
                 p.frames_per_episode,
                 p.shots_per_sheet,
+                quzimu,
             )
             .await?;
             Ok(format!(
@@ -1244,13 +1257,32 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             // 用全量计数的话这行永远不出现。
             if db::count_pending_jobs_of_kind_for_drama(&conn, &kind, drama_id)? == 0 {
                 let n = db::count_done_jobs_of_kind(&conn, run_id, &kind).unwrap_or(0);
-                db::append_log(
-                    &conn,
-                    Some(run_id),
-                    None,
-                    "info",
-                    &format!("===== {} 全部完成（{n} 个） =====", kind_label(&kind)),
-                );
+                let bad = db::count_failed_jobs_of_kind(&conn, run_id, &kind).unwrap_or(0);
+                // **失败也得写进这一行。**
+                //
+                // 只写「全部完成（20 个）」会把失败的那一集盖过去 ——
+                // 真实撞到过：两集源文件是坏的，汇总行照样说「全部完成」，
+                // 用户以为都成了，直到整部剧的后续步骤全被撤掉才发现不对。
+                if bad == 0 {
+                    db::append_log(
+                        &conn,
+                        Some(run_id),
+                        None,
+                        "info",
+                        &format!("===== {} 全部完成（{n} 个） =====", kind_label(&kind)),
+                    );
+                } else {
+                    db::append_log(
+                        &conn,
+                        Some(run_id),
+                        None,
+                        "error",
+                        &format!(
+                            "===== {} 结束：成功 {n} 个，失败 {bad} 个（看上面的 ✗ 行） =====",
+                            kind_label(&kind)
+                        ),
+                    );
+                }
             }
         }
     }

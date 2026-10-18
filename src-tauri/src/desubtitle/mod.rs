@@ -61,25 +61,50 @@ const PAD_RATIO: f64 = 0.006;
 /// 不能要求 100%：有的帧刚好是空镜 / 转场，本来就没字幕。
 const MIN_COVERAGE: f64 = 0.25;
 
-/// 从 OCR 结果里算出字幕带。找不到就返回 `None`。
+/// 一个像素框：左上 + 右下。
+type Rect = (f64, f64, f64, f64);
+
+/// 框的纵向中心。
+fn center_y(r: &Rect) -> f64 {
+    (r.1 + r.3) / 2.0
+}
+
+/// 画面里所有要擦的文字区域：字幕 + 水印/台标。
 ///
-/// ## 为什么是「最密的一簇」而不是「全部并集」
+/// ## 为什么不是「全部并集」
 ///
 /// 第一版用全部并集，**实测炸了**：一部剧里 OCR 会扫到各种位置的文字
 /// （字幕、招牌、画面里的字）。并集出来 269px 高 —— 而字幕只有一行 60px。
 /// `delogo` 在那 269px 上做插值，抹出一道横贯画面的拖影，比原来的字幕还难看。
 ///
-/// 正确做法：**字幕是出现最频繁的那个位置**。按纵向中心聚簇，
-/// 取最大的一簇，只盖它。
-pub fn subtitle_band(frames: &[OcrFrame], frame_w: i64, frame_h: i64) -> Option<SubtitleBand> {
-    if frames.is_empty() || frame_w <= 0 || frame_h <= 0 {
-        return None;
+/// ## 为什么也不止「最密的一簇」
+///
+/// 用户的原话是「字幕 水印都要擦的」。真实素材（1280×716）OCR 出来是两簇：
+///
+///     字幕「行动僵硬迟缓」   x 520~761，y 593~632  ← 居中
+///     水印「唐余安漫居」     x 1072~1279，y 648~696 ← 右下角，每帧都有
+///
+/// 两簇的纵向中心只差 60px，碰巧大于聚簇容差（716×0.05 = 35.8px），能分开。
+/// 旧版只留一簇、按中位数挑，水印框数更多就把字幕挤掉了，
+/// 结果 `delogo` 只擦水印、字幕原样留着 —— 用户看 quzimu 和原片一模一样。
+///
+/// 所以：**按纵向中心聚簇，每簇各出一个框**。但簇不能随便多 ——
+/// 招牌、画面里的字也会成簇，擦掉就是毁画面。放行规则：
+///
+/// - **居中**（不贴左右边）的簇：只取一个最像字幕的（命中帧最多、最靠中间）
+/// - **边角且窄**的簇：水印/台标，全取
+///
+/// 返回顺序：字幕在前，水印按命中帧数从多到少。
+pub fn text_bands(frames: &[OcrFrame], frame_w: i64, frame_h: i64) -> Vec<SubtitleBand> {
+    // 画面小到留不出 1px 边距时 `delogo` 根本用不了，直接当「没有文字」
+    if frames.is_empty() || frame_w < 3 || frame_h < 3 {
+        return Vec::new();
     }
     let bottom_limit = frame_h as f64 * (1.0 - SEARCH_BOTTOM_RATIO);
+    let fw = frame_w as f64;
 
-    // 先把所有合格的框收起来
-    let mut boxes: Vec<(f64, f64, f64, f64)> = Vec::new();
-    let mut frames_with_hit = vec![false; frames.len()];
+    // 先把所有合格的框收起来，记着它在第几帧
+    let mut items: Vec<(usize, Rect)> = Vec::new();
     for (fi, frame) in frames.iter().enumerate() {
         for b in &frame.boxes {
             // 只要**整体在下方**的框。跨过中线的多半是画面内容被误认成字。
@@ -92,51 +117,134 @@ pub fn subtitle_band(frames: &[OcrFrame], frame_w: i64, frame_h: i64) -> Option<
             if b.x2 <= b.x1 || b.y2 <= b.y1 {
                 continue;
             }
-            boxes.push((b.x1, b.y1, b.x2, b.y2));
-            frames_with_hit[fi] = true;
+            items.push((fi, (b.x1, b.y1, b.x2, b.y2)));
         }
     }
-    if boxes.is_empty() {
-        return None;
+    if items.is_empty() {
+        return Vec::new();
     }
 
-    // **以中位数为基准剔除离群点**，再取剩下的并集。
+    // **按纵向中心聚簇。**
     //
-    // 真实素材上的实测数据（1080×1920，一部剧抽 42 帧）：
+    // 容差 5% = 96px（1920 上）：够容纳换行的第二行，又分得开字幕和水印。
+    // 和旧版的中位数容差一致，只是从「只留一簇」变成「每簇一个框」。
     //
-    //   24 个框落在 y 1288~1379  ← 就是那一行字幕，高 91px
-    //    1 个框落在 y 1524~1557  ← 某帧的误检（画面里的字被当成字幕）
-    //
-    // 那一个误检把并集从 91px 拖到 269px，`delogo` 在 269px 上插值 = 一道
-    // 横贯画面的拖影，比原字幕还难看。
-    //
-    // 聚簇试过、不够：字间距和误检间距会连成一片。用中位数最稳 ——
-    // 字幕是**出现最频繁的那个位置**，中位数天然落在它上面。
-    let mut centers: Vec<f64> = boxes.iter().map(|b| (b.1 + b.3) / 2.0).collect();
-    centers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = centers[centers.len() / 2];
-
-    // 允许偏离中位数多少：两行字幕的行距大约就这么高。
-    // 取 5% = 96px（1920 上）—— 够容纳换行的第二行，又排除得了误检。
-    let tolerance = frame_h as f64 * 0.05;
-    let kept: Vec<&(f64, f64, f64, f64)> = boxes
-        .iter()
-        .filter(|b| ((b.1 + b.3) / 2.0 - median).abs() <= tolerance)
-        .collect();
-    if kept.is_empty() {
-        return None;
+    // 基准用簇内**均值**而不是首元素：单链式聚簇会把
+    // 「字幕 1590 → 招牌 1680」一路连成一串。
+    items.sort_by(|a, b| {
+        center_y(&a.1)
+            .partial_cmp(&center_y(&b.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let tol = frame_h as f64 * 0.05;
+    let mut clusters: Vec<(Vec<(usize, Rect)>, f64)> = Vec::new();
+    for item in items {
+        let c = center_y(&item.1);
+        match clusters.last_mut() {
+            Some((list, sum)) if (c - *sum / list.len() as f64).abs() <= tol => {
+                *sum += c;
+                list.push(item);
+            }
+            _ => clusters.push((vec![item], c)),
+        }
     }
 
-    let x1 = kept.iter().map(|b| b.0).fold(f64::MAX, f64::min);
-    let y1 = kept.iter().map(|b| b.1).fold(f64::MAX, f64::min);
-    let x2 = kept.iter().map(|b| b.2).fold(f64::MIN, f64::max);
-    let y2 = kept.iter().map(|b| b.3).fold(f64::MIN, f64::max);
-
+    // 每簇取并集 → 一个框
     let pad = (frame_h as f64 * PAD_RATIO).round().max(2.0);
-    let px1 = (x1 - pad).max(0.0);
-    let py1 = (y1 - pad).max(0.0);
-    let px2 = (x2 + pad).min(frame_w as f64);
-    let py2 = (y2 + pad).min(frame_h as f64);
+    let mut candidates: Vec<SubtitleBand> = Vec::new();
+    for (list, _) in clusters {
+        let mut hit = vec![false; frames.len()];
+        let (mut x1, mut y1, mut x2, mut y2) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for (fi, r) in &list {
+            hit[*fi] = true;
+            x1 = x1.min(r.0);
+            y1 = y1.min(r.1);
+            x2 = x2.max(r.2);
+            y2 = y2.max(r.3);
+        }
+        let hits = hit.iter().filter(|h| **h).count();
+        if let Some(band) = make_band(x1, y1, x2, y2, pad, frame_w, frame_h, hits, frames.len()) {
+            candidates.push(band);
+        }
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // **边角且窄 = 水印/台标；居中 = 字幕。**
+    //
+    // 两簇的纵向位置挨得太近，分不开；横向位置才可靠：
+    // 字幕是居中的，水印/台标贴左右边角且窄。
+    let narrow_w = fw * 0.3;
+    let is_corner = |b: &SubtitleBand| {
+        let cx = b.x as f64 + b.w as f64 / 2.0;
+        (b.w as f64) < narrow_w && (cx < fw * 0.25 || cx > fw * 0.75)
+    };
+    let centrality = |b: &SubtitleBand| (b.x as f64 + b.w as f64 / 2.0 - fw / 2.0).abs();
+
+    let mut subtitle: Option<SubtitleBand> = None;
+    let mut overlays: Vec<SubtitleBand> = Vec::new();
+    for b in candidates {
+        if is_corner(&b) {
+            overlays.push(b);
+            continue;
+        }
+        // 居中的簇只留一个：命中帧多的优先，一样多就选更靠中间的
+        let better = match &subtitle {
+            None => true,
+            Some(cur) => {
+                b.hit_frames > cur.hit_frames
+                    || (b.hit_frames == cur.hit_frames && centrality(&b) < centrality(cur))
+            }
+        };
+        if better {
+            subtitle = Some(b);
+        }
+    }
+
+    overlays.sort_by(|a, b| b.hit_frames.cmp(&a.hit_frames));
+    let mut bands: Vec<SubtitleBand> = Vec::with_capacity(overlays.len() + 1);
+    if let Some(b) = subtitle {
+        bands.push(b);
+    }
+    bands.extend(overlays);
+    // 两个框挨得太近（padding 后重叠）就并成一个 —— 同一块擦两遍会更糊
+    merge_overlapping(bands)
+}
+
+/// 只要一个框的旧接口：字幕优先，没有居中字幕时退回边角文字。
+#[cfg(test)]
+fn subtitle_band(frames: &[OcrFrame], frame_w: i64, frame_h: i64) -> Option<SubtitleBand> {
+    text_bands(frames, frame_w, frame_h).into_iter().next()
+}
+
+/// 给一簇框扩边、夹进画面、取整，得到一个能直接喂 `delogo` 的框。
+///
+/// **框的四周都要留 1px。**
+///
+/// `delogo` 的硬约束（本机 ffmpeg 实测：x=0、y=0、x+w=宽、y+h=高 四种
+/// 都直接报 "Logo area is outside of the frame."，整集失败）：
+///
+///     x ≥ 1、y ≥ 1、x+w ≤ 宽-1、y+h ≤ 高-1
+///
+/// 以前只把框裁到 [0, 宽]：竖屏剧字幕在画面中间，从没贴过边；换一部
+/// 横屏剧、OCR 的框碰到右边界（RapidOCR 映射回原图坐标时能到边界），
+/// 整部剧的去字幕就全挂 —— 报错还只有一句 "Logo area is outside"。
+fn make_band(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    pad: f64,
+    frame_w: i64,
+    frame_h: i64,
+    hit_frames: usize,
+    total_frames: usize,
+) -> Option<SubtitleBand> {
+    let px1 = (x1 - pad).max(1.0);
+    let py1 = (y1 - pad).max(1.0);
+    let px2 = (x2 + pad).min(frame_w as f64 - 1.0);
+    let py2 = (y2 + pad).min(frame_h as f64 - 1.0);
     if px2 <= px1 || py2 <= py1 {
         return None;
     }
@@ -151,34 +259,76 @@ pub fn subtitle_band(frames: &[OcrFrame], frame_w: i64, frame_h: i64) -> Option<
     let y = py1.round() as i64;
     let right = px2.round() as i64;
     let bottom = py2.round() as i64;
-    let w = (right - x).min(frame_w - x);
-    let h = (bottom - y).min(frame_h - y);
-    if x < 0 || y < 0 || w <= 0 || h <= 0 {
+    let w = (right - x).min(frame_w - 1 - x);
+    let h = (bottom - y).min(frame_h - 1 - y);
+    if x < 1 || y < 1 || w <= 0 || h <= 0 {
         return None;
     }
-
     let band = SubtitleBand {
         x,
         y,
         w,
         h,
-        hit_frames: frames_with_hit.iter().filter(|h| **h).count(),
-        total_frames: frames.len(),
+        hit_frames,
+        total_frames,
     };
-
+    // 偶尔一帧扫到不算数 —— 低于门槛的簇不擦
     if band.coverage() < MIN_COVERAGE {
         return None;
     }
     Some(band)
 }
 
+/// 两个框有重叠就并成一个。
+fn merge_overlapping(mut bands: Vec<SubtitleBand>) -> Vec<SubtitleBand> {
+    let overlaps = |a: &SubtitleBand, b: &SubtitleBand| {
+        a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+    };
+    let mut merged = true;
+    while merged {
+        merged = false;
+        'scan: for i in 0..bands.len() {
+            for j in (i + 1)..bands.len() {
+                if !overlaps(&bands[i], &bands[j]) {
+                    continue;
+                }
+                let x = bands[i].x.min(bands[j].x);
+                let y = bands[i].y.min(bands[j].y);
+                let right = (bands[i].x + bands[i].w).max(bands[j].x + bands[j].w);
+                let bottom = (bands[i].y + bands[i].h).max(bands[j].y + bands[j].h);
+                // 命中帧取小的那个：宁可少报覆盖率，不要吹
+                let hit_frames = bands[i].hit_frames.min(bands[j].hit_frames);
+                let total_frames = bands[i].total_frames;
+                bands[i] = SubtitleBand {
+                    x,
+                    y,
+                    w: right - x,
+                    h: bottom - y,
+                    hit_frames,
+                    total_frames,
+                };
+                bands.remove(j);
+                merged = true;
+                break 'scan;
+            }
+        }
+    }
+    bands
+}
+
 /// `delogo` 的滤镜串。
+///
+/// 多个区域直接逗号串起来 —— ffmpeg 按顺序一块一块擦。
 ///
 /// 为什么用 `delogo` 而不是 `boxblur`/`drawbox`：
 /// `delogo` 是**用四周的像素往中间插值**，不是糊一块黑或高斯模糊 ——
 /// 在纯色/渐变背景上几乎看不出来。代价是它要求整个框都在画面内。
-pub fn delogo_filter(band: &SubtitleBand) -> String {
-    format!("delogo=x={}:y={}:w={}:h={}", band.x, band.y, band.w, band.h)
+pub fn delogo_filter(bands: &[SubtitleBand]) -> String {
+    bands
+        .iter()
+        .map(|b| format!("delogo=x={}:y={}:w={}:h={}", b.x, b.y, b.w, b.h))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -266,6 +416,35 @@ mod tests {
         assert!(b.y + b.h <= 1920, "下边越界了：{b:?}");
     }
 
+    /// **贴边就被拒。** 实测 `delogo` 要求 x≥1、y≥1、x+w≤宽-1、y+h≤高-1：
+    /// 1280×700 上 x=1027、w=253（x+w=1280）直接报
+    /// "Logo area is outside of the frame."，整集失败。
+    /// OCR 的框偶尔会顶到画面最右/最下，这条保证算出来的框永远不贴边。
+    #[test]
+    fn band_keeps_one_pixel_from_every_edge() {
+        let frames = vec![OcrFrame {
+            time_ms: 0,
+            text: "贴边".into(),
+            boxes: vec![OcrBox { x1: 1020.0, y1: 640.0, x2: 1280.0, y2: 700.0 }],
+        }];
+        let b = subtitle_band(&frames, 1280, 700).expect("该找到");
+        assert!(b.x >= 1 && b.y >= 1, "上/左要留 1px：{b:?}");
+        assert!(b.x + b.w <= 1279, "右边要留 1px：{b:?}");
+        assert!(b.y + b.h <= 699, "下边要留 1px：{b:?}");
+    }
+
+    /// 框从画面左上角开始也一样：x=0 / y=0 同样被 `delogo` 拒。
+    #[test]
+    fn band_keeps_one_pixel_at_the_top_left() {
+        let frames = vec![OcrFrame {
+            time_ms: 0,
+            text: "左上".into(),
+            boxes: vec![OcrBox { x1: 0.0, y1: 500.0, x2: 300.0, y2: 560.0 }],
+        }];
+        let b = subtitle_band(&frames, 1280, 700).expect("该找到");
+        assert!(b.x >= 1 && b.y >= 1, "{b:?}");
+    }
+
     /// 没有字就没有字幕带。
     #[test]
     fn no_boxes_means_no_band() {
@@ -309,15 +488,147 @@ mod tests {
     }
 
     #[test]
+    fn corner_watermark_does_not_steal_the_subtitle_band() {
+        // 真实素材（1280×716）的 OCR 结果，每帧两个框：
+        //   居中的字幕 + 右下角的水印（x 1072~1279，y 648~696）
+        // 旧逻辑按纵向中位数聚簇，水印框多、中位数落在水印上，
+        // 结果只擦了水印，字幕原样留着。
+        let mut frames = Vec::new();
+        for (i, (x1, x2)) in [(520.0, 761.0), (480.0, 803.0), (360.0, 925.0)]
+            .iter()
+            .cycle()
+            .take(12)
+            .enumerate()
+        {
+            let text = if i == 0 { "" } else { "行动僵硬迟缓" };
+            let mut boxes = vec![OcrBox {
+                x1: 1072.0,
+                y1: 648.0,
+                x2: 1279.0,
+                y2: 696.0,
+            }];
+            if !text.is_empty() {
+                boxes.push(OcrBox {
+                    x1: *x1,
+                    y1: 593.0,
+                    x2: *x2,
+                    y2: 632.0,
+                });
+            }
+            frames.push(OcrFrame {
+                time_ms: 0,
+                text: text.into(),
+                boxes,
+            });
+        }
+        let b = subtitle_band(&frames, 1280, 716).expect("该找到字幕带");
+        assert!(b.x <= 360 && b.x + b.w >= 925, "要盖住居中的字幕：{b:?}");
+        assert!(
+            b.x + b.w < 1060,
+            "不该被右下角水印带到右边去（那就是旧 bug）：{b:?}"
+        );
+        assert!(b.y <= 593 && b.y + b.h >= 632, "要盖住字幕的上下范围：{b:?}");
+    }
+
+    #[test]
+    fn a_lone_corner_watermark_still_gets_covered() {
+        // 全片只有边角一处文字（没有任何居中字幕）时退出筛选，
+        // 保持旧行为 —— 擦水印总比什么都不做好。
+        let frames = vec![frame(648.0, 696.0, 1072.0, 1279.0); 3];
+        let b = subtitle_band(&frames, 1280, 716).expect("该找到");
+        assert!(b.x >= 1060, "只该盖住右下角那块：{b:?}");
+    }
+
+    /// 用户的原话：「字幕 水印都要擦的」。
+    ///
+    /// 真实素材（1280×716）每帧两个框：居中的字幕 + 右下角水印。
+    /// 两个都得是独立的 `delogo` 区域。
+    #[test]
+    fn subtitle_and_corner_watermark_are_both_removed() {
+        let mut frames = Vec::new();
+        for (i, (x1, x2)) in [(520.0, 761.0), (480.0, 803.0), (360.0, 925.0)]
+            .iter()
+            .cycle()
+            .take(12)
+            .enumerate()
+        {
+            let text = if i == 0 { "" } else { "行动僵硬迟缓" };
+            let mut boxes = vec![OcrBox {
+                x1: 1072.0,
+                y1: 648.0,
+                x2: 1279.0,
+                y2: 696.0,
+            }];
+            if !text.is_empty() {
+                boxes.push(OcrBox {
+                    x1: *x1,
+                    y1: 593.0,
+                    x2: *x2,
+                    y2: 632.0,
+                });
+            }
+            frames.push(OcrFrame {
+                time_ms: 0,
+                text: text.into(),
+                boxes,
+            });
+        }
+        let bands = text_bands(&frames, 1280, 716);
+        assert_eq!(bands.len(), 2, "字幕 + 水印各一个框：{bands:?}");
+        assert!(
+            bands[0].x <= 360 && bands[0].x + bands[0].w >= 925 && bands[0].x + bands[0].w < 1060,
+            "第一个是居中字幕：{bands:?}"
+        );
+        assert!(
+            bands[1].x >= 1060 && bands[1].y <= 648 && bands[1].y + bands[1].h >= 696,
+            "第二个是右下角水印：{bands:?}"
+        );
+        let filter = delogo_filter(&bands);
+        assert_eq!(filter.matches("delogo=").count(), 2, "两块都要擦：{filter}");
+    }
+
+    /// 画面里还有别的居中文字（招牌、画面里的字）时，只当字幕擦**一条**。
+    #[test]
+    fn only_one_centered_cluster_is_treated_as_subtitles() {
+        // 主字幕 4 帧都在；另一行居中文字只出现 2 帧（50%，过了门槛）
+        let mut frames = vec![frame(1600.0, 1700.0, 300.0, 780.0); 4];
+        for f in frames.iter_mut().take(2) {
+            f.boxes.push(OcrBox {
+                x1: 320.0,
+                y1: 1450.0,
+                x2: 760.0,
+                y2: 1500.0,
+            });
+        }
+        let bands = text_bands(&frames, 1080, 1920);
+        assert_eq!(bands.len(), 1, "只留命中最多那条：{bands:?}");
+        assert!(bands[0].y >= 1580, "留下的应该是主字幕：{bands:?}");
+    }
+
+    #[test]
     fn delogo_filter_is_well_formed() {
-        let b = SubtitleBand {
-            x: 10,
-            y: 1600,
-            w: 800,
-            h: 100,
-            hit_frames: 3,
-            total_frames: 3,
-        };
-        assert_eq!(delogo_filter(&b), "delogo=x=10:y=1600:w=800:h=100");
+        let bands = [
+            SubtitleBand {
+                x: 10,
+                y: 1600,
+                w: 800,
+                h: 100,
+                hit_frames: 3,
+                total_frames: 3,
+            },
+            SubtitleBand {
+                x: 1068,
+                y: 644,
+                w: 211,
+                h: 56,
+                hit_frames: 3,
+                total_frames: 3,
+            },
+        ];
+        assert_eq!(
+            delogo_filter(&bands),
+            "delogo=x=10:y=1600:w=800:h=100,delogo=x=1068:y=644:w=211:h=56"
+        );
+        assert!(delogo_filter(&[]).is_empty());
     }
 }

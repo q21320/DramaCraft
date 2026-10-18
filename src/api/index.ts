@@ -35,8 +35,11 @@ import type {
   ExportOutcome,
   DownloadedDrama,
   FanqieCategoryPage,
+  FanqieDownloadBatchReport,
+  FanqieDownloadPick,
   FanqieDownloadReport,
   FanqieDownloadRequest,
+  FanqieDownloadState,
   FanqiePlayInfo,
   FanqiePreparedVideo,
   FanqieSelectItems,
@@ -367,9 +370,24 @@ export const api = {
   dedupMedia: (mediaId: number, intensity: string, headerLabel: HeaderLabel | null, outDir: string) =>
     call<DedupReport>("dedup_media", { mediaId, intensity, headerLabel, outDir }),
 
-  /** 分镜证明：抽帧 → 视觉模型反推 → 拼成报备用的证明图 */
-  buildStoryboard: (mediaIds: number[], outDir: string, framesPerEpisode: number, shotsPerSheet: number) =>
-    call<StoryboardReport>("build_storyboard", { mediaIds, outDir, framesPerEpisode, shotsPerSheet }),
+  /**
+   * 分镜证明：抽帧 → 视觉模型反推 → 拼成报备用的证明图。
+   * `quzimuPaths` 和 `mediaIds` 一一对应；不给就退回去重产物（图上会带字幕）。
+   */
+  buildStoryboard: (
+    mediaIds: number[],
+    outDir: string,
+    framesPerEpisode: number,
+    shotsPerSheet: number,
+    quzimuPaths?: string[],
+  ) =>
+    call<StoryboardReport>("build_storyboard", {
+      mediaIds,
+      outDir,
+      framesPerEpisode,
+      shotsPerSheet,
+      quzimuPaths: quzimuPaths ?? null,
+    }),
 
   // 运行日志：afterId 用来增量拉取，只要新行
   listLogs: (runId: number | null, afterId: number, limit?: number) =>
@@ -457,4 +475,27 @@ export const api = {
       quality: quality ?? null,
       transcode: transcode ?? null,
     }),
+  /**
+   * 批量下载：整批交给后端跑。
+   *
+   * 推进的循环在 Rust 里，页面刷新/切页都不会断；进度靠 `fanqie:download`
+   * 事件和 `fanqieDownloadState` 读回来。
+   */
+  fanqieDownloadBatch: (
+    picks: FanqieDownloadPick[],
+    outRoot: string,
+    quality?: string,
+    transcode?: boolean,
+  ) =>
+    call<FanqieDownloadBatchReport>("fanqie_download_batch", {
+      picks,
+      outRoot,
+      quality: quality ?? null,
+      transcode: transcode ?? null,
+    }),
+  /** 当前/最后一次批量下载的状态（刷新后用它把面板恢复） */
+  fanqieDownloadState: () =>
+    call<FanqieDownloadState>("fanqie_download_state"),
+  /** 收起面板时清掉错误，否则刷新页面又会弹回来 */
+  fanqieDownloadDismiss: () => call<void>("fanqie_download_dismiss"),
 };

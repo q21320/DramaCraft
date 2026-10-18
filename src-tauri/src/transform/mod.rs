@@ -391,10 +391,30 @@ pub fn build_video_filter(raw: &TransformOptions, target: Option<(u32, u32)>) ->
         parts.push(format!("fps={}", o.fps as i64));
     }
 
-    // **统一出 720p。** 真实软件是 1080 进、720 出。
-    // 放在最后：前面所有处理都在原尺寸上做，最后一步才降下来。
+    // **统一出 720p —— 按「长边」算，不是按高度。**
+    //
+    // 真实软件是 1080 进、720 出，但那只对**竖屏**成立。写成
+    // `scale=-2:1280` 的话，横屏素材（比如 872×480）会被放大成
+    // **2324×1280** —— 又慢又糊，而且和 `tmix` 撞在一起会直接把内存吃光：
+    //
+    //     119 帧 × 2324×1280 × 3 字节 ≈ 1.06 GB   ← 只算 tmix 的帧缓冲
+    //     119 帧 ×  720×1280 × 3 字节 ≈ 0.33 GB   ← 竖屏没这个问题
+    //
+    // 实测 28 集竖屏全过、横屏那集 `frame= 0` 直接失败。
+    //
+    // 现在：竖屏锁高度（720×1280），横屏锁宽度（1280×720）。两边的
+    // 「长边」都是 1280，这才是 720p 的本意。**竖屏行为完全不变。**
     if o.max_height > 0 {
-        parts.push(format!("scale=-2:{}", o.max_height));
+        let portrait = match target {
+            Some((w, h)) => h >= w,
+            // 不知道源尺寸时按竖屏处理 —— 这个项目的主体是竖屏短剧
+            None => true,
+        };
+        if portrait {
+            parts.push(format!("scale=-2:{}", o.max_height));
+        } else {
+            parts.push(format!("scale={}:-2", o.max_height));
+        }
     }
 
     // 片头标识放在**最后**：它要压在最终画面上。
@@ -405,6 +425,8 @@ pub fn build_video_filter(raw: &TransformOptions, target: Option<(u32, u32)>) ->
         // 标识画在 `scale=-2:720` 之后，画面已经是 720 高了；
         // 还按源尺寸 1920 算字号的话，字会大三倍（实测 fontsize=58 画在 720 上）。
         let (w, h) = target.unwrap_or((1080, 1920));
+        // 上面这行的 (1080,1920) 只是「完全探不到」时的兜底；
+        // 正常路径一定带 target（探测到的真实宽高）。
         let size = (w as i64, final_height(&o, h as i64));
         let seg = build_label_filter(label, size)?;
         if !seg.is_empty() {
@@ -1105,10 +1127,11 @@ pub fn apply(
 
     if !output.status.success() {
         let _ = std::fs::remove_file(&temp);
-        return Err(AppError::Process(format!(
-            "处理失败（退出码 {:?}）：{}",
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Process(diagnose(
+            &stderr,
+            input,
             output.status.code(),
-            tail(&String::from_utf8_lossy(&output.stderr))
         )));
     }
     if !temp.is_file() {
@@ -1121,6 +1144,86 @@ pub fn apply(
     }
     std::fs::rename(&temp, out)?;
     Ok(std::fs::metadata(out).map(|m| m.len() as i64).unwrap_or(0))
+}
+
+/// 把一次失败翻译成一句**用户能照着做**的话。
+///
+/// 真实撞到过：下载没下全的两集，去重时刷了上万行解码错误，日志里只有最后
+/// 800 字符（全是编码器参数），用户根本看不出是下载的问题 —— 只能去猜。
+///
+/// 所以按原因分三支：素材坏、没有画面、参数不适用。前两种都指向
+/// 「重新下载这一集」，第三种是工具自己的问题，不能让人白重下一次。
+fn diagnose(stderr: &str, input: &Path, code: Option<i32>) -> String {
+    let name = input
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // 1. 源文件根本解不开（HEVC 的 NAL 单元错、AAC 帧错都算）。
+    if let Some(line) = crate::media::decode_error_line(stderr) {
+        return format!(
+            "源文件坏了，解不出内容（{name}）—— 多半是下载没下全或下载到的就是不完整的那一版，重新下载这一集再跑。\n\
+             ffmpeg：{}",
+            crate::media::strip_pointer(line)
+        );
+    }
+
+    // 2. 参数/滤镜问题 —— 这时候让用户重下就是白费力气。
+    //
+    // **必须排在「一帧都没编出来」之前**：滤镜挂了也会报一句
+    // "Nothing was written into output file"，拿它当素材问题就错怪了源文件。
+    if stderr.contains("Invalid too big or non positive size")
+        || stderr.contains("Error reinitializing filters")
+        || stderr.contains("Could not open encoder before EOF")
+    {
+        return format!(
+            "处理参数在这一集上用不了（{name}）：{}",
+            key_lines(stderr)
+        );
+    }
+
+    // 3. 一帧都没编出来，但解码器没报具体错。
+    if stderr.contains("Output file is empty, nothing was encoded")
+        || stderr.contains("Nothing was written into output file")
+    {
+        return format!(
+            "源文件没有可用画面（{name}）—— 一帧都没解出来，重新下载这一集再跑。\n\
+             ffmpeg：{}",
+            key_lines(stderr)
+        );
+    }
+
+    format!(
+        "处理失败（退出码 {}）：{}",
+        code.unwrap_or(-1),
+        key_lines(stderr)
+    )
+}
+
+/// 从 stderr 里挑几条有信息量的错误行。
+///
+/// 坏素材会刷**上万行**（每帧一条）。原来把最后 800 字符塞进日志，
+/// 用户看到的全是编码器参数 —— 既不知道哪坏了，也不知道该干什么。
+fn key_lines(stderr: &str) -> String {
+    const NOISY: [&str; 5] = ["rror", "Invalid", "failed", "Failed", "not allocated"];
+    let mut picked: Vec<String> = Vec::new();
+    for raw in stderr.lines() {
+        let line = raw.trim();
+        if line.is_empty() || !NOISY.iter().any(|k| line.contains(k)) {
+            continue;
+        }
+        let line = crate::media::strip_pointer(line);
+        if !picked.contains(&line) {
+            picked.push(line);
+        }
+        if picked.len() >= 4 {
+            break;
+        }
+    }
+    if picked.is_empty() {
+        return tail(stderr);
+    }
+    picked.join("\n")
 }
 
 #[cfg(test)]
@@ -1141,6 +1244,38 @@ mod tests {
         assert!(is_noop(&opts()));
         assert_eq!(vf(&opts(), None), "");
         assert_eq!(build_audio_filter(&opts()), "");
+    }
+
+    /// 坏素材的诊断必须指向「重新下载这一集」。
+    ///
+    /// 真实撞到过：两集下载没下全，去重时刷了上万行解码错误，
+    /// 日志里只有最后 800 字符（全是编码器参数）—— 用户根本看不出是下载的问题。
+    #[test]
+    fn corrupt_source_is_diagnosed_as_redownload() {
+        let stderr = "[aac @ 000002635632b5c0] channel element 3.11 is not allocated\n\
+[hevc @ 00000263563cd9c0] Invalid NAL unit size (1746351624 > 7589).\n\
+[hevc @ 00000263563cd9c0] Error splitting the input into NAL units.\n\
+frame=    0 fps=0.0 q=0.0 Lsize=       0KiB time=N/A bitrate=N/A speed=N/A\n\
+Conversion failed!";
+
+        let msg = diagnose(stderr, Path::new("D:/源/第20集.mp4"), Some(69));
+        assert!(msg.contains("重新下载"), "{msg}");
+        assert!(msg.contains("第20集.mp4"), "要能看出是哪一集：{msg}");
+        // 上万行不能原样塞进来
+        assert!(msg.lines().count() <= 3, "{msg}");
+        // 对象地址每次都不同，要抹掉
+        assert!(!msg.contains("000002635632b5c0"), "{msg}");
+    }
+
+    /// 参数/滤镜不行的时候不能甩锅给素材 —— 让人白重下一次下载。
+    #[test]
+    fn filter_failure_does_not_blame_the_source() {
+        let stderr = "[vf#0:0 @ 0000024293f2ae40] Invalid too big or non positive size for width '774'\n\
+[out#0/mp4 @ 0000024293f3c800] Nothing was written into output file, because at least one of its streams received no packets.";
+
+        let msg = diagnose(stderr, Path::new("D:/源/第08集.mp4"), Some(69));
+        assert!(!msg.contains("重新下载"), "{msg}");
+        assert!(msg.contains("参数"), "{msg}");
     }
 
     /// 自动生成的参数**永远不能镜像**。

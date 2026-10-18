@@ -16,11 +16,41 @@ body,
   padding: 0;
 }
 
+/*
+ * 桌面应用不是网页：默认不让划选。
+ *
+ * 浏览器里拖一下鼠标选中半页文字是常态；放进应用里就变成满屏蓝底，
+ * 还能把文字、图片直接拖到别的窗口去 —— 一眼还是「网页」。
+ * 真需要复制的地方单独放开：输入框、日志、路径 / ID 这类等宽文本、表格。
+ */
 body {
   font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, -apple-system,
     "Segoe UI", sans-serif;
   font-size: 14px;
   line-height: 1.7;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+input,
+textarea,
+select,
+[contenteditable],
+pre,
+code,
+.dd-mono,
+.dd-logbox,
+table.dd-table,
+.dd-selectable {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* 图片、视频、链接不能被拖出去（拖到桌面会变成文件副本） */
+img,
+video,
+a {
+  -webkit-user-drag: none;
 }
 
 /* 卡片区块：页面里所有"一块内容"统一用它 */

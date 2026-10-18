@@ -9,7 +9,7 @@ use crate::models::{MediaProbe, SlicePlan};
 use crate::proc::{no_window, tail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub fn ms_to_secs(ms: i64) -> String {
     format!("{:.3}", ms as f64 / 1000.0)
@@ -111,6 +111,86 @@ pub fn probe(ffprobe: &Path, input: &Path) -> AppResult<MediaProbe> {
             .and_then(|f| f.format_name)
             .unwrap_or_default(),
     })
+}
+
+// ---------------- 能不能播：解码自检 ----------------
+
+/// 坏素材解码时的典型报错。
+///
+/// 下载没下全 / CDN 给的片段缺损时，ffmpeg 用 `-c copy` 转封装**照样报成功**，
+/// 坏文件就这么落盘了；等到去重、切片时才炸，而那时刷出来的是上万行解码错误，
+/// 用户看不出「这是下载的问题」。下面这几条是所有坏素材共同的特征。
+const DECODE_ERRORS: [&str; 8] = [
+    "Invalid NAL unit size",
+    "Error splitting the input into NAL units",
+    "Error submitting packet to decoder",
+    "Invalid data found when processing input",
+    "channel element",
+    "Reserved bit set",
+    "Prediction is not allowed",
+    "error while decoding",
+];
+
+/// 从 ffmpeg 的 stderr 里挑出**第一条**能说明「文件坏了」的行。
+///
+/// 坏文件会刷上万行（每帧一条），所以只取第一条 —— 够定位，也不会淹掉日志。
+pub fn decode_error_line(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| DECODE_ERRORS.iter().any(|key| line.contains(key)))
+}
+
+/// 去掉 ffmpeg 日志里的对象地址：`[aac @ 000001c3df778280] xxx` → `[aac] xxx`。
+///
+/// 地址每次运行都不一样，留着既吵又像关键信息 ——
+/// 日志里「播不了（解码报错：[aac @ 000001c3...] channel element ...）」根本读不下去。
+pub fn strip_pointer(line: &str) -> String {
+    let Some(close) = line.find(']') else {
+        return line.to_string();
+    };
+    let Some(at) = line[..close].find(" @ ") else {
+        return line.to_string();
+    };
+    format!("{}{}", &line[..at], &line[close..])
+}
+
+/// 完整解码一遍（不编码、不落盘），回答「这个文件到底能不能播」。
+///
+/// **能解密、能转封装，不等于能播。** 下载链路里用的就是 `-c copy`，
+/// 源片段坏了它照样成功，于是坏文件一路走到去重才失败。这里真解码一遍，
+/// 坏的在下载阶段就能发现并重下。
+///
+/// 实测一集 60 秒的 480p 素材约 0.6 秒 —— 比重新下载一次便宜得多。
+pub fn decode_check(ffmpeg: &Path, file: &Path) -> AppResult<()> {
+    if !file.is_file() {
+        return Err(AppError::Msg("文件不存在".into()));
+    }
+
+    let out = no_window(
+        Command::new(ffmpeg)
+            .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-i"])
+            .arg(file)
+            .args(["-map", "0:v:0", "-map", "0:a:0?", "-f", "null", "-"]),
+    )
+    .stdin(Stdio::null())
+    .output()
+    .map_err(|e| AppError::Process(format!("无法启动 ffmpeg：{e}")))?;
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // **解码报错就算不过**，哪怕 ffmpeg 退出码是 0 ——
+    // 半坏的文件能「跑完」，但画面会花、会卡，拿去发布是废片。
+    if let Some(line) = decode_error_line(&stderr) {
+        return Err(AppError::Process(format!("解码报错：{}", strip_pointer(line))));
+    }
+    if !out.status.success() {
+        return Err(AppError::Process(format!(
+            "解码失败（退出码 {:?}）：{}",
+            out.status.code(),
+            tail(&stderr)
+        )));
+    }
+    Ok(())
 }
 
 // ---------------- ffmpeg 切片 ----------------
@@ -355,6 +435,85 @@ fn finish(out: &Path, temp: &Path, how: &str) -> AppResult<SliceOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 坏文件的典型报错要能认出来。
+    ///
+    /// 下载阶段就是靠这几条判断「这一集能不能播」—— 认不出来，坏文件会
+    /// 一路走到去重才炸，用户看到的是一屏 "Conversion failed"。
+    #[test]
+    fn corruption_markers_are_recognised() {
+        let broken = "[aac @ 000002635632b5c0] channel element 3.11 is not allocated\n\
+[hevc @ 00000263563cd9c0] Invalid NAL unit size (1746351624 > 7589).\n\
+[hevc @ 00000263563cd9c0] Error splitting the input into NAL units.\n\
+Conversion failed!";
+        let hit = decode_error_line(broken).expect("应当认出坏文件");
+        assert!(hit.contains("channel element"), "{hit}");
+
+        // 正常的编码器统计不能误伤
+        let fine = "[libx264 @ 000001] kb/s:5931.57\n[aac @ 000001] Qavg: 1351.030";
+        assert!(decode_error_line(fine).is_none(), "{fine}");
+    }
+
+    /// 好片子要能过自检，坏片子（截掉一半）要能当场拦住。
+    ///
+    /// 做法就是把一段真编出来的片截短：mdat 断在中间 → 解码器必然报
+    /// "Invalid NAL unit size"/"Error splitting the input into NAL units"。
+    /// 这正是「下载没下全」产生的文件。
+    #[test]
+    fn decode_check_accepts_good_and_rejects_truncated() {
+        let Some(ffmpeg) = std::env::var("DRAMADIST_TEST_FFMPEG")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+        else {
+            eprintln!("跳过：未设置 DRAMADIST_TEST_FFMPEG");
+            return;
+        };
+
+        let dir = std::env::temp_dir().join("dramadist_decode_check");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.mp4");
+        let st = crate::proc::no_window(
+            Command::new(&ffmpeg).args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x96:rate=10",
+                "-t",
+                "3",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+            ]),
+        )
+        .arg(&good)
+        .status()
+        .expect("生成测试视频失败");
+        assert!(st.success());
+
+        decode_check(&ffmpeg, &good).expect("好片子应当通过自检");
+
+        // 截到一半：模拟「下载没下全」
+        let bytes = std::fs::read(&good).unwrap();
+        let cut = dir.join("cut.mp4");
+        std::fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(
+            decode_check(&ffmpeg, &cut).is_err(),
+            "截断的片子必须被拦住，否则坏文件会一路走到去重"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 兼容模式：源是 HEVC 时必须转成 H.264。
     ///

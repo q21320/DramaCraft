@@ -1,8 +1,8 @@
 import { defineStore } from "pinia";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/api";
-import type { FanqieDownloadProgress } from "@/types";
+import type { FanqieDownloadState } from "@/types";
 
 /** 列表里挑出来要下载的剧 —— 只需要下载用得到的字段。 */
 export interface DownloadPick {
@@ -12,45 +12,51 @@ export interface DownloadPick {
 }
 
 /**
- * 进度事件监听放在**模块级**，不放进 store state：
- * 它是运行时句柄，不需要响应式。
+ * 进度事件监听只需要装一次。运行时句柄不用存 —— 面板和 store
+ * 跟着应用生命周期活，不存在局部卸载后要解绑的情况。
  */
-let unlisten: UnlistenFn | null = null;
+let bindStarted = false;
+/** running 时的兜底轮询：事件万一漏了，面板也不会卡在旧进度上 */
+let pollTimer: number | null = null;
 
 /**
  * 批量下载的状态与流程。
  *
- * ## 为什么放在 Pinia 里
+ * ## 为什么推进的循环在后端
  *
- * 组件内的 `reactive` 会随页面卸载一起消失 —— 用户切去别的页面再回来，
- * 看到的是全新状态：进度 0、面板消失，以为下载停了。
+ * 以前这里是前端 `for` 循环逐部调命令 —— 循环活在页面里，刷新一下
+ * 循环就没了：右下角面板消失、进度归零，看起来像下载被取消了。
+ * 现在整批交给 `fanqie_download_batch`，Rust 那边一部部推；
+ * 状态存在 `AppState.download` 并落一份到 setting：
  *
- * 实际情况是 `downloadSelected` 的异步循环还在跑（Vue 卸载组件不会掐 Promise），
- * 只是没人记录它的进度。放大到 store 之后：
- *
- * - 流程不依赖页面，切页面下载照跑；
- * - 进度事件由 store 监听，回来直接看到当前值；
- * - 进度浮层挂在 MainLayout 上（`DownloadPanel`），在哪个页面都看得见。
+ * - 页面刷新：重新挂载时 `restore()` 读回状态，面板接着显示；
+ * - 切页面：本来就不影响；
+ * - 应用关掉：下次启动读到中断标记，告诉用户停在哪。
  */
 export const useDownloadStore = defineStore("download", {
   state: () => ({
     /** 面板是否可见：下载中一直显示；整批成功几秒后自动收起，失败时保留等用户关 */
     active: false,
+    /** 是否已经跟后端对过一次状态 */
+    restored: false,
     /** 流程是否还在跑 */
     running: false,
     seriesIndex: 0,
     seriesTotal: 0,
     title: "",
+    /** 当前这部剧已处理完的集数 */
     episode: 0,
+    /** 当前这部剧的总集数 */
     episodes: 0,
+    /** 整批累计「下好 + 跳过」 */
     done: 0,
+    /** 整批累计失败项 */
     failed: 0,
-    /** 当前这部剧开始前已完成的集数 / 失败数：进度事件里的计数是单部剧的，加上这个才是总数 */
-    doneBase: 0,
-    failedBase: 0,
     message: "",
     root: "",
     error: "",
+    /** 实际落盘的剧名，下载完交给流水线只跑这几部 */
+    landed: [] as string[],
   }),
 
   getters: {
@@ -63,12 +69,108 @@ export const useDownloadStore = defineStore("download", {
   },
 
   actions: {
+    /** 把后端给的整份状态套进来。事件、轮询、恢复都走这一条路。 */
+    apply(s: FanqieDownloadState) {
+      this.running = s.running;
+      this.seriesIndex = s.seriesIndex;
+      this.seriesTotal = s.seriesTotal;
+      this.title = s.title;
+      this.episode = s.episode;
+      this.episodes = s.episodes;
+      this.done = s.done;
+      this.failed = s.failed;
+      this.message = s.message;
+      this.root = s.root;
+      this.error = s.error;
+      this.landed = s.landed ?? [];
+    },
+
+    /** 监听后端进度；重复调用无副作用。 */
+    bind() {
+      if (bindStarted) return;
+      bindStarted = true;
+      void listen<FanqieDownloadState>("fanqie:download", (e) => {
+        const s = e.payload;
+        this.apply(s);
+        if (s.running) {
+          this.active = true;
+          this.startPolling();
+          return;
+        }
+        this.stopPolling();
+        // 结束：有错误就留在屏幕上让人看清原因；全部成功则几秒后自己收起
+        if (s.error) this.active = true;
+        else if (this.done > 0 && this.failed === 0) this.hideLater();
+      })
+        .catch(() => {
+          // 监听挂了不影响下载本身，轮询还会兜底
+          bindStarted = false;
+        });
+    },
+
     /**
-     * 下载选中的剧：逐部拉分集、逐集解密，落到 `<下载目录>/<剧名>/`。
+     * 页面刷新 / 应用重开后的第一次对齐。
+     *
+     * 正在跑就把面板重新摆出来；上次被关掉时后端留了中断说明，
+     * 也弹出来告诉用户「再点一次下载会只补缺的集」。
+     */
+    async restore() {
+      if (this.restored) return;
+      this.restored = true;
+      this.bind();
+      try {
+        const s = await api.fanqieDownloadState();
+        this.apply(s);
+        if (s.running) {
+          this.active = true;
+          this.startPolling();
+        } else if (s.error) {
+          this.active = true;
+        }
+      } catch {
+        // 读不到（例如在浏览器里预览）就当没下过
+      }
+    },
+
+    /** running 时的兜底轮询：事件漏了也能把进度接上。 */
+    startPolling() {
+      if (pollTimer !== null) return;
+      pollTimer = window.setInterval(() => void this.sync(), 1500);
+    },
+
+    stopPolling() {
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    },
+
+    async sync() {
+      try {
+        const s = await api.fanqieDownloadState();
+        this.apply(s);
+        if (s.running) {
+          this.active = true;
+          return;
+        }
+        this.stopPolling();
+        if (s.error) this.active = true;
+        else if (this.done > 0 && this.failed === 0) this.hideLater();
+      } catch {
+        // 一次读不到不算错，下一轮再说
+      }
+    },
+
+    /**
+     * 下载选中的剧：整批交给后端，一部部落到 `<下载目录>/<剧名>/`。
      * 全部落地后调用 `onDone(root, titles)` —— titles 是**实际落盘的剧名**，
      * 由页面带去流水线，让它只跑刚下的这几部（下载根里还有以前下的剧）。
      */
     async run(list: DownloadPick[], onDone?: (root: string, titles: string[]) => void) {
+      // 刷新后还没跟后端对过状态：先对一次，否则可能把正在跑的那批
+      // 当成「没在下载」又发起一批（后端会拒，但用户会白看到一句错）。
+      if (!this.restored) await this.restore();
+      this.bind();
       // 已经有一批在跑时再点下载 → 不开第二份
       if (this.running) return;
       if (list.length === 0) {
@@ -77,39 +179,18 @@ export const useDownloadStore = defineStore("download", {
         return;
       }
 
+      // 面板先摆出来：后端第一条进度可能在一两秒之后
       this.active = true;
-      this.running = true;
       this.error = "";
-      this.seriesIndex = 0;
-      this.seriesTotal = list.length;
-      this.title = "";
-      this.episode = 0;
-      this.episodes = 0;
+      this.message = "正在准备下载目录…";
+      this.landed = [];
       this.done = 0;
       this.failed = 0;
-      this.doneBase = 0;
-      this.failedBase = 0;
-      this.message = "正在准备下载目录…";
-
-      // 监听跟着 store 走：页面卸载不会把它带走
-      if (unlisten) {
-        unlisten();
-        unlisten = null;
-      }
-      try {
-        unlisten = await listen<FanqieDownloadProgress>("fanqie:download", (e) => {
-          if (!this.active) return;
-          const p = e.payload;
-          this.title = p.title;
-          this.episode = p.index;
-          this.episodes = p.total;
-          this.message = p.message;
-          this.done = this.doneBase + p.downloaded + p.skipped;
-          this.failed = this.failedBase + p.failed;
-        });
-      } catch {
-        // 监听挂了不影响下载本身，最终结果仍会回来
-      }
+      this.episode = 0;
+      this.episodes = 0;
+      this.title = "";
+      this.seriesIndex = 0;
+      this.seriesTotal = list.length;
 
       try {
         // 第一次下载先让用户指定一个固定目录；以后每次都放这里
@@ -129,77 +210,39 @@ export const useDownloadStore = defineStore("download", {
         }
         this.root = root;
 
-        // 真正落到盘上的剧名（详情接口的标题，目录就是拿它建的）
-        const landed: string[] = [];
-        for (let i = 0; i < list.length; i++) {
-          const v = list[i];
-          // 进度事件里的 downloaded/skipped/failed 只算当前这部剧，
-          // 记下开跑前的总数，面板上的「已完成」才是跨剧累计值。
-          this.doneBase = this.done;
-          this.failedBase = this.failed;
-          this.seriesIndex = i;
-          this.title = v.title;
-          this.episode = 0;
-          this.episodes = v.episodeCount || 0;
-          this.message = "正在获取分集列表…";
+        this.running = true;
+        this.startPolling();
 
-          const detailData = await api.fanqieSeriesDetail(v.seriesId);
-          const episodes = detailData.episodes
-            .filter((e) => !!e.vid)
-            .map((e) => ({ vid: e.vid, index: e.index }));
-          if (episodes.length === 0) {
-            this.failed = this.failedBase + 1;
-            this.message = `《${v.title}》没有可下载的分集`;
-            continue;
-          }
+        // 这一行会一直等到整批结束 —— 但推进的是 Rust：
+        // 页面刷新、切走都不影响它继续跑，回来读状态就能接上。
+        await api.fanqieDownloadBatch(
+          list.map((v) => ({
+            seriesId: v.seriesId,
+            title: v.title,
+            episodeCount: v.episodeCount ?? 0,
+          })),
+          root,
+        );
 
-          this.title = detailData.title || v.title;
-          this.episodes = episodes.length;
-          const report = await api.fanqieDownloadSeries(
-            {
-              seriesId: v.seriesId,
-              title: this.title,
-              intro: detailData.intro || "",
-              cover: detailData.cover || "",
-              episodes,
-            },
-            root,
-          );
-          this.done = this.doneBase + report.downloaded + report.skipped;
-          this.failed = this.failedBase + report.failed.length;
-          landed.push(report.title);
-          this.message = report.failed.length
-            ? `《${report.title}》有 ${report.failed.length} 集失败：${report.failed[0]}`
-            : `《${report.title}》完成`;
-        }
+        // 以后端状态为准：事件可能错过最后一两条
+        const final = await api.fanqieDownloadState();
+        this.apply(final);
 
-        // 一集都没落地就别往流水线送 —— 空目录只会扫出个错
-        if (this.done === 0) {
-          this.message = "一集都没下载成功";
-          this.error = "没有可跑的源片，已停在列表页；可以重试或换个清晰度。";
-          return;
-        }
-        // 有失败集也别自动开跑：带着缺集去二创，后面全白干。
-        // 再点一次下载只会补缺的集（已存在会跳过）。
-        if (this.failed > 0) {
-          this.message = `有 ${this.failed} 集没下下来`;
-          this.error = `有 ${this.failed} 集下载失败，已停在列表页；再点一次「下载」会只补缺的集。`;
-          return;
-        }
+        // 一集都没落地 / 有失败：别往流水线送，空目录或缺集只会让后面全白干
+        if (final.landed.length === 0 || final.failed > 0 || final.error) return;
 
         this.message = "下载完成，正在打开整剧处理…";
-        onDone?.(root, landed);
+        this.active = true;
+        onDone?.(final.root || root, final.landed);
       } catch (e) {
         this.message = "下载中断";
         this.error = `下载失败：${(e as Error).message}`;
+        this.active = true;
       } finally {
         this.running = false;
-        if (unlisten) {
-          unlisten();
-          unlisten = null;
-        }
-        // 用户要的「处理完就隐藏」：整批成功后面板自己收起，
-        // 留几秒把「下载完成」看清；有失败/错误时留着，得让人看到原因
+        this.stopPolling();
+        // 整批成功后面板自己收起，留几秒把「下载完成」看清；
+        // 有失败/错误时留着，得让人看到原因
         if (!this.error && this.failed === 0) this.hideLater();
       }
     },
@@ -216,6 +259,8 @@ export const useDownloadStore = defineStore("download", {
       if (this.running) return;
       this.active = false;
       this.error = "";
+      // 后端那份也清掉，否则刷新页面又会把旧错误弹出来
+      void api.fanqieDownloadDismiss().catch(() => {});
     },
   },
 });

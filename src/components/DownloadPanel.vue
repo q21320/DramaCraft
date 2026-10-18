@@ -1,16 +1,37 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted } from "vue";
+import { useRouter } from "vue-router";
+import { NButton } from "naive-ui";
 import { useDownloadStore } from "@/stores/download";
 
 /**
  * 批量下载进度浮层。
  *
  * 挂在 MainLayout 而不是视频页：下载是全局任务，切到任何页面都该看得见。
+ * 进度本身住在 Rust 那边 —— 页面刷新（组件重建）时 `restore()` 读回来，
+ * 正在跑或者上次被关掉都还能接着看。
  * 整批成功后面板自己收起（用户要的「处理完就隐藏」）；
  * 有失败或错误时保留，得让用户看到原因再手动关。
  */
 const dl = useDownloadStore();
 const percent = computed(() => dl.percent);
+const router = useRouter();
+
+/**
+ * 刷新过页面的那批下载不会自动跳走了（`onDone` 只活在发起它的那次页面里）。
+ * 给个入口把刚落盘的剧送去整剧处理，和原来自动跳转的参数一致。
+ */
+function goPipeline() {
+  if (dl.running || dl.landed.length === 0) return;
+  void router.push({
+    name: "pipeline",
+    query: { root: dl.root, autostart: "1", only: JSON.stringify(dl.landed) },
+  });
+  dl.dismiss();
+}
+
+// 刷新/重开应用后第一次挂载：把后端那份状态检回来
+onMounted(() => void dl.restore());
 </script>
 
 <template>
@@ -34,16 +55,25 @@ const percent = computed(() => dl.percent);
     <div class="dd-dl-line dd-muted dd-wrap">{{ dl.message }}</div>
     <div class="dd-dl-line dd-muted">
       已完成 {{ dl.done }} 集
-      <template v-if="dl.failed > 0"> · 失败 {{ dl.failed }}</template>
+      <template v-if="dl.failed > 0"> · 失败 {{ dl.failed }} 项</template>
     </div>
     <div v-if="dl.root" class="dd-dl-line dd-muted dd-wrap" style="font-size: 11px">
       保存到：{{ dl.root }}（每部剧自己的「二创」在剧目录里）
     </div>
     <div v-if="dl.error" class="dd-dl-error dd-wrap">{{ dl.error }}</div>
+    <n-button
+      v-if="!dl.running && dl.failed === 0 && dl.landed.length > 0"
+      size="tiny"
+      type="primary"
+      style="margin-top: 8px"
+      @click="goPipeline"
+    >
+      去整剧处理（{{ dl.landed.length }} 部）
+    </n-button>
     <div class="dd-muted" style="font-size: 11px; margin-top: 4px">
       {{
         dl.running
-          ? "下载在后台继续，切到别的页面不会中断"
+          ? "下载在后台继续，刷新页面或切走都不会中断"
           : dl.failed > 0
             ? "有失败集时不会自动开跑；再点一次「下载」只补缺的集"
             : "下载完会自动跳到整剧处理并开始"

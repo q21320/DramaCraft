@@ -262,6 +262,8 @@ export interface DesubtitleReport {
   outPath: string;
   /** 找到的字幕带；没找到就是 null */
   band: { x: number; y: number; w: number; h: number; hitFrames: number; totalFrames: number } | null;
+  /** 擦掉的所有文字区域：字幕在前，水印/台标在后 */
+  bands: { x: number; y: number; w: number; h: number; hitFrames: number; totalFrames: number }[];
   sampledFrames: number;
   engine: string;
   removed: boolean;
@@ -953,20 +955,46 @@ export interface DownloadedDrama {
   episodes: number;
 }
 
-/** 批量下载进度事件（`fanqie:download`）。 */
-export interface FanqieDownloadProgress {
+/**
+ * 批量下载的当前进度。
+ *
+ * 整份状态由后端给出（存在 Rust 内存 + setting 表里）—— 前端不再自己
+ * 拿单部剧的计数加偏移，页面刷新后重新读一份就能接上。
+ */
+export interface FanqieDownloadState {
+  running: boolean;
+  /** 当前第几部（0 基） */
+  seriesIndex: number;
+  seriesTotal: number;
+  title: string;
+  /** 当前这部剧已处理完的集数 */
+  episode: number;
+  /** 当前这部剧的总集数 */
+  episodes: number;
+  /** 整批累计「下好 + 跳过」的集数 */
+  done: number;
+  /** 整批累计失败项（失败的集或整部剧） */
+  failed: number;
+  message: string;
+  root: string;
+  error: string;
+  /** 实际落盘的剧名，下载完交给流水线只跑这几部 */
+  landed: string[];
+}
+
+/** 批量下载时交给后端的一部剧。分集列表由后端自己拉。 */
+export interface FanqieDownloadPick {
   seriesId: string;
   title: string;
-  /** 已处理完的集数（并发下载时完成顺序不固定，用它算进度才单调） */
-  index: number;
-  /** 集号 */
-  episodeIndex: number;
-  /** 这部剧一共几集 */
-  total: number;
-  /** episode：单集结束；series：整部剧结束 */
-  phase: "episode" | "series";
-  message: string;
+  episodeCount?: number;
+}
+
+/** 一整批下载的结果。 */
+export interface FanqieDownloadBatchReport {
+  root: string;
+  landed: string[];
   downloaded: number;
   skipped: number;
-  failed: number;
+  /** 失败项：`第 3 集：原因` 或 `《剧名》：原因` */
+  failed: string[];
 }

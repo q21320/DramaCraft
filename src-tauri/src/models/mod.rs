@@ -46,6 +46,20 @@ pub struct MediaProbe {
     pub format_name: String,
 }
 
+impl MediaProbe {
+    /// 和库里的记录比一比：**文件被重下过时宽高/时长都可能变**。
+    ///
+    /// 比范围包括文件大小 —— 大小都没变就不用去动库。
+    pub fn matches(&self, m: &Media) -> bool {
+        self.duration_ms == m.duration_ms
+            && self.width == m.width
+            && self.height == m.height
+            && self.has_audio == m.has_audio
+            && self.size_bytes == m.size_bytes
+            && self.format_name == m.format_name
+    }
+}
+
 /// 一片的切点
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -932,6 +946,12 @@ pub struct DesubtitleReport {
     pub out_path: String,
     /// 找到的字幕带；没找到就是 `None`。
     pub band: Option<crate::desubtitle::SubtitleBand>,
+    /// 擦掉的所有文字区域：字幕在前，水印/台标在后。
+    ///
+    /// 用户的原话是「字幕 水印都要擦的」—— 一块字幕、一块右下角水印，
+    /// 每块一个 `delogo`。`band` 保留给只关心字幕的旧调用方。
+    #[serde(default)]
+    pub bands: Vec<crate::desubtitle::SubtitleBand>,
     pub sampled_frames: i64,
     pub engine: String,
     /// 到底去没去
@@ -1516,5 +1536,57 @@ pub struct FanqieDownloadReport {
     pub downloaded: i64,
     pub skipped: i64,
     /// 失败集：`第 3 集：原因`
+    pub failed: Vec<String>,
+}
+
+/// 批量下载的当前状态。
+///
+/// **状态住后端，不住页面**：下载是几分钟起步的长任务，页面刷新、
+/// 切页都不该把它连同进度一起抹掉。这里同时存在内存（`AppState.download`）
+/// 和 `setting` 表（`fanqie.download.state`）里，应用重开后还能告诉用户
+/// 「上次下载到哪、为什么停了」。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FanqieDownloadState {
+    pub running: bool,
+    /// 当前是第几部（0 基）
+    pub series_index: i64,
+    pub series_total: i64,
+    pub title: String,
+    /// 当前这部剧已处理完的集数
+    pub episode: i64,
+    /// 当前这部剧的总集数
+    pub episodes: i64,
+    /// 整批累计「下好 + 跳过」的集数
+    pub done: i64,
+    /// 整批累计失败的集数
+    pub failed: i64,
+    pub message: String,
+    pub root: String,
+    pub error: String,
+    /// 实际落盘的剧名（下载根里还躺着以前下的剧，流水线只该跑这几部）
+    pub landed: Vec<String>,
+}
+
+/// 批量下载时前端传过来的一部剧。分集列表由后端自己拉 ——
+/// 页面关掉了，流程还得知道下一集是什么。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqieDownloadPick {
+    pub series_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub episode_count: i64,
+}
+
+/// 一整批下载的结果。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqieDownloadBatchReport {
+    pub root: String,
+    pub landed: Vec<String>,
+    pub downloaded: i64,
+    pub skipped: i64,
+    /// 失败项：`第 3 集：原因` 或 `《剧名》：原因`
     pub failed: Vec<String>,
 }

@@ -33,9 +33,9 @@
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    FanqieCategoryPage, FanqieDownloadReport, FanqieDownloadRequest, FanqieEpisode, FanqiePlayInfo,
-    FanqiePreparedVideo, FanqieSelectItems, FanqieSelectorItem, FanqieSelectorRow,
-    FanqieSeriesDetail, FanqieVideoInfo, OnlineDrama,
+    FanqieCategoryPage, FanqieDownloadReport, FanqieDownloadRequest, FanqieDownloadState,
+    FanqieEpisode, FanqiePlayInfo, FanqiePreparedVideo, FanqieSelectItems, FanqieSelectorItem,
+    FanqieSelectorRow, FanqieSeriesDetail, FanqieVideoInfo, OnlineDrama,
 };
 use crate::proc;
 use serde::de::DeserializeOwned;
@@ -1189,6 +1189,7 @@ async fn decrypt_part(
     copy_video: bool,
 ) -> AppResult<()> {
     let ffmpeg = ffmpeg.to_path_buf();
+    let ffmpeg_check = ffmpeg.clone();
     let part_for_task = part.to_path_buf();
     let out_for_task = out.to_path_buf();
     let output = tauri::async_runtime::spawn_blocking(move || {
@@ -1240,7 +1241,73 @@ async fn decrypt_part(
         let _ = std::fs::remove_file(out);
         return Err(AppError::Msg("解密失败：没有产出文件".into()));
     }
+
+    // **能解密不等于能播。**
+    //
+    // `-c:v copy` 只搬包、不解码：源分片缺损时它照样报成功，坏文件就这么落盘，
+    // 一路走到整集去重才炸 —— 用户看到的是一屏 "Conversion failed" 加几万行解码错误，
+    // 根本看不出来是下载的问题。这里真解码一遍，不过就当这趟失败，
+    // 让调用方退回转码（转码会真解码，坏源会直接露馅）或重下。
+    let out_for_check = out.to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::media::decode_check(&ffmpeg_check, &out_for_check)
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("校验任务异常：{e}")))??;
+
     Ok(())
+}
+
+/// 缓存命中也要验一遍能不能播。
+///
+/// 以前这里只判「文件非空」：`-c copy` 解出来的坏文件会一直命中缓存，
+/// 重下多少次都还是它 —— 用户只能在去重那一步看到「Conversion failed」。
+/// 验不过就把这份缓存删掉，让后面重新下一份。
+///
+/// `label`：日志里怎么称呼这一集（下载时是「第 8 集」，播放时为空）。
+async fn usable_cache(
+    app: &tauri::AppHandle,
+    file: &std::path::Path,
+    ffmpeg: &std::path::Path,
+    label: &str,
+) -> bool {
+    if !is_nonempty(file) {
+        return false;
+    }
+    if let Err(why) = playable(file, Some(ffmpeg)).await {
+        let _ = std::fs::remove_file(file);
+        log_download(
+            app,
+            "warn",
+            &format!("{label}缓存文件播不了（{why}），删掉重下"),
+            "",
+        );
+        return false;
+    }
+    true
+}
+
+/// 完整解码一遍，回答「这个文件能不能播」。
+///
+/// 解码是阻塞活（一集约 0.6 秒），丢给阻塞线程池，不占异步运行时。
+/// 没配 ffmpeg 就不验 —— 不能因为缺工具把下载卡死。
+async fn playable(
+    file: &std::path::Path,
+    ffmpeg: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let Some(ff) = ffmpeg else { return Ok(()) };
+    let path = file.to_path_buf();
+    let ff = ff.to_path_buf();
+    match tauri::async_runtime::spawn_blocking(move || {
+        crate::media::decode_check(&ff, &path)
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        // 校验任务自己挂了（比如线程池关闭）不该连累下载，当作可用
+        Err(_) => Ok(()),
+    }
 }
 
 /// 下载一条流并解密，写到 `out`。
@@ -1320,12 +1387,15 @@ async fn fetch_and_decrypt(
 /// 官网只公开前 50 集且部分文件缺失，所以播放主链路走这里；
 /// 前端失败时才退回 [`play_url`] 的官网明文流。
 /// 同一条流失败会自动换下一条（比如 bytevc2 解不了就换 bytevc1）。
+///
+/// `label`：日志里怎么称呼这一集（「第 8 集」），只影响提示文字。
 pub async fn prepare_video(
     app: &tauri::AppHandle,
     vid: &str,
     quality: Option<&str>,
     ffmpeg: Option<PathBuf>,
     copy_video: bool,
+    label: &str,
 ) -> AppResult<FanqiePreparedVideo> {
     let vid = vid.trim();
     if !valid_id(vid) {
@@ -1351,7 +1421,7 @@ pub async fn prepare_video(
         Some(q) => dir.join(format!("{vid}_{}_raw.mp4", safe_name(q))),
         None => dir.join(format!("{vid}_raw.mp4")),
     };
-    if is_nonempty(&h264) {
+    if is_nonempty(&h264) && usable_cache(app, &h264, &ffmpeg, label).await {
         return Ok(FanqiePreparedVideo {
             vid: vid.to_string(),
             path: h264.to_string_lossy().to_string(),
@@ -1362,7 +1432,7 @@ pub async fn prepare_video(
             source: "cache".into(),
         });
     }
-    if copy_video && is_nonempty(&raw) {
+    if copy_video && is_nonempty(&raw) && usable_cache(app, &raw, &ffmpeg, label).await {
         return Ok(FanqiePreparedVideo {
             vid: vid.to_string(),
             path: raw.to_string_lossy().to_string(),
@@ -1478,14 +1548,20 @@ pub fn count_episodes(dir: &Path) -> i64 {
 /// 往往就正常了 —— 实测单独重跑那些「失败」的集全都能下，所以必须重试，
 /// 否则用户看到的后果就是「缺了好几集」。
 const DOWNLOAD_ATTEMPTS: usize = 3;
+/// 重试基础等待：第 1 次 1.5 秒、第 2 次 3 秒。
+///
+/// 固定间隔会让限流来不及恢复 —— 连续两次“刚被限流就又撞上去”，
+/// 所以第几次重试就等几个间隔。
 const DOWNLOAD_RETRY_WAIT_MS: u64 = 1500;
 
-/// 一部剧内同时下载几集。
+/// 一部剧内默认同时下载几集。
 ///
 /// 每集都是「取流 → ffmpeg 解密转码 → 落盘」，串行时绝大部分时间在等 ffmpeg。
 /// 3 路能明显缩短整部剧的等待；再往上会和转码抢 CPU（ffmpeg 本身吃满核），
-/// 也更容易被番茄限流，反而更慢。
-const DOWNLOAD_CONCURRENCY: usize = 3;
+/// 也更容易被番茄限流，反而更慢。用户可以到设置里改成 2 / 3 / 5。
+pub const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 3;
+/// 并发上限：再多只会把网络和 CPU 抢成一团，收益是负的。
+pub const MAX_DOWNLOAD_CONCURRENCY: usize = 6;
 
 /// 把下载过程写进运行日志（`run_log`）。
 ///
@@ -1500,6 +1576,119 @@ fn log_download(app: &tauri::AppHandle, level: &str, message: &str, artifact: &s
     };
     let Ok(conn) = state.db.lock() else { return };
     crate::db::append_log_with_file(&conn, None, None, level, message, artifact);
+}
+
+/// 批量下载状态在 `setting` 表里的键。
+///
+/// 存一份到盘上是为了应用重开后还能说清楚「上次下到哪、为什么停了」——
+/// 内存里的 `AppState.download` 随进程一起没了。
+pub const DOWNLOAD_STATE_KEY: &str = "fanqie.download.state";
+
+/// 把状态写进 `setting`。存不下也不能影响下载 —— 调用方不需处理错误。
+pub fn save_download_state(app: &tauri::AppHandle, st: &FanqieDownloadState) {
+    let Some(state) = app.try_state::<crate::AppState>() else {
+        return;
+    };
+    let Ok(conn) = state.db.lock() else { return };
+    if let Ok(raw) = serde_json::to_string(st) {
+        let _ = crate::db::set_setting(&conn, DOWNLOAD_STATE_KEY, &raw);
+    }
+}
+
+/// 一部剧内部的进度推手。
+///
+/// 每集完成后干三件事：把进展写进共享状态、落一份到 `setting`、
+/// 发一个完整的 `fanqie:download`。前端拿到的是**整份状态**，
+/// 不必自己拿单部剧的计数去加偏移 —— 页面刷新后接上也不会算错。
+#[derive(Clone)]
+pub struct DownloadTracker {
+    app: tauri::AppHandle,
+    state: std::sync::Arc<std::sync::Mutex<FanqieDownloadState>>,
+    /// 这一批里的第几部（0 基）
+    pub series_index: i64,
+    pub series_total: i64,
+    /// 这部剧开始前整批的累计值
+    pub done_base: i64,
+    pub failed_base: i64,
+}
+
+impl DownloadTracker {
+    pub fn new(
+        app: tauri::AppHandle,
+        state: std::sync::Arc<std::sync::Mutex<FanqieDownloadState>>,
+        series_index: i64,
+        series_total: i64,
+        done_base: i64,
+        failed_base: i64,
+    ) -> Self {
+        Self {
+            app,
+            state,
+            series_index,
+            series_total,
+            done_base,
+            failed_base,
+        }
+    }
+
+    /// 改状态 → 落盘 → 广播，返回改完的快照（方便调用方直接返回给前端）。
+    pub fn update(&self, f: impl FnOnce(&mut FanqieDownloadState)) -> FanqieDownloadState {
+        use tauri::Emitter;
+
+        let snapshot = {
+            let mut guard = match self.state.lock() {
+                Ok(g) => g,
+                // 前一个持锁线程 panic 了也要把状态救回来：进度比锁的洁癖重要
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            f(&mut guard);
+            guard.clone()
+        };
+        save_download_state(&self.app, &snapshot);
+        let _ = self.app.emit("fanqie:download", &snapshot);
+        snapshot
+    }
+
+    /// 一部剧开跑 / 拿到分集列表后调一次，把标题、集数、消息摆好。
+    pub fn begin_series(&self, title: &str, episodes: i64, message: &str) -> FanqieDownloadState {
+        self.update(|s| {
+            s.running = true;
+            s.series_index = self.series_index;
+            s.series_total = self.series_total;
+            s.title = title.to_string();
+            s.episode = 0;
+            s.episodes = episodes.max(0);
+            s.done = self.done_base;
+            s.failed = self.failed_base;
+            s.message = message.to_string();
+            s.error.clear();
+        })
+    }
+
+    /// 一集有了结果（完成/跳过/失败）或开始下载时更新。
+    #[allow(clippy::too_many_arguments)]
+    pub fn episode(
+        &self,
+        title: &str,
+        episode: i64,
+        episodes: i64,
+        downloaded: i64,
+        skipped: i64,
+        failed: i64,
+        message: &str,
+    ) {
+        self.update(|s| {
+            s.running = true;
+            s.series_index = self.series_index;
+            s.series_total = self.series_total;
+            s.title = title.to_string();
+            s.episode = episode;
+            s.episodes = episodes.max(0);
+            s.done = self.done_base + downloaded + skipped;
+            s.failed = self.failed_base + failed;
+            s.message = message.to_string();
+        });
+    }
 }
 
 /// 日志里报文件大小用。拿不到就算了，不能因为格式化把下载弄断。
@@ -1635,6 +1824,11 @@ async fn save_cover(
 ///
 /// `copy_video`：true = 只解密不转码（推荐）。下载阶段几乎不占 CPU，
 /// 唯一的一次 H.264 编码留给整剧处理的「整集去重」—— 反正那一步本来就要完整编码。
+///
+/// `tracker`：批次下载时带上，进度会写进后端状态并发给前端；
+/// 单独下一部（旧命令）传 `None`，事件照样发，只是不落盘。
+/// `concurrency`：同时下载几集（1~6）。吃紧时降到 2 能明显减少
+/// 「流被削断 / 限流」的失败；网络好时 5 能快一些。
 pub async fn download_series(
     app: &tauri::AppHandle,
     req: &FanqieDownloadRequest,
@@ -1642,8 +1836,13 @@ pub async fn download_series(
     quality: Option<&str>,
     ffmpeg: Option<PathBuf>,
     copy_video: bool,
+    tracker: Option<&DownloadTracker>,
+    concurrency: usize,
 ) -> AppResult<FanqieDownloadReport> {
     use tauri::Emitter;
+
+    // 各集任务要进 `'static` 的 JoinSet，不能借外部引用 —— 先变成自己的一份
+    let tracker = tracker.cloned();
 
     let sid = req.series_id.trim();
     if !valid_id(sid) {
@@ -1682,14 +1881,22 @@ pub async fn download_series(
     episodes.sort_by_key(|e| e.index);
     let total = episodes.len() as i64;
 
+    // 一部剧内并行下载。串行时每集都要等完整个「取流 → ffmpeg 解密转码」，
+    // 而这几步里 ffmpeg 并不会把网络和磁盘占满 —— 3 路同时跑才吃得下带宽和 CPU。
+    // 并发也是日志按完成先后、不按集号排的原因，开头那句要讲清楚。
+    let concurrency = concurrency
+        .clamp(1, MAX_DOWNLOAD_CONCURRENCY)
+        .min(episodes.len())
+        .max(1);
+
     log_download(
         app,
         "info",
         &format!(
-            "下载《{title}》开始：共 {total} 集，保存到 {}（{}，已写 剧名.txt / intro.txt）",
+            "下载《{title}》开始：共 {total} 集，{concurrency} 集同时下（日志按完成先后，不按集号）→ {}（{}）",
             dir.to_string_lossy(),
             if copy_video {
-                "只解密不转码，省下的一次编码留给整剧去重"
+                "只解密不转码，编码留给整剧去重"
             } else {
                 "解密并转成 H.264"
             }
@@ -1739,9 +1946,7 @@ pub async fn download_series(
         },
     }
 
-    // 一部剧内并行下载。串行时每集都要等完整个「取流 → ffmpeg 解密转码」，
-    // 而这几步里 ffmpeg 并不会把网络和磁盘占满 —— 3 路同时跑才吃得下带宽和 CPU。
-    let concurrency = DOWNLOAD_CONCURRENCY.min(episodes.len()).max(1);
+    // 并发数在下载开始前就算好了（日志里也要用），这里不再重复算
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
     let done_downloaded = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let done_skipped = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -1758,7 +1963,7 @@ pub async fn download_series(
         let done_downloaded = done_downloaded.clone();
         let done_skipped = done_skipped.clone();
         let done_failed = done_failed.clone();
-        let sid = sid.to_string();
+        let tracker = tracker.clone();
         let vid = ep.vid.clone();
         let index = ep.index.max(1);
 
@@ -1784,38 +1989,80 @@ pub async fn download_series(
                     + done_failed.load(Ordering::Relaxed)
             };
             let emit = |message: &str| {
-                let _ = app.emit(
-                    "fanqie:download",
-                    serde_json::json!({
-                        "seriesId": &sid,
-                        "title": &title,
-                        "index": progress(),
-                        "episodeIndex": index,
-                        "total": total,
-                        "phase": "episode",
-                        "message": message,
-                        "downloaded": done_downloaded.load(Ordering::Relaxed),
-                        "skipped": done_skipped.load(Ordering::Relaxed),
-                        "failed": done_failed.load(Ordering::Relaxed),
-                    }),
-                );
+                let downloaded = done_downloaded.load(Ordering::Relaxed);
+                let skipped = done_skipped.load(Ordering::Relaxed);
+                let failed = done_failed.load(Ordering::Relaxed);
+                match &tracker {
+                    Some(t) => t.episode(
+                        &title,
+                        progress(),
+                        total,
+                        downloaded,
+                        skipped,
+                        failed,
+                        message,
+                    ),
+                    // 没有 tracker（单部下载命令）：也发完整状态，
+                    // 前端只有一套解析，不用再区分事件形态。
+                    None => {
+                        let st = FanqieDownloadState {
+                            running: true,
+                            series_index: 0,
+                            series_total: 1,
+                            title: title.clone(),
+                            episode: progress(),
+                            episodes: total,
+                            done: downloaded + skipped,
+                            failed,
+                            message: message.to_string(),
+                            ..Default::default()
+                        };
+                        let _ = app.emit("fanqie:download", &st);
+                    }
+                }
             };
 
+            // 日志里统一拿这个称呼这一集：文件名叫「第08集.mp4」，比非补零的「第 8 集」好认
+            let ep_name = format!("第{index:02}集.mp4");
+            let ep_label = format!("第 {index} 集");
+
             if is_nonempty(&file) {
-                done_skipped.fetch_add(1, Ordering::Relaxed);
-                let message = format!("第 {index} 集已存在，跳过");
-                log_download(
-                    &app,
-                    "info",
-                    &format!("{message}（{}/{total}）：{}（{}）", progress(), file.file_name().unwrap_or_default().to_string_lossy(), size_label(&file)),
-                    &file.to_string_lossy(),
-                );
-                emit(&message);
-                return (index, None);
+                // **已存在也要验一遍能不能播。**
+                //
+                // 以前只判「文件非空」：下载没下全的坏文件会一直命中「跳过」，
+                // 重下多少次都修不好 —— 用户只能在去重那一步看到「Conversion failed」。
+                // 验不过就删掉，这趟当成缺集重新下。
+                match playable(&file, ffmpeg.as_deref()).await {
+                    Ok(()) => {
+                        done_skipped.fetch_add(1, Ordering::Relaxed);
+                        let message = format!("第 {index} 集已存在，跳过");
+                        log_download(
+                            &app,
+                            "info",
+                            &format!(
+                                "{ep_name} 已存在且能播，跳过（进度 {}/{total}，{}）",
+                                progress(),
+                                size_label(&file)
+                            ),
+                            &file.to_string_lossy(),
+                        );
+                        emit(&message);
+                        return (index, None);
+                    }
+                    Err(why) => {
+                        let _ = std::fs::remove_file(&file);
+                        log_download(
+                            &app,
+                            "warn",
+                            &format!("{ep_name} 本地文件播不了（{why}），当成没下载，重新下"),
+                            "",
+                        );
+                    }
+                }
             }
 
-            // 开始那一行也要写：并发时哪几集在跑，看日志最清楚。
-            log_download(&app, "info", &format!("第 {index} 集开始下载…"), "");
+            // 「开始下载」只留在面板上，不写日志 —— 每集一条完成/失败已经够看，
+            // 再多一行开始只会把并发日志搅得更乱。
             emit(&format!("第 {index} 集开始下载…"));
 
             let mut last_error = String::new();
@@ -1825,10 +2072,13 @@ pub async fn download_series(
                     log_download(
                         &app,
                         "warn",
-                        &format!("第 {index} 集第 {attempt} 次重试…"),
+                        &format!("{ep_name} 第 {attempt} 次重试…"),
                         "",
                     );
-                    tokio::time::sleep(Duration::from_millis(DOWNLOAD_RETRY_WAIT_MS)).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        DOWNLOAD_RETRY_WAIT_MS * attempt as u64,
+                    ))
+                    .await;
                 }
                 match prepare_video(
                     &app,
@@ -1836,6 +2086,7 @@ pub async fn download_series(
                     quality.as_deref(),
                     ffmpeg.clone(),
                     copy_video,
+                    &ep_label,
                 )
                 .await
                 {
@@ -1862,7 +2113,11 @@ pub async fn download_series(
                 log_download(
                     &app,
                     "ok",
-                    &format!("{message}（{}/{total}）→ {}（{}）", progress(), file.file_name().unwrap_or_default().to_string_lossy(), size_label(&file)),
+                    &format!(
+                        "{ep_name} 下载完成（进度 {}/{total}，{}）",
+                        progress(),
+                        size_label(&file)
+                    ),
                     &file.to_string_lossy(),
                 );
                 emit(&message);
@@ -1870,7 +2125,7 @@ pub async fn download_series(
             } else {
                 done_failed.fetch_add(1, Ordering::Relaxed);
                 let message = format!("第 {index} 集：{last_error}");
-                log_download(&app, "error", &format!("{message}（{}/{total}）", progress()), "");
+                log_download(&app, "error", &format!("{ep_name} 下载失败：{last_error}"), "");
                 emit(&message);
                 (index, Some(message))
             }
@@ -1892,21 +2147,41 @@ pub async fn download_series(
     let downloaded = done_downloaded.load(std::sync::atomic::Ordering::Relaxed);
     let skipped = done_skipped.load(std::sync::atomic::Ordering::Relaxed);
 
-    let _ = app.emit(
-        "fanqie:download",
-        serde_json::json!({
-            "seriesId": sid,
-            "title": title,
-            "index": total,
-            "episodeIndex": episodes.last().map(|e| e.index).unwrap_or(0),
-            "total": total,
-            "phase": "series",
-            "message": format!("《{title}》下载完成"),
-            "downloaded": downloaded,
-            "skipped": skipped,
-            "failed": failed.len(),
-        }),
-    );
+    // 这部剧收尾：进度推到满，消息换成「下载完成」。
+    // 有失败集时消息要点名，不能让人以为全下好了。
+    let done_message = if failed.is_empty() {
+        format!("《{title}》下载完成")
+    } else {
+        format!("《{title}》有 {} 集没下下来", failed.len())
+    };
+    match &tracker {
+        Some(t) => {
+            t.episode(
+                &title,
+                total,
+                total,
+                downloaded,
+                skipped,
+                failed.len() as i64,
+                &done_message,
+            );
+        }
+        None => {
+            let st = FanqieDownloadState {
+                running: true,
+                series_index: 0,
+                series_total: 1,
+                title: title.clone(),
+                episode: total,
+                episodes: total,
+                done: downloaded + skipped,
+                failed: failed.len() as i64,
+                message: done_message,
+                ..Default::default()
+            };
+            let _ = app.emit("fanqie:download", &st);
+        }
+    }
 
     log_download(
         app,

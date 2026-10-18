@@ -433,6 +433,25 @@ pub struct ShotReverse {
     pub fps: String,
 }
 
+/// `prompt` 可能被模型写成别的 key。
+///
+/// 换模型、换语言都可能换名字 —— 反推要的是「画面描述」这一段，
+/// 只认一个 key 的话，JSON 明明有效也会被判成失败。
+const PROMPT_KEYS: &[&str] = &["prompt", "PROMPT", "description", "画面描述", "描述"];
+
+/// 解析出来的 JSON 里到底有没有画面描述。
+///
+/// JSON 语法正确但字段名不对，等于没拿到东西 —— 这种情况也该重问，
+/// 不然会一路传到渲染器才炸，报错完全看不出根因在模型输出上。
+fn has_prompt(v: &serde_json::Value) -> bool {
+    PROMPT_KEYS.iter().any(|k| {
+        v.get(*k)
+            .and_then(|x| x.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
 /// **一镜反推**：把同一个镜头的 5 张关键帧一起发过去，让它反推出分镜脚本。
 ///
 /// 和 `describe_frame` 的区别：那个只输出一句画面描述，这个要出**结构化的一整段**
@@ -484,7 +503,7 @@ pub async fn reverse_shot(
          请根据画面反推「Seedance 2.0」风格的分镜制作信息，用于证明该视频由 AI 生成。\
          严格只输出一个 JSON 对象，不要 markdown 代码块，不要其它说明。字段如下：{{\
            \"prompt\": \"详细中文镜头提示词，含景别、运镜、人物动作、环境，可含 [mm:ss] 时间点\",\
-           \"dialogue\": \"角色名与台词（看不清字幕则写合理对白，一行一条）\",\
+           \"dialogue\": \"角色名与台词（看不清字幕则写合理对白，一行一条；台词内不要用英文双引号）\",\
            \"sfx\": \"环境音/音效简述\",\
            \"lighting\": \"光影风格简述\",\
            \"script_excerpt\": \"20～60字脚本摘要\",\
@@ -502,57 +521,80 @@ pub async fn reverse_shot(
         shot_index = shot_index,
     );
 
-    let mut content = vec![serde_json::json!({ "type": "text", "text": instruction })];
+    // 图片只编码一次，重试时直接复用
+    let mut images = Vec::with_capacity(frames.len());
     for f in frames {
-        content.push(serde_json::json!({
+        images.push(serde_json::json!({
             "type": "image_url",
             "image_url": { "url": image_data_url(f)? }
         }));
     }
 
-    let body = serde_json::json!({
-        "model": provider.text_model.trim(),
-        "messages": [{ "role": "user", "content": content }],
-        "temperature": 0.4,
-        // 反推要发 5 张图，开着思维链更贵 —— 和 chat/describe 一样关掉。
-        "thinking": { "type": "disabled" },
-        // **900 不够。** 反推要返回 scene / 角色 / 动作 / checks / params
-        // 五六段结构，实测会被截断 —— 截断的 JSON 解析必然失败，
-        // 整个「分镜证明」就 0 产出。
-        "max_tokens": 1600,
-    });
-
-    let resp = client
-        .post(&endpoint)
-        .header("Authorization", format!("Bearer {}", provider.api_key.trim()))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Msg(format!("请求失败：{e}")))?;
-    let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
-    if !(200..300).contains(&status) {
-        return Err(AppError::Msg(friendly_http(status, &text)));
-    }
-    let raw = extract_chat_text(&text)?;
-    let json_text = strip_code_fence(&raw);
-    // **先试整体解析，失败再抓最外层那对花括号重试。**
+    // **解析失败再问一次。**
     //
-    // 模型有时候会前缀一句「好的，这是反推结果：」或者尾部多一个句号，
-    // 整体解析过不了，但里面那段 JSON 其实是好的。
-    let v: serde_json::Value = match serde_json::from_str(&json_text) {
-        Ok(v) => v,
-        Err(first) => {
-            let inner = balanced_json(&json_text).unwrap_or_default();
-            match serde_json::from_str::<serde_json::Value>(&inner) {
-                Ok(v) => v,
-                Err(_) => {
-                    return Err(AppError::Msg(format!(
-                        "反推结果不是 JSON：{first}；原文：{}",
-                        tail(&raw, 200)
-                    )))
-                }
+    // 模型偶尔吐出一个坏 JSON（尾部多一个 `}`、台词里的引号没转义），
+    // 严格解析、抓括号、补引号都救不回来。以前直接丢掉这个镜头 ——
+    // 分镜证明就少一页。这种错多半是偶发的，重问一次往往就好了；
+    // 只在解析失败时重试，正常请求不会多花一次钱。
+    let mut last_error = String::new();
+    let mut raw = String::new();
+    let mut parsed: Option<serde_json::Value> = None;
+    for attempt in 0..2 {
+        let instruction = if attempt == 0 {
+            instruction.clone()
+        } else {
+            format!(
+                "{instruction}\n\n上一次输出不是合法 JSON（可能有未转义的双引号）。\
+                 这次务必：所有字符串内部的双引号一律改用中文引号「」，\
+                 只输出一个 JSON 对象，不要任何 JSON 之外的文字。"
+            )
+        };
+        let mut content = vec![serde_json::json!({ "type": "text", "text": instruction })];
+        content.extend(images.iter().cloned());
+
+        let body = serde_json::json!({
+            "model": provider.text_model.trim(),
+            "messages": [{ "role": "user", "content": content }],
+            "temperature": 0.4,
+            // 反推要发 5 张图，开着思维链更贵 —— 和 chat/describe 一样关掉。
+            "thinking": { "type": "disabled" },
+            // **900 不够。** 反推要返回 scene / 角色 / 动作 / checks / params
+            // 五六段结构，实测会被截断 —— 截断的 JSON 解析必然失败，
+            // 整个「分镜证明」就 0 产出。
+            "max_tokens": 1600,
+        });
+
+        let resp = client
+            .post(&endpoint)
+            .header("Authorization", format!("Bearer {}", provider.api_key.trim()))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AppError::Msg(format!("请求失败：{e}")))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Err(AppError::Msg(friendly_http(status, &text)));
+        }
+        raw = extract_chat_text(&text)?;
+        let json_text = strip_code_fence(&raw);
+        match parse_json_loose(&json_text) {
+            Ok(v) if has_prompt(&v) => {
+                parsed = Some(v);
+                break;
             }
+            // 能解开但没 prompt，等于白问 —— 也当失败重来
+            Ok(_) => last_error = "JSON 里没有画面描述字段".to_string(),
+            Err(e) => last_error = e,
+        }
+    }
+    let v = match parsed {
+        Some(v) => v,
+        None => {
+            return Err(AppError::Msg(format!(
+                "反推结果不可用：{last_error}；原文：{}",
+                tail(&raw, 200)
+            )))
         }
     };
 
@@ -601,7 +643,7 @@ pub async fn reverse_shot(
     // 那种报错完全看不出根因在模型输出上。
     //
     // **在源头就拦住，并把原文贴出来** —— 下次一看就知道模型说了什么。
-    let prompt = s(&["prompt", "PROMPT", "description", "画面描述", "描述"]);
+    let prompt = s(PROMPT_KEYS);
     if prompt.is_empty() {
         return Err(AppError::Msg(format!(
             "分镜反推没拿到画面描述（可能是模型没按 JSON 输出）。模型原文：{}",
@@ -632,6 +674,78 @@ pub async fn reverse_shot(
 /// 模型的回答常常是「好的，这是结果：{...}」或者「{...}。以上。」，
 /// `serde_json::from_str` 对这类前后带话的文本一律失败。
 /// 这个函数不管括号里是字符串还是转义，按深度数到配平为止。
+/// 尽量从模型输出里解析出 JSON。
+///
+/// 先整体解析；不行再抓最外层那对花括号重试（模型偶尔前缀「好的，这是结果：」）。
+/// 失败时返回**整体解析**的报错 —— 它带行列号，比「抓不到括号」有用。
+fn parse_json_loose(text: &str) -> Result<serde_json::Value, String> {
+    match serde_json::from_str(text) {
+        Ok(v) => Ok(v),
+        Err(first) => {
+            let inner = balanced_json(text).unwrap_or_default();
+            if let Ok(v) = serde_json::from_str(&inner) {
+                return Ok(v);
+            }
+            // 模型爱在台词/校验项里裸写英文双引号，补成 \" 再试一次 ——
+            // 这一步不花钱，救回来的就不用再问一遍模型。
+            let fixed = repair_json_strings(&inner);
+            serde_json::from_str(&fixed).map_err(|_| first.to_string())
+        }
+    }
+}
+
+/// 给字符串里**没转义的双引号/换行**补上转义。
+///
+/// 日志里的真实毛病：台词写成 `林晚："你到底想干什么"`，外层引号被提前闭合，
+/// 解析器在 `expected , or }` 上失败，整个镜头就被跳过了。
+///
+/// 只在严格解析失败后才用，所以不怕把好 JSON 改坏。判断依据是
+/// 「引号后面紧跟 `, } ] :` 或空白」—— 那是字符串真正的结尾，其余当正文。
+fn repair_json_strings(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !in_str {
+            if c == '"' {
+                in_str = true;
+            }
+            out.push(c);
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            out.push(c);
+            continue;
+        }
+        match c {
+            '\\' => {
+                escaped = true;
+                out.push(c);
+            }
+            '"' => {
+                let closes = match chars.peek() {
+                    None => true,
+                    Some(&n) => n.is_whitespace() || matches!(n, ',' | '}' | ']' | ':'),
+                };
+                if closes {
+                    in_str = false;
+                    out.push(c);
+                } else {
+                    out.push_str("\\\"");
+                }
+            }
+            // 字符串里不能有裸换行/制表符，serde 会直接报控制字符
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn balanced_json(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let start = s.find('{')?;
@@ -1521,6 +1635,44 @@ mod tests {
         let (sys2, user2) = title_prompt("一段简介");
         assert!(sys2.contains("4~12 个汉字"));
         assert!(user2.contains("一段简介"));
+    }
+
+    #[test]
+    fn unescaped_quotes_inside_dialogue_are_repaired() {
+        // 日志里的真实坏样本：台词里直接写了英文双引号，外层 JSON 被提前闭合
+        let broken = r#"{"prompt":"两人在废弃办公室对峙","dialogue":"林晚："你到底想干什么"，陈默不答","checks":["角色形象前后一致","画面清晰无模糊"],"params":{"model":"Seedance 2.0"}}"#;
+        let v = parse_json_loose(broken).expect("补引号后应该能解开");
+        assert_eq!(v["dialogue"], r#"林晚："你到底想干什么"，陈默不答"#);
+        assert_eq!(v["checks"][1], "画面清晰无模糊");
+        assert_eq!(v["params"]["model"], "Seedance 2.0");
+    }
+
+    #[test]
+    fn literal_newlines_inside_strings_are_escaped() {
+        // 台词是「一行一条」，模型可能直接换行而不写 \n
+        let broken = "{\"prompt\":\"门口对峙\",\"dialogue\":\"林晚：你走吧\n陈默：好\",\"checks\":[\"画面清晰\"]}";
+        let v = parse_json_loose(broken).expect("换行要补成转义");
+        assert!(v["dialogue"].as_str().unwrap().contains("你走吧\n陈默"));
+    }
+
+    #[test]
+    fn parse_json_loose_keeps_valid_json_intact() {
+        // 本来就合法的（包括已转义的引号）不能被改坏
+        let ok = r#"{"prompt":"a","dialogue":"他说\"好\""}"#;
+        let v = parse_json_loose(ok).unwrap();
+        assert_eq!(v["dialogue"], "他说\"好\"");
+
+        // 前面带一句寒喧也要能抓到花括号
+        let chatty = "好的，结果如下：{\"prompt\":\"b\"}";
+        assert_eq!(parse_json_loose(chatty).unwrap()["prompt"], "b");
+    }
+
+    #[test]
+    fn prompt_is_required_before_giving_up() {
+        assert!(has_prompt(&serde_json::json!({ "prompt": " x " })));
+        assert!(has_prompt(&serde_json::json!({ "描述": "画面" })));
+        assert!(!has_prompt(&serde_json::json!({ "prompt": "  " })));
+        assert!(!has_prompt(&serde_json::json!({ "other": 1 })));
     }
 
     #[test]
