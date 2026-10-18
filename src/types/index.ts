@@ -872,6 +872,8 @@ export interface FanqieSeriesDetail {
   intro: string;
   /** 封面原地址；可能是 HEIC，交给 fanqieCover 转换 */
   cover: string;
+  /** 上架日期 YYYY-MM-DD。列表接口没有，只有详情接口给；可能是空串 */
+  onlineTime: string;
   episodeCount: number;
   episodes: FanqieEpisode[];
   source: string;

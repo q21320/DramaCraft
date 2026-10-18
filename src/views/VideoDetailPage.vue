@@ -304,6 +304,7 @@ onBeforeUnmount(() => {
             <div class="vd-title">{{ detail.title || "未命名短剧" }}</div>
             <div class="vd-meta dd-muted">
               <span>共 {{ detail.episodeCount || episodes.length }} 集</span>
+              <span v-if="detail.onlineTime">上架 {{ detail.onlineTime }}</span>
               <span v-if="videoInfo?.durationSec">单集 {{ formatClock(videoInfo.durationSec) }}</span>
               <span v-if="playInfo">当前 {{ playInfo.quality }}</span>
               <span v-if="videoInfo?.encrypted">平台流已加密（已本地解密）</span>

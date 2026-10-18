@@ -538,44 +538,69 @@ pub async fn reverse_shot(
     // 只在解析失败时重试，正常请求不会多花一次钱。
     let mut last_error = String::new();
     let mut raw = String::new();
+    // 最近一次响应的「没写完」信号，失败时拼进报错 —— 到底是截断还是思考吃 token
+    let mut last_hint = String::new();
     let mut parsed: Option<serde_json::Value> = None;
+    // 第二次不再重发 5 张图：把上一次的**原文**发回去，让它原地修 JSON。
+    //
+    // 真实坏了的样子（日志里的）：`"characters" ["男主", "同事们"]` —— 漏了一个
+    // 冒号，serde 报 `expected :`。整段重写是重新掷骰子，还可能再错别处；
+    // 给它原文、只让它补语法，既便宜又准。
+    let mut broken: Option<String> = None;
+    // 兜底有没有真跑过 —— 失败时要告诉用户「已经让模型修过一轮了」，
+    // 不然下次又只能看到一个孤零零的解析错误。
+    let mut repaired = false;
     for attempt in 0..2 {
-        let instruction = if attempt == 0 {
-            instruction.clone()
-        } else {
-            format!(
-                "{instruction}\n\n上一次输出不是合法 JSON（可能有未转义的双引号）。\
-                 这次务必：所有字符串内部的双引号一律改用中文引号「」，\
-                 只输出一个 JSON 对象，不要任何 JSON 之外的文字。"
-            )
+        let repair_text = broken.take();
+        let repairing = repair_text.is_some();
+        repaired |= repairing;
+        let content: Vec<serde_json::Value> = match repair_text {
+            Some(text) => vec![serde_json::json!({
+                "type": "text",
+                "text": format!(
+                    "下面这段 JSON 是你上一次的输出，语法有错（{last_error}）。\
+                     请只修正语法：补齐漏掉的逗号/冒号、给字符串里的双引号补转义、\
+                     去掉多余的括号。字段内容和顺序都不要改，\
+                     只输出修好的 JSON 对象，不要任何说明。\n\n{text}"
+                ),
+            })],
+            None => {
+                let instruction = if attempt == 0 {
+                    instruction.clone()
+                } else {
+                    format!(
+                        "{instruction}\n\n上一次输出不是合法 JSON（可能有未转义的双引号）。\
+                         这次务必：所有字符串内部的双引号一律改用中文引号「」，\
+                         只输出一个 JSON 对象，不要任何 JSON 之外的文字。"
+                    )
+                };
+                let mut c = vec![serde_json::json!({ "type": "text", "text": instruction })];
+                c.extend(images.iter().cloned());
+                c
+            }
         };
-        let mut content = vec![serde_json::json!({ "type": "text", "text": instruction })];
-        content.extend(images.iter().cloned());
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": provider.text_model.trim(),
             "messages": [{ "role": "user", "content": content }],
-            "temperature": 0.4,
-            // 反推要发 5 张图，开着思维链更贵 —— 和 chat/describe 一样关掉。
-            "thinking": { "type": "disabled" },
-            // **900 不够。** 反推要返回 scene / 角色 / 动作 / checks / params
-            // 五六段结构，实测会被截断 —— 截断的 JSON 解析必然失败，
-            // 整个「分镜证明」就 0 产出。
-            "max_tokens": 1600,
+            // **修 JSON 要稳，不要发散。** 0.4 是反推画面描述用的；
+            // 修语法时模型只需要照抄原文、补符号，温度越低越不容易改出新毛病。
+            "temperature": if repairing { 0.1 } else { 0.4 },
+            // **不设 `max_tokens`。**
+            //
+            // 设 900 时实测会截断，改成 1600 仍是在猜模型要写多长 ——
+            // 而截断的 JSON 必然解析失败，整个镜头直接丢掉。
+            // 上限交给服务端（模型自己的输出上限）：提示词已经限定
+            // 「只输出一个 JSON 对象」，正常不会跑飞。
         });
+        // 所有语言模型调用统一关思考 —— 方舟 Seed 2.0 不传字段就是开着的
+        apply_thinking_off(&mut body, provider);
 
-        let resp = client
-            .post(&endpoint)
-            .header("Authorization", format!("Bearer {}", provider.api_key.trim()))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AppError::Msg(format!("请求失败：{e}")))?;
-        let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
+        let (status, text) = post_chat(&client, &endpoint, provider, body).await?;
         if !(200..300).contains(&status) {
             return Err(AppError::Msg(friendly_http(status, &text)));
         }
+        last_hint = finish_hint(&text);
         raw = extract_chat_text(&text)?;
         let json_text = strip_code_fence(&raw);
         match parse_json_loose(&json_text) {
@@ -585,15 +610,26 @@ pub async fn reverse_shot(
             }
             // 能解开但没 prompt，等于白问 —— 也当失败重来
             Ok(_) => last_error = "JSON 里没有画面描述字段".to_string(),
-            Err(e) => last_error = e,
+            Err(e) => {
+                last_error = e;
+                // 拿到了原文才修得动；第一次就把原文留给下一轮
+                if attempt == 0 && !raw.trim().is_empty() {
+                    broken = Some(raw.clone());
+                }
+            }
         }
     }
     let v = match parsed {
         Some(v) => v,
         None => {
             return Err(AppError::Msg(format!(
-                "反推结果不可用：{last_error}；原文：{}",
-                tail(&raw, 200)
+                "反推结果不可用{}：{last_error}{last_hint}；{}",
+                if repaired {
+                    "（已让模型修过一次 JSON）"
+                } else {
+                    ""
+                },
+                error_spot(&raw, &last_error)
             )))
         }
     };
@@ -795,6 +831,41 @@ fn tail(s: &str, n: usize) -> String {
         chars[chars.len() - n..].iter().collect()
     }
 }
+
+/// 报错时截取**出错位置附近**的一小段原文。
+///
+/// 以前只给 `tail(raw, 200)`，但 serde 的列号是**字节** —— 中文一个字占 3 字节，
+/// 320 列可能才一百多个字，错误常常落在被尾巴截掉的开头。
+/// 真实样本：模型漏了 `"characters"` 后面的冒号，报错点就在 `["男主"` 前，
+/// 而日志只看到 `["男主", "同事们"], ...` —— 完全看不出少了冒号。
+///
+/// 拿不到列号时退回尾部 200 字（至少比什么都没有强）。
+fn error_spot(raw: &str, err: &str) -> String {
+    let col = err
+        .split("column ")
+        .nth(1)
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse::<usize>().ok());
+    let Some(col) = col else {
+        return format!("原文：{}", tail(raw, 200));
+    };
+    let mut at = col.saturating_sub(1).min(raw.len());
+    while at > 0 && !raw.is_char_boundary(at) {
+        at -= 1;
+    }
+    let start = raw[..at]
+        .char_indices()
+        .rev()
+        .nth(40)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let end = raw[at..]
+        .char_indices()
+        .nth(60)
+        .map(|(i, _)| at + i)
+        .unwrap_or(raw.len());
+    format!("第 {col} 列附近：…{}…", &raw[start..end])
+}
 // ---------------- 剧名 / 简介改写 ----------------
 
 /// 从 OpenAI 兼容的 chat 返回体里取文本。
@@ -823,6 +894,114 @@ pub fn extract_chat_text(body: &str) -> AppResult<String> {
     Ok(text)
 }
 
+/// 从响应体里挑出「为什么没写完」的信号，拼在失败文案后面。
+///
+/// 两个关键字段：
+/// - `finish_reason == "length"`：被输出上限截断，不是语法错；
+/// - `usage...reasoning_tokens > 0`：模型还是思考了 —— 我们明明传了
+///   `thinking: disabled`，但有的服务商不认这个字段，思考照样吃 token。
+fn finish_hint(body: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return String::new();
+    };
+    let reason = v
+        .pointer("/choices/0/finish_reason")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let usage = &v["usage"];
+    let reasoning = usage["completion_tokens_details"]["reasoning_tokens"]
+        .as_i64()
+        .or_else(|| usage["reasoning_tokens"].as_i64())
+        .unwrap_or(0);
+    let completion = usage["completion_tokens"].as_i64().unwrap_or(0);
+
+    let mut parts = Vec::new();
+    if reason == "length" {
+        parts.push("输出被截断（finish_reason=length）".to_string());
+    }
+    if reasoning > 0 {
+        parts.push(format!("模型思考吞了 {reasoning} token"));
+    }
+    if completion > 0 {
+        parts.push(format!("本次输出 {completion} token"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("；{}", parts.join("，"))
+    }
+}
+
+/// 关思考的请求字段 —— **所有语言模型调用都从这儿取**。
+///
+/// 方舟 Seed 2.0 文档写明 `thinking.type` 只认 `enabled`（默认）/ `disabled`，
+/// 不传就是开着；百炼 Qwen3 的开关叫 `enable_thinking`。
+/// 自定义服务商不猜：OpenAI 兼容家太多，乱塞字段会直接 400。
+fn thinking_off(provider: &AiProvider) -> Vec<(&'static str, serde_json::Value)> {
+    let base = provider.base_url.to_ascii_lowercase();
+    if provider.id == "ark" || base.contains("volces.com") {
+        vec![("thinking", serde_json::json!({ "type": "disabled" }))]
+    } else if provider.id == "dashscope" || base.contains("dashscope.aliyuncs.com") {
+        vec![("enable_thinking", serde_json::json!(false))]
+    } else {
+        Vec::new()
+    }
+}
+
+/// 把「关思考」字段并进请求体。以后新增语言模型调用也必须走这里。
+fn apply_thinking_off(body: &mut serde_json::Value, provider: &AiProvider) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for (key, value) in thinking_off(provider) {
+        obj.insert(key.to_string(), value);
+    }
+}
+
+/// 脱掉「关思考」字段；返回是否真的脱了。
+fn strip_thinking_off(body: &mut serde_json::Value) -> bool {
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+    let mut removed = false;
+    for key in ["thinking", "enable_thinking", "reasoning_effort"] {
+        removed |= obj.remove(key).is_some();
+    }
+    removed
+}
+
+/// 发一次 chat/completions。
+///
+/// **不认识「关思考」字段就脱掉重试一次**：老模型 / 某些兼容服务商会 400，
+/// 不该让整个功能挂掉 —— 去掉字段后功能照旧，只是思考可能关不掉。
+async fn post_chat(
+    client: &reqwest::Client,
+    endpoint: &str,
+    provider: &AiProvider,
+    mut body: serde_json::Value,
+) -> AppResult<(u16, String)> {
+    for attempt in 0..2 {
+        let resp = client
+            .post(endpoint)
+            .header("Authorization", format!("Bearer {}", provider.api_key.trim()))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AppError::Msg(format!("请求失败：{e}")))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        // 成功了、已经是第二轮、错得与 thinking 无关、或本来就没字段可脱，都到此为止
+        if (200..300).contains(&status)
+            || attempt == 1
+            || !mentions_unknown_thinking(&text)
+            || !strip_thinking_off(&mut body)
+        {
+            return Ok((status, text));
+        }
+    }
+    unreachable!("两轮都一定会 return")
+}
+
 /// 一次 chat 调用。
 pub async fn chat(provider: &AiProvider, system: &str, user: &str) -> AppResult<String> {
     if let Some(early) = precheck(provider) {
@@ -838,7 +1017,7 @@ pub async fn chat(provider: &AiProvider, system: &str, user: &str) -> AppResult<
         .build()
         .map_err(|e| AppError::Msg(format!("建不了 HTTP 客户端：{e}")))?;
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": provider.text_model.trim(),
         "messages": [
             { "role": "system", "content": system },
@@ -846,39 +1025,20 @@ pub async fn chat(provider: &AiProvider, system: &str, user: &str) -> AppResult<
         ],
         // 改写要的是多样性，不是稳定复读
         "temperature": 0.9,
-        // **关掉思维链。**
-        //
-        // `doubao-seed-2-0-mini` 是推理模型，默认会先生成一大段思考再回答。
-        // 实测（同一个起剧名的请求）：
-        //
-        //     默认：      completion_tokens=495，其中 reasoning_tokens=483  ← 98%
-        //     关掉思考：  completion_tokens=5，  其中 reasoning_tokens=0
-        //
-        // **495 → 5，省 99%**，而答案是「借来的"新车"」/「借车风波」，
-        // 质量没有变差 —— 起个剧名不需要推理。
-        //
-        // 改写简介、起剧名都是"要求明确、答案很短"的任务，思维链纯属浪费。
-        "thinking": { "type": "disabled" },
-        // 兜底上限：万一某个模型不认 `thinking`，至少别让它无限写下去。
-        // 简介要求 100~140 字（约 300 token），给到 800 足够宽裕。
-        "max_tokens": 800,
+        // 不设 `max_tokens`：简介要求 100~140 字、剧名更短，
+        // 本来就不会长；设了反而可能把最后一句截掉（模型不一定守字数）。
     });
+    // **关掉思维链。** `doubao-seed-2-0-mini` 默认会先生成一大段思考再回答。
+    // 实测（同一个起剧名的请求）：
+    //
+    //     默认：      completion_tokens=495，其中 reasoning_tokens=483  ← 98%
+    //     关掉思考：  completion_tokens=5，  其中 reasoning_tokens=0
+    //
+    // **495 → 5，省 99%**，而起剧名 / 改写简介根本不需要推理。
+    apply_thinking_off(&mut body, provider);
 
-    let resp = client
-        .post(&endpoint)
-        .header("Authorization", format!("Bearer {}", provider.api_key.trim()))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Msg(format!("请求失败：{e}")))?;
-    let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
+    let (status, text) = post_chat(&client, &endpoint, provider, body).await?;
     if !(200..300).contains(&status) {
-        // **有的服务商 / 模型不认 `thinking` 字段**，会直接 400。
-        // 那不该让整个功能挂掉 —— 去掉它重试一次：功能照旧，只是多花点 token。
-        if mentions_unknown_thinking(&text) {
-            return chat_without_thinking(provider, system, user).await;
-        }
         return Err(AppError::Msg(friendly_http(status, &text)));
     }
     extract_chat_text(&text)
@@ -888,42 +1048,12 @@ pub async fn chat(provider: &AiProvider, system: &str, user: &str) -> AppResult<
 fn mentions_unknown_thinking(body: &str) -> bool {
     let b = body.to_ascii_lowercase();
     b.contains("thinking")
-        && (b.contains("invalid") || b.contains("unknown") || b.contains("unexpected"))
-}
-
-/// 去掉 `thinking` 再试一次。给不支持该字段的服务商用。
-async fn chat_without_thinking(
-    provider: &AiProvider,
-    system: &str,
-    user: &str,
-) -> AppResult<String> {
-    let endpoint = format!("{}/chat/completions", normalize_base_url(&provider.base_url));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|e| AppError::Msg(format!("建不了 HTTP 客户端：{e}")))?;
-    let body = serde_json::json!({
-        "model": provider.text_model.trim(),
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user },
-        ],
-        "temperature": 0.9,
-        "max_tokens": 800,
-    });
-    let resp = client
-        .post(&endpoint)
-        .header("Authorization", format!("Bearer {}", provider.api_key.trim()))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Msg(format!("请求失败：{e}")))?;
-    let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
-    if !(200..300).contains(&status) {
-        return Err(AppError::Msg(friendly_http(status, &text)));
-    }
-    extract_chat_text(&text)
+        && (b.contains("invalid")
+            || b.contains("unknown")
+            || b.contains("unexpected")
+            || b.contains("unsupported")
+            || b.contains("not supported")
+            || b.contains("不支持"))
 }
 
 /// 提示词：重写简介。
@@ -1673,6 +1803,107 @@ mod tests {
         assert!(has_prompt(&serde_json::json!({ "描述": "画面" })));
         assert!(!has_prompt(&serde_json::json!({ "prompt": "  " })));
         assert!(!has_prompt(&serde_json::json!({ "other": 1 })));
+    }
+
+    #[test]
+    fn error_spot_points_at_the_broken_place() {
+        // 真实毛病：`"characters"` 后面漏了冒号。报错列号是字节列，
+        // 这里前面的中文很多，如果只看尾巴会完全看不到出错的地方。
+        let raw = format!(
+            "{{\"prompt\":\"{}…\",\"characters\" [\"男主\", \"同事们\"]}}",
+            "画面很暗".repeat(20)
+        );
+        let err = format!(
+            "expected `:` at line 1 column {}",
+            raw.find("characters").unwrap() + 1
+        );
+        let spot = error_spot(&raw, &err);
+        assert!(spot.contains("characters"), "要看到出错位置：{spot}");
+        assert!(spot.contains("第 "), "要带上列号：{spot}");
+
+        // 拿不到列号时退回尾部
+        let fallback = error_spot("短文本", "没有位置");
+        assert!(fallback.starts_with("原文："), "{fallback}");
+    }
+
+    #[test]
+    fn finish_hint_tells_truncation_from_reasoning() {
+        let cut = concat!(
+            r#"{"choices":[{"finish_reason":"length"}],"usage":{"completion_tokens":1600,"#, 
+            r#""completion_tokens_details":{"reasoning_tokens":1200}}}"#
+        );
+        let h = finish_hint(cut);
+        assert!(h.contains("截断"), "{h}");
+        assert!(h.contains("1200"), "思考用量没报出来：{h}");
+        assert!(h.contains("1600"), "总用量没报出来：{h}");
+
+        let ok = r#"{"choices":[{"finish_reason":"stop"}],"usage":{"completion_tokens":700}}"#;
+        let h = finish_hint(ok);
+        assert!(!h.contains("截断"), "{h}");
+        assert!(!h.contains("思考"), "{h}");
+        assert_eq!(finish_hint("{}"), "");
+    }
+
+    #[test]
+    fn known_providers_always_turn_thinking_off() {
+        let provider = |id: &str, base: &str| AiProvider {
+            id: id.to_string(),
+            label: String::new(),
+            enabled: true,
+            base_url: base.to_string(),
+            text_model: "m".to_string(),
+            image_model: String::new(),
+            api_key: String::new(),
+        };
+
+        // 方舟：内置预设，以及用户在「自定义」里填的方舟地址，都要认出来
+        for (id, base) in [
+            ("ark", "https://ark.cn-beijing.volces.com/api/v3"),
+            ("custom", "https://ark.cn-beijing.volces.com/api/v3"),
+        ] {
+            let mut body = serde_json::json!({ "model": "m" });
+            apply_thinking_off(&mut body, &provider(id, base));
+            assert_eq!(body["thinking"]["type"], "disabled", "{id}");
+        }
+
+        // 百炼 Qwen3 的开关叫 enable_thinking
+        let mut body = serde_json::json!({});
+        apply_thinking_off(
+            &mut body,
+            &provider("dashscope", "https://dashscope.aliyuncs.com/api/v1"),
+        );
+        assert_eq!(body["enable_thinking"], false);
+
+        // 不认识的服务商不乱塞字段，否则每调一次就 400
+        let mut body = serde_json::json!({});
+        apply_thinking_off(&mut body, &provider("custom", "https://api.openai.com/v1"));
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn thinking_fields_can_be_stripped_for_old_models() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "thinking": { "type": "disabled" },
+            "enable_thinking": false,
+        });
+        assert!(strip_thinking_off(&mut body));
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("enable_thinking").is_none());
+        assert!(!strip_thinking_off(&mut body), "已经空了就别再说脱过");
+    }
+
+    #[test]
+    fn unsupported_thinking_errors_are_recognized() {
+        for body in [
+            r#"{"error":{"message":"Unknown parameter: thinking"}}"#,
+            r#"{"message":"thinking is not supported"}"#,
+            r#"{"message":"enable_thinking 参数不支持"}"#,
+        ] {
+            assert!(mentions_unknown_thinking(body), "{body}");
+        }
+        assert!(!mentions_unknown_thinking(r#"{"message":"invalid api key"}"#));
     }
 
     #[test]

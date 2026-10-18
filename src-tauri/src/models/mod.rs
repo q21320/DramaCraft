@@ -1443,6 +1443,10 @@ pub struct FanqieSeriesDetail {
     pub intro: String,
     /// 封面原地址；可能是 HEIC，前端可交给 `fanqie_cover` 转成 JPEG
     pub cover: String,
+    /// 上架日期（`YYYY-MM-DD`）。**列表接口不返回这个字段**，
+    /// 只有详情接口的 `create_time` 有；拿不到就是空串。
+    #[serde(default)]
+    pub online_time: String,
     pub episode_count: i64,
     pub episodes: Vec<FanqieEpisode>,
     /// app / web

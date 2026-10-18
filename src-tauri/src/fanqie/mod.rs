@@ -583,6 +583,7 @@ fn parse_series_page(html: &str, series_id: &str) -> Option<FanqieSeriesDetail> 
         cover: pick_json_string(html, "series_cover").unwrap_or_default(),
         episode_count: episodes.len() as i64,
         episodes,
+        online_time: String::new(),
         source: "web".into(),
     })
 }
@@ -671,8 +672,30 @@ fn parse_app_series(data: &serde_json::Value, series_id: &str) -> Option<FanqieS
             .to_string(),
         episode_count,
         episodes,
+        online_time: vd
+            .get("create_time")
+            .and_then(|v| v.as_i64())
+            .map(online_date)
+            .unwrap_or_default(),
         source: "app".into(),
     })
+}
+
+/// 详情接口的 `create_time`（Unix 秒）→ `2026-10-10`。
+///
+/// 固定按**东八区**落日期，不跟运行机器的时区走 —— 同一部剧在不同时区
+/// 打开不能差一天。秒和毫秒都兼容；离谱的值返回空串。
+fn online_date(ts: i64) -> String {
+    let secs = if ts > 10_000_000_000 { ts / 1000 } else { ts };
+    if secs <= 0 {
+        return String::new();
+    }
+    let Some(t) = chrono::DateTime::from_timestamp(secs, 0) else {
+        return String::new();
+    };
+    // 偏移常量不可能非法，用 expect 比 unwrap 更能说明意图
+    let east8 = chrono::FixedOffset::east_opt(8 * 3600).expect("东八区偏移恒定合法");
+    t.with_timezone(&east8).format("%Y-%m-%d").to_string()
 }
 
 // ---------------- 官网页面 ----------------
@@ -2547,6 +2570,7 @@ mod tests {
                         "series_title": "测试剧",
                         "series_intro": "一句简介",
                         "series_cover": "https://a.heic",
+                        "create_time": 1791607620,
                         "episode_cnt": 2,
                         "video_list": [
                             {"vid": "111", "vid_index": 1, "title": "一句简介", "duration": 66},
@@ -2566,6 +2590,28 @@ mod tests {
         assert_eq!(detail.episodes[0].title, "第 1 集");
         assert_eq!(detail.episodes[0].duration_sec, 66);
         assert_eq!(detail.episodes[1].title, "第 2 集");
+        // 详情接口的 `create_time` 就是上架日期（固定东八区）
+        assert_eq!(detail.online_time, "2026-10-10");
+    }
+
+    #[test]
+    fn online_date_accepts_seconds_millis_and_garbage() {
+        assert_eq!(online_date(1791607620), "2026-10-10");
+        // 毫秒也能吃
+        assert_eq!(online_date(1791607620000), "2026-10-10");
+        // 没给 / 乱给 → 空串，不在界面上显示
+        assert_eq!(online_date(0), "");
+        assert_eq!(online_date(-1), "");
+    }
+
+    #[test]
+    fn detail_without_create_time_has_empty_online_date() {
+        let data: serde_json::Value = serde_json::from_str(
+            r#"{"1":{"video_data":{"series_title":"剧","video_list":[{"vid":"111"}]}}}"#,
+        )
+        .unwrap();
+        let detail = parse_app_series(&data, "1").unwrap();
+        assert_eq!(detail.online_time, "");
     }
 
     #[test]
