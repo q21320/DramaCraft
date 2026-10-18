@@ -218,3 +218,5 @@ DramaDist/
 - **不要**把第三方商业软件自带的二进制、音效、模板、字体复制进本项目。
 - ASR/OCR 模型选用 MIT / Apache-2.0 许可者（如 faster-whisper + Whisper、RapidOCR + PP-OCR）。
 - 平台发布请优先使用各平台**官方开放平台 API**；网页自动化存在封号与协议风险。
+#   D r a m a C r a f t  
+ 
