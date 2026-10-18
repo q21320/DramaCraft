@@ -34,7 +34,7 @@ export const videoNav: NavItem = {
   key: "video",
   path: "/video",
   label: "视频",
-  subtitle: "视频处理",
+  subtitle: "本地视频与在线短剧",
 };
 
 /** 主入口。直接摆在菜单最上面，不藏在任何分组里。 */
@@ -172,7 +172,8 @@ export const navItems: NavItem[] = [
 ];
 
 export function navByPath(path: string): NavItem | undefined {
-  return navItems.find((n) => n.path === path);
+  // 子页面（例如 /video/:seriesId/:vid）也算在父级入口下，页头文案才不会串到流水线
+  return navItems.find((n) => n.path === path || path.startsWith(`${n.path}/`));
 }
 
 /** 某个路径属于哪个分组（首页要按分组显示入口）。 */

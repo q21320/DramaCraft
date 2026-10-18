@@ -796,3 +796,165 @@ export interface SliceProgress {
   phase: "running" | "done";
   failed?: number;
 }
+
+// ---------------- 在线短剧（番茄接口） ----------------
+
+/** 番茄接口里的一条在线短剧，Rust 侧已把原始结构压平。 */
+export interface OnlineDrama {
+  vid: string;
+  seriesId: string;
+  title: string;
+  desc: string;
+  cover: string;
+  /** 秒 */
+  durationSec: number;
+  playCount: number;
+  /** 热度原文，如「1578万」；没有时为空串 */
+  heat: string;
+  score: string;
+  episodeCount: number;
+  tags: string[];
+  copyright: string;
+  isNew: boolean;
+}
+
+/** 在线短剧的一页；「最新上线」和「新剧货架」都用这个形状，翻页时把游标原样带回去。 */
+export interface FanqieCategoryPage {
+  items: OnlineDrama[];
+  hasMore: boolean;
+  nextOffset: number;
+  sessionId: string;
+}
+
+/** 分类接口 `select_items` 的 8 个筛选键；空数组表示「全部」。 */
+export interface FanqieSelectItems {
+  genre: string[];
+  sort: string[];
+  category_dim_theme: string[];
+  category_dim_role: string[];
+  category_dim_epoch: string[];
+  gender: string[];
+  online_time: string[];
+  creation_status: string[];
+}
+
+/** 筛选面板里的一个可选项。 */
+export interface FanqieSelectorItem {
+  id: string;
+  name: string;
+}
+
+/** 筛选面板的一行：体裁 / 主题 / 设定 / 背景 / 排序 / 受众 / 时间… */
+export interface FanqieSelectorRow {
+  key: string;
+  label: string;
+  items: FanqieSelectorItem[];
+}
+
+/** 一部在线短剧的详情。`source` 为 app 或 web（数据从哪来）。 */
+export interface FanqieSeriesDetail {
+  seriesId: string;
+  title: string;
+  intro: string;
+  /** 封面原地址；可能是 HEIC，交给 fanqieCover 转换 */
+  cover: string;
+  episodeCount: number;
+  episodes: FanqieEpisode[];
+  source: string;
+}
+
+/** 剧里的一集。 */
+export interface FanqieEpisode {
+  vid: string;
+  /** 从 1 开始的集号 */
+  index: number;
+  title: string;
+  /** 秒；接口没给时为 0 */
+  durationSec: number;
+}
+
+/** 一集可播放的直链（官网公开的明文 MP4），只在解密失败时兜底。 */
+export interface FanqiePlayInfo {
+  url: string;
+  quality: string;
+  source: string;
+}
+
+/** App 播放接口的元信息：时长、清晰度列表、流是否加密。 */
+export interface FanqieVideoInfo {
+  vid: string;
+  durationSec: number;
+  qualities: string[];
+  encrypted: boolean;
+}
+
+/** 一集解密好的本地文件。`path` 交给 convertFileSrc 播放。 */
+export interface FanqiePreparedVideo {
+  vid: string;
+  /** 本地 mp4 绝对路径 */
+  path: string;
+  /** 平台流的清晰度，例如 480p */
+  quality: string;
+  /** 转码后的编码，固定 h264 */
+  codec: string;
+  durationSec: number;
+  /** app：本次下载解密；cache：命中本地缓存 */
+  source: string;
+}
+
+/** 批量下载时的一集。 */
+export interface FanqieDownloadEpisode {
+  vid: string;
+  /** 从 1 开始的集号 */
+  index: number;
+}
+
+/** 请求把一部剧的全部分集下载到流水线源目录。 */
+export interface FanqieDownloadRequest {
+  seriesId: string;
+  title: string;
+  /** 简介，写进 `<剧名>/intro.txt` */
+  intro: string;
+  /** 封面地址，写进 `<剧名>/poster.jpg` */
+  cover: string;
+  episodes: FanqieDownloadEpisode[];
+}
+
+/** 一部剧的下载结果。 */
+export interface FanqieDownloadReport {
+  seriesId: string;
+  title: string;
+  /** 剧集目录（绝对路径） */
+  dir: string;
+  downloaded: number;
+  skipped: number;
+  /** 失败集：`第 3 集：原因` */
+  failed: string[];
+}
+
+/** 下载目录里已经有内容的剧。 */
+export interface DownloadedDrama {
+  /** 番茄剧集 ID —— 列表按它匹配，剧名变了也不会认错 */
+  seriesId: string;
+  title: string;
+  /** 剧目录里平铺的 mp4 集数 */
+  episodes: number;
+}
+
+/** 批量下载进度事件（`fanqie:download`）。 */
+export interface FanqieDownloadProgress {
+  seriesId: string;
+  title: string;
+  /** 当前第几集（按下载顺序） */
+  index: number;
+  /** 集号 */
+  episodeIndex: number;
+  /** 这部剧一共几集 */
+  total: number;
+  /** episode：单集结束；series：整部剧结束 */
+  phase: "episode" | "series";
+  message: string;
+  downloaded: number;
+  skipped: number;
+  failed: number;
+}

@@ -212,8 +212,19 @@ const SCHEMA_V12: &str = r#"
 ALTER TABLE run_log ADD COLUMN artifact TEXT NOT NULL DEFAULT '';
 "#;
 
+/// v13：下载索引。列表要判断「这部剧下载过没有」必须按 **seriesId** ——
+/// 剧名会变（接口标题带后缀、标点差异），拿标题当键迟早对不上。
+const SCHEMA_V13: &str = r#"
+CREATE TABLE IF NOT EXISTS download_index (
+    series_id  TEXT PRIMARY KEY,
+    title      TEXT NOT NULL,
+    dir        TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
 /// 当前 schema 版本。加表/加列时递增，并在 `migrate` 里补一段。
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 pub fn open(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
@@ -285,6 +296,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     if version < 12 {
         conn.execute_batch(SCHEMA_V12)?;
     }
+    if version < 13 {
+        conn.execute_batch(SCHEMA_V13)?;
+    }
     // **兜底：按实际表结构补齐关键列。**
     //
     // 上面的版本分支只在版本号正确时才跑到。一旦版本号被错误地推高
@@ -334,6 +348,37 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
 pub fn get_setting(conn: &Connection, key: &str) -> AppResult<Option<String>> {
     let mut stmt = conn.prepare("SELECT value FROM setting WHERE key = ?1")?;
     let mut rows = stmt.query(params![key])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
+// ---------- download_index ----------
+
+/// 记下某部剧下载到哪个目录。列表页靠它按 seriesId 判断「已下载」。
+pub fn upsert_download(
+    conn: &Connection,
+    series_id: &str,
+    title: &str,
+    dir: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO download_index(series_id, title, dir, updated_at) VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(series_id) DO UPDATE SET
+             title = excluded.title,
+             dir = excluded.dir,
+             updated_at = excluded.updated_at",
+        params![series_id, title, dir, now()],
+    )?;
+    Ok(())
+}
+
+/// 这部剧上次下载到哪个目录（没记录返回 `None`）。
+pub fn download_dir(conn: &Connection, series_id: &str) -> AppResult<Option<String>> {
+    let mut stmt = conn.prepare("SELECT dir FROM download_index WHERE series_id = ?1")?;
+    let mut rows = stmt.query(params![series_id])?;
     if let Some(row) = rows.next()? {
         Ok(Some(row.get(0)?))
     } else {
@@ -1424,6 +1469,10 @@ pub fn attach_recent_logs_to_run(conn: &Connection, run_id: i64, mark: i64) -> A
 }
 
 /// 读日志。`after_id` 用来做增量拉取（前端轮询只要新行）。
+///
+/// 按运行过滤时，**这次运行开始之后写的、还没归属运行的日志也要带上**：
+/// 下载原片、手工操作发生在建 run 之前或运行之间，不带的话用户按运行
+/// 过滤就看不到「刚才下载失败在哪一集」。
 pub fn list_logs(
     conn: &Connection,
     run_id: Option<i64>,
@@ -1436,7 +1485,15 @@ pub fn list_logs(
         Some(id) => {
             let mut stmt = conn.prepare(
                 "SELECT id, run_id, drama_id, level, message, artifact, created_at FROM run_log
-                  WHERE run_id = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
+                  WHERE (
+                      run_id = ?1
+                      -- 这次运行开始之后写、还没归属的日志（比如下载原片）
+                      OR (run_id IS NULL AND id > COALESCE(
+                            (SELECT MIN(id) FROM run_log WHERE run_id = ?1),
+                            9223372036854775807
+                      ))
+                  )
+                    AND id > ?2 ORDER BY id ASC LIMIT ?3",
             )?;
             let rows = stmt.query_map(params![id, after_id, limit], row_to_run_log)?;
             for r in rows {
@@ -2733,6 +2790,23 @@ mod tests {
         let fresh = list_logs(&conn, Some(1), last, 100).unwrap();
         assert_eq!(fresh.len(), 1, "只该拿到新增的那一行");
         assert_eq!(fresh[0].message, "已排 12 个任务");
+    }
+
+    /// 这次运行开始之后写的、还没归属的日志也要看到。
+    ///
+    /// 下载原片写在 run 记录之前（或两次运行之间）。不带上它们，
+    /// 用户按运行过滤时只会看到流水线自己那几行，下载失败像没发生过。
+    #[test]
+    fn logs_include_unattached_lines_written_after_the_run_started() {
+        let conn = mem();
+        append_log(&conn, None, None, "info", "很久以前的下载");
+        append_log(&conn, Some(1), None, "info", "运行开始");
+        append_log(&conn, None, None, "error", "这次运行旁边的下载失败");
+
+        let rows = list_logs(&conn, Some(1), 0, 100).unwrap();
+        assert_eq!(rows.len(), 2, "运行之前的旧日志不该混进来");
+        assert_eq!(rows[0].message, "运行开始");
+        assert_eq!(rows[1].message, "这次运行旁边的下载失败");
     }
 
     #[test]

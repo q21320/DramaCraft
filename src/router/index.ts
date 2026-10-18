@@ -9,6 +9,11 @@ import { createRouter, createWebHashHistory, type RouteRecordRaw } from "vue-rou
 const routes: RouteRecordRaw[] = [
   { path: "/", redirect: "/pipeline" },
   { path: "/video", name: "video", component: () => import("@/views/VideoPage.vue") },
+  {
+    path: "/video/:seriesId/:vid?",
+    name: "videoDetail",
+    component: () => import("@/views/VideoDetailPage.vue"),
+  },
   { path: "/pipeline", name: "pipeline", component: () => import("@/views/PipelinePage.vue") },
   { path: "/projects", name: "home", component: () => import("@/views/HomePage.vue") },
   { path: "/library", name: "library", component: () => import("@/views/LibraryPage.vue") },

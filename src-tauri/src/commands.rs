@@ -8,6 +8,8 @@ use crate::models::{
     DiscoveredAsset, DocxReport, EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome,
     AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage, CostReportRow, DedupReport,
     DesubtitleReport, RewriteOutcome, StoryboardReport, CoverReport, CoverRequest, HeaderLabel,
+    FanqieCategoryPage, FanqieDownloadReport, FanqieDownloadRequest, FanqiePlayInfo,
+    FanqiePreparedVideo, FanqieSelectItems, FanqieSelectorRow, FanqieSeriesDetail, FanqieVideoInfo,
     IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
     PipelineStage, PlatformOption, Project,
     ProofLayout, ProofPreview, ProofRenderReport, PublishAccount, PublishClipEntry,
@@ -16,8 +18,8 @@ use crate::models::{
     TransformOptions, TransformReport, VerifyItem, VerifyReport,
 };
 use crate::{
-    ai, asr, asset, cloud, cover, docx, export, jy, media, ocr, pipeline, proc, proof, publish, queue,
-    series, subtitle, tools, transform, verify, AppState,
+    ai, asr, asset, cloud, cover, docx, export, fanqie, jy, media, ocr, pipeline, proc, proof, publish,
+    queue, series, subtitle, tools, transform, verify, AppState,
 };
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -1436,7 +1438,7 @@ pub async fn desubtitle_media(
         let configured = lock_tools(&state)?.clone();
         let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
         // 探实际文件的尺寸用 —— **不能用素材记录里的**，见下面 subtitle_band 那段
-        let ffprobe = configured.ffprobe.clone();
+        let ffprobe = tools::require(&configured.ffprobe, "ffprobe")?;
         let python = tools::require(&configured.python, "python")?;
         let conn = lock_db(&state)?;
         let media = db::get_media(&conn, media_id)?;
@@ -1517,18 +1519,19 @@ pub async fn desubtitle_media(
     let sampled = frames.len() as i64;
 
     let (ocr_frames, engine) = ocr::run_worker(&python, &worker, &frames, &opts, ocr::default_timeout())?;
-    let _ = std::fs::remove_dir_all(&frames_dir);
 
-    // **尺寸要从实际处理的这个文件探，不能用素材记录里的。**
+    // **尺寸要在抽出来的帧上探，不能从源视频探。**
     //
-    // 踩过一次：去字幕改成吃「去重产物」之后又抓不到字幕了。原因是
-    // 去重产物被**缩到了 720p**（404×720），而素材记录里存的是源片的
-    // 1080×1920 —— OCR 在 720p 上量出来的字幕框 y≈453，被判成
-    // 「不在下半部分」（要求 y ≥ 1920×0.55 = 1056），全被滤掉。
+    // OCR 框是相对这些帧的像素坐标；而 ffprobe 对源视频报的是**编码尺寸**。
+    // 视频带 rotate 元数据时（手机竖拍、某些转码产物）ffmpeg 解码会自动转
+    // 90°，两边差一个宽高互换 —— delogo 拿到越界的框就报
+    // "Logo area is outside of the frame."，整集失败。
     //
-    // **手上正在处理哪个文件，就问哪个文件的尺寸。**
-    let probe = media::probe(&PathBuf::from(&ffprobe), &input)?;
-    let (fw, fh) = (probe.width, probe.height);
+    // 帧本身就是 ffmpeg 解出来的图，探它得到的就是 delogo 真正看到的画幅。
+    // （必须在删临时帧之前探）
+    let frame_probe = media::probe(&ffprobe, &frames[0])?;
+    let _ = std::fs::remove_dir_all(&frames_dir);
+    let (fw, fh) = (frame_probe.width, frame_probe.height);
     if fw <= 0 || fh <= 0 {
         return Err(AppError::Msg("探不到画面尺寸，无法定位字幕".into()));
     }
@@ -1602,7 +1605,13 @@ pub async fn desubtitle_media(
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::Msg(format!(
-            "去字幕失败：{}",
+            "去字幕失败（字幕带 {}×{} @ ({}, {})，画面 {}×{}）：{}",
+            band.w,
+            band.h,
+            band.x,
+            band.y,
+            fw,
+            fh,
             proc::tail(err.trim())
         )));
     }
@@ -2179,7 +2188,10 @@ pub fn pipeline_scan(root: String) -> AppResult<SourceScan> {
     pipeline::scan_source(Path::new(root))
 }
 
-/// 默认导出目录：**源目录里面的 `<源目录名>二创`**，一部剧的东西放在一个文件夹里。
+/// 导出目录的约定位置：**源目录下的 `二创`**。
+///
+/// 真正落盘是每部剧自己的 `<剧目录>/二创/<AI剧名>/`；
+/// 这个命令只给界面显示一个约定根。
 #[tauri::command]
 pub fn pipeline_default_out_dir(root: String) -> AppResult<String> {
     if root.trim().is_empty() {
@@ -2188,6 +2200,49 @@ pub fn pipeline_default_out_dir(root: String) -> AppResult<String> {
     Ok(pipeline::default_out_dir(Path::new(root.trim()), "二创")
         .to_string_lossy()
         .to_string())
+}
+
+// ---------------- 下载日志与流水线运行的衔接 ----------------
+
+/// 记「这次下载从哪条日志开始」的设置键。
+const DOWNLOAD_LOG_MARK_KEY: &str = "download_log_mark";
+
+/// 下载完最多过多久再开流水线，日志还挂得上去。
+///
+/// 太晚手动开跑的那次多半不是为这批下载准备的，
+/// 把旧下载日志卷进来只会让日志页说谎。
+const DOWNLOAD_LOG_MARK_TTL_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// 读出还没过期的那条下载日志起点。
+fn read_download_log_mark(conn: &Connection) -> Option<i64> {
+    let raw = db::get_setting(conn, DOWNLOAD_LOG_MARK_KEY).ok().flatten()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let mark = v.get("mark")?.as_i64()?;
+    let at = v.get("at")?.as_i64()?;
+    let age = chrono::Utc::now().timestamp_millis().saturating_sub(at);
+    (mark >= 0 && age <= DOWNLOAD_LOG_MARK_TTL_MS).then_some(mark)
+}
+
+/// 下载开始前划一条线。
+///
+/// 下载日志写在 `run_log` 里，但那时还没有 run 记录。下完自动跳流水线时，
+/// `pipeline_start` 会把这条线之后的日志一起挂到那次运行上 ——
+/// 否则日志页只按运行过滤，用户根本看不到刚才下载了什么。
+///
+/// 连着下几部剧时保留**最早**的一条线，别让后一部把前一部的地标顶掉。
+fn remember_download_log_mark(state: &tauri::State<'_, AppState>) -> AppResult<()> {
+    let conn = lock_db(state)?;
+    let now_mark = db::max_log_id(&conn)?;
+    let mark = read_download_log_mark(&conn).map_or(now_mark, |m| m.min(now_mark));
+    db::set_setting(
+        &conn,
+        DOWNLOAD_LOG_MARK_KEY,
+        &serde_json::json!({
+            "mark": mark,
+            "at": chrono::Utc::now().timestamp_millis(),
+        })
+        .to_string(),
+    )
 }
 
 /// 开始一条流水线。
@@ -2212,6 +2267,7 @@ pub async fn pipeline_start(
     slice_seconds: Option<f64>,
     model: Option<String>,
     header_label: Option<HeaderLabel>,
+    only: Option<Vec<String>>,
 ) -> AppResult<PipelineRun> {
     let root_path = PathBuf::from(root.trim());
     if root_path.as_os_str().is_empty() {
@@ -2239,6 +2295,8 @@ pub async fn pipeline_start(
     };
     let slice_ms = ((slice_seconds.unwrap_or(40.0)).clamp(3.0, 600.0) * 1000.0).round() as i64;
     let asr_model = model.unwrap_or_default();
+    // 点名的剧（从下载页跳过来时就是刚下的那一两部）。空 = 整目录全跑。
+    let only: Vec<String> = only.unwrap_or_default();
 
     let ffprobe = {
         let configured = lock_tools(&state)?.clone();
@@ -2251,14 +2309,26 @@ pub async fn pipeline_start(
     // 但它写的日志属于「这次运行」，而 run 记录还没建 —— 所以先划一条线，
     // 等 run 建好之后再把线之后的日志挂上去（attach_recent_logs_to_run）。
     // 不挂的话，用户按运行过滤时看不到「改剧名失败」，像什么都没发生。
+    //
+    // 起点还要往前推到**下载开始**：下完自动跳过来开跑时，
+    // 那批「下载到第几集」的日志得跟着这次运行一起显示。
     let log_mark = {
         let conn = lock_db(&state)?;
-        db::max_log_id(&conn)?
+        let now_mark = db::max_log_id(&conn)?;
+        read_download_log_mark(&conn)
+            .map(|m| m.min(now_mark))
+            .unwrap_or(now_mark)
     };
     let mut renames: std::collections::HashMap<String, pipeline::NewName> =
         std::collections::HashMap::new();
     if enabled.iter().any(|s| s == "rewrite") {
-        let scan = pipeline::scan_source(&root_path)?;
+        let mut scan = pipeline::scan_source(&root_path)?;
+        // **只给这次点名的剧改名字。**
+        //
+        // 下载页跳过来时 `root` 是下载根，目录里还躺着以前下的剧 ——
+        // 不过滤的话，AI 会顺手把无关的剧也改一遍（日志里一次三条「改剧名」）。
+        // 改剧名是外部调用，白花的钱和配额都是用户的。
+        pipeline::keep_only(&mut scan, &only)?;
         let provider = {
             let conn = lock_db(&state)?;
             ai::usable_provider(&conn)?
@@ -2362,11 +2432,14 @@ pub async fn pipeline_start(
         header_label,
         &renames,
         regroup.as_ref(),
+        &only,
     )?;
 
-    // 把开始前写的那几条日志（扫描、改剧名成没成）挂到这次运行上。
-    // 用户按运行过滤时才看得到「改剧名失败了」。
+    // 把开始前写的那几条日志（扫描、改剧名成没成、刚才的下载）挂到这次运行上。
+    // 用户按运行过滤时才看得到「改剧名失败了」「第几集下完了」。
     let _ = db::attach_recent_logs_to_run(&conn, outcome.run_id, log_mark);
+    // 挂过就清掉，别让下一次无关的运行又把它们卷进来
+    let _ = db::set_setting(&conn, DOWNLOAD_LOG_MARK_KEY, "");
 
     if !outcome.skipped.is_empty() {
         // 读不出来的文件不能悄悄咽掉 —— 但要让它可查，而不是弹一堆错误
@@ -3802,4 +3875,239 @@ pub async fn export_publish_package(
     })
     .await
     .map_err(|e| AppError::Msg(format!("打包线程异常终止：{e}")))?
+}
+
+// ---------------- 在线短剧（番茄） ----------------
+
+/// 分类落地页：默认按上线时间倒序，可带体裁/主题等筛选，可翻页。
+/// `session_id` 是首页返回的会话号，翻页时带回能保持同一批推荐。
+#[tauri::command]
+pub async fn fanqie_category(
+    offset: i64,
+    limit: i64,
+    session_id: Option<String>,
+    select_items: Option<FanqieSelectItems>,
+) -> AppResult<FanqieCategoryPage> {
+    fanqie::category(
+        offset,
+        limit,
+        session_id.as_deref().unwrap_or(""),
+        select_items.unwrap_or_default(),
+    )
+    .await
+}
+
+/// 分类筛选面板：返回体裁/主题/设定/背景等可选项。
+#[tauri::command]
+pub async fn fanqie_selector_rows(genre: Option<String>) -> AppResult<Vec<FanqieSelectorRow>> {
+    fanqie::selector_rows(genre.as_deref().unwrap_or("")).await
+}
+
+/// 新剧货架：约 20 条一页，带游标，可以接着翻。
+#[tauri::command]
+pub async fn fanqie_new_shelf(
+    offset: i64,
+    session_id: Option<String>,
+) -> AppResult<FanqieCategoryPage> {
+    fanqie::new_shelf(offset, session_id.as_deref().unwrap_or("")).await
+}
+
+/// 整部剧的详情：标题、简介、封面与分集列表。
+#[tauri::command]
+pub async fn fanqie_series_detail(series_id: String) -> AppResult<FanqieSeriesDetail> {
+    fanqie::series_detail(&series_id).await
+}
+
+/// 一集的可播放直链（官网公开的明文 360p MP4），只在解密失败时兜底。
+#[tauri::command]
+pub async fn fanqie_play_url(series_id: String, vid: String) -> AppResult<FanqiePlayInfo> {
+    fanqie::play_url(&series_id, &vid).await
+}
+
+/// 下载并解密 App 流，转成 H.264 落到本地缓存，返回可直接播放的文件路径。
+/// 这是覆盖全部集数的主链路；解不开时前端再退回官网直链。
+#[tauri::command]
+pub async fn fanqie_prepare_video(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    vid: String,
+    quality: Option<String>,
+) -> AppResult<FanqiePreparedVideo> {
+    let ffmpeg = {
+        let configured = lock_tools(&state)?.ffmpeg.clone();
+        tools::resolve(&configured, "ffmpeg")
+    };
+    fanqie::prepare_video(&app, &vid, quality.as_deref(), ffmpeg).await
+}
+
+/// App 播放接口给的元信息：时长、全部清晰度、是否加密。
+#[tauri::command]
+pub async fn fanqie_video_info(vid: String) -> AppResult<FanqieVideoInfo> {
+    fanqie::video_info(&vid).await
+}
+
+/// 下载目录的设置键。存在 setting 表里 —— **和项目无关**，一次选定以后都用它。
+const DOWNLOAD_ROOT_KEY: &str = "download.root";
+
+/// 读用户指定的下载目录；没配过、或目录已经不在了，返回空串。
+///
+/// 前端拿到空串就引导用户选一个 —— 不替用户猜位置（之前猜到了 C 盘下载夹，
+/// 用户的片子在 E 盘，每次都要多搬一次）。
+#[tauri::command]
+pub fn fanqie_download_root(state: tauri::State<'_, AppState>) -> AppResult<String> {
+    let conn = lock_db(&state)?;
+    let dir = db::get_setting(&conn, DOWNLOAD_ROOT_KEY)?.unwrap_or_default();
+    let dir = dir.trim();
+    if dir.is_empty() || !Path::new(dir).is_dir() {
+        return Ok(String::new());
+    }
+    Ok(dir.to_string())
+}
+
+/// 指定下载目录：以后所有剧都放在这里。
+///
+/// ```text
+/// <下载目录>/
+///     <剧名>/
+///         剧名.txt
+///         intro.txt
+///         poster.jpg
+///         第01集.mp4 …
+///         二创/          ← 流水线产出（每部剧自己的）
+/// ```
+///
+/// 只接受绝对路径 —— 相对路径会跟着程序启动目录跑，用户根本找不到。
+#[tauri::command]
+pub fn set_fanqie_download_root(
+    state: tauri::State<'_, AppState>,
+    dir: String,
+) -> AppResult<String> {
+    let dir = dir.trim();
+    if dir.is_empty() {
+        return Err(AppError::Msg("下载目录不能为空".into()));
+    }
+    let path = PathBuf::from(dir);
+    if !path.is_absolute() {
+        return Err(AppError::Msg(
+            "请选择绝对路径，比如 E:\\短剧\\下载".into(),
+        ));
+    }
+    std::fs::create_dir_all(&path)
+        .map_err(|e| AppError::Msg(format!("建不了下载目录：{e}")))?;
+    let shown = path.to_string_lossy().to_string();
+    let conn = lock_db(&state)?;
+    db::set_setting(&conn, DOWNLOAD_ROOT_KEY, &shown)?;
+    Ok(shown)
+}
+
+/// 列表要查的一部剧。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadedQuery {
+    pub series_id: String,
+    pub title: String,
+}
+
+/// 一部剧在下载目录里的落地情况。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadedDrama {
+    pub series_id: String,
+    pub title: String,
+    pub episodes: i64,
+}
+
+/// 查这些剧在下载目录里已经落了多少集；没下过的不返回。
+///
+/// **先按 seriesId 查索引** —— 剧名会变（接口标题带后缀、标点差异），
+/// 拿标题当键迟早对不上。旧版本下载没有索引，再退回按剧名找目录。
+#[tauri::command]
+pub fn fanqie_downloaded(
+    state: tauri::State<'_, AppState>,
+    items: Vec<DownloadedQuery>,
+) -> AppResult<Vec<DownloadedDrama>> {
+    let conn = lock_db(&state)?;
+    let root = db::get_setting(&conn, DOWNLOAD_ROOT_KEY)?.unwrap_or_default();
+    let root = root.trim();
+    if root.is_empty() || !Path::new(root).is_dir() {
+        return Ok(Vec::new());
+    }
+    let root = Path::new(root);
+    let mut out = Vec::new();
+    for item in items {
+        let mut dir: Option<PathBuf> = None;
+        let sid = item.series_id.trim();
+        if !sid.is_empty() {
+            if let Some(saved) = db::download_dir(&conn, sid)? {
+                let p = PathBuf::from(saved);
+                if p.is_dir() {
+                    dir = Some(p);
+                }
+            }
+        }
+        // 旧下载（没有索引）→ 按剧名找；目录名用下载时那一套清洗
+        if dir.is_none() {
+            let p = root.join(fanqie::safe_file_name(&item.title));
+            if p.is_dir() {
+                dir = Some(p);
+            }
+        }
+        if let Some(p) = dir {
+            let episodes = fanqie::count_episodes(&p);
+            if episodes > 0 {
+                out.push(DownloadedDrama {
+                    series_id: item.series_id,
+                    title: item.title,
+                    episodes,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 把一部剧的全部分集下载到流水线源目录（解密 + 转 H.264）。
+#[tauri::command]
+pub async fn fanqie_download_series(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    req: FanqieDownloadRequest,
+    out_root: String,
+    quality: Option<String>,
+) -> AppResult<FanqieDownloadReport> {
+    let root = PathBuf::from(out_root.trim());
+    if !root.is_dir() {
+        return Err(AppError::Msg("下载目录不存在，请重新发起下载".into()));
+    }
+    // 划一条线：这批下载日志要跟随后那次流水线运行一起显示。
+    // 只是记账，写不进去不该让下载本身失败。
+    let _ = remember_download_log_mark(&state);
+    let ffmpeg = {
+        let configured = lock_tools(&state)?.ffmpeg.clone();
+        tools::resolve(&configured, "ffmpeg")
+    };
+    let report = fanqie::download_series(&app, &req, &root, quality.as_deref(), ffmpeg).await?;
+    // 记下 seriesId → 目录。列表页靠它标「已下载」—— 拿剧名当键，
+    // 接口标题一变就对不上，用户会以为没下过。
+    if report.downloaded + report.skipped > 0 {
+        if let Ok(conn) = lock_db(&state) {
+            let _ = db::upsert_download(&conn, &req.series_id, &report.title, &report.dir);
+        }
+    }
+    Ok(report)
+}
+
+/// 把 HEIC 封面转成 JPEG 并缓存；本来就是 JPEG 的原样返回地址。
+#[tauri::command]
+pub async fn fanqie_cover(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> AppResult<String> {
+    // 锁只在解析 ffmpeg 路径时拿一下，后面转码是异步的，不能把锁带过去
+    let ffmpeg = {
+        let configured = lock_tools(&state)?.ffmpeg.clone();
+        tools::resolve(&configured, "ffmpeg")
+    };
+    fanqie::cover_jpeg(&app, &url, ffmpeg).await
 }

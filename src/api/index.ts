@@ -32,6 +32,16 @@ import type {
   EpisodeDetection,
   ExportOptions,
   ExportOutcome,
+  DownloadedDrama,
+  FanqieCategoryPage,
+  FanqieDownloadReport,
+  FanqieDownloadRequest,
+  FanqiePlayInfo,
+  FanqiePreparedVideo,
+  FanqieSelectItems,
+  FanqieSelectorRow,
+  FanqieSeriesDetail,
+  FanqieVideoInfo,
   Job,
   Media,
   IpDocRequest,
@@ -302,6 +312,8 @@ export const api = {
     sliceSeconds: number,
     model: string,
     headerLabel?: HeaderLabel | null,
+    // 只跑点名的剧（从下载页跳过来时就是刚下的那一部）；空 = 整目录全跑
+    only?: string[],
   ) =>
     call<PipelineRun>("pipeline_start", {
       root,
@@ -310,6 +322,7 @@ export const api = {
       sliceSeconds,
       headerLabel: headerLabel ?? null,
       model,
+      only: only ?? [],
     }),
   pipelineList: (limit?: number) => call<PipelineRun[]>("pipeline_list", { limit: limit ?? 20 }),
   pipelineGet: (id: number) => call<PipelineRun | null>("pipeline_get", { id }),
@@ -357,4 +370,45 @@ export const api = {
 
   // 封面生成：配好 AI 走图生图，否则本地合成
   renderCover: (req: CoverRequest) => call<CoverReport>("render_cover", { req }),
+
+  // 在线短剧（番茄）：只读公开列表，不需要登录
+  fanqieCategory: (offset = 0, limit = 20, sessionId = "", selectItems: FanqieSelectItems) =>
+    call<FanqieCategoryPage>("fanqie_category", { offset, limit, sessionId, selectItems }),
+  /** 分类筛选面板：体裁/主题/设定/背景等选项 */
+  fanqieSelectorRows: (genre = "") =>
+    call<FanqieSelectorRow[]>("fanqie_selector_rows", { genre }),
+  fanqieNewShelf: (offset = 0, sessionId = "") =>
+    call<FanqieCategoryPage>("fanqie_new_shelf", { offset, sessionId }),
+  /** HEIC 封面转本地 JPEG 缓存；非 HEIC 原样返回地址 */
+  fanqieCover: (url: string) => call<string>("fanqie_cover", { url }),
+  /** 整部剧的详情：标题、简介、封面与分集列表 */
+  fanqieSeriesDetail: (seriesId: string) =>
+    call<FanqieSeriesDetail>("fanqie_series_detail", { seriesId }),
+  /** 官网明文直链，只在 App 流解密失败时兜底 */
+  fanqiePlayUrl: (seriesId: string, vid: string) =>
+    call<FanqiePlayInfo>("fanqie_play_url", { seriesId, vid }),
+  /** 下载并解密 App 流，转 H.264 缓存到本地，返回可直接播放的文件路径 */
+  fanqiePrepareVideo: (vid: string, quality?: string) =>
+    call<FanqiePreparedVideo>("fanqie_prepare_video", { vid, quality: quality ?? null }),
+  /** App 播放接口的元信息：时长、清晰度、是否加密 */
+  fanqieVideoInfo: (vid: string) => call<FanqieVideoInfo>("fanqie_video_info", { vid }),
+  /** 用户指定的下载目录；没设置过（或目录已不在）返回空串 */
+  fanqieDownloadRoot: () => call<string>("fanqie_download_root"),
+  /** 指定下载目录：以后所有剧都放这里 */
+  setFanqieDownloadRoot: (dir: string) =>
+    call<string>("set_fanqie_download_root", { dir }),
+  /** 查这些剧在下载目录里已经落了多少集（按 seriesId 匹配，没下过的不返回） */
+  fanqieDownloaded: (items: { seriesId: string; title: string }[]) =>
+    call<DownloadedDrama[]>("fanqie_downloaded", { items }),
+  /** 把一部剧的全部分集下载到下载根（解密 + 转 H.264） */
+  fanqieDownloadSeries: (
+    req: FanqieDownloadRequest,
+    outRoot: string,
+    quality?: string,
+  ) =>
+    call<FanqieDownloadReport>("fanqie_download_series", {
+      req,
+      outRoot,
+      quality: quality ?? null,
+    }),
 };

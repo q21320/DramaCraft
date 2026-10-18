@@ -141,11 +141,27 @@ pub fn subtitle_band(frames: &[OcrFrame], frame_w: i64, frame_h: i64) -> Option<
         return None;
     }
 
+    // **先取整，再用取整后的左右/上下算宽高。**
+    //
+    // 之前是分别对左边界、宽度四舍五入：px1=0.5、px2=1080 时
+    // x=1、w=round(1079.5)=1080 —— x+w=1081，`delogo` 直接报
+    // "Logo area is outside of the frame."，整集失败。
+    // 取整后再相减，宽高天然不会多出那一像素。
+    let x = px1.round() as i64;
+    let y = py1.round() as i64;
+    let right = px2.round() as i64;
+    let bottom = py2.round() as i64;
+    let w = (right - x).min(frame_w - x);
+    let h = (bottom - y).min(frame_h - y);
+    if x < 0 || y < 0 || w <= 0 || h <= 0 {
+        return None;
+    }
+
     let band = SubtitleBand {
-        x: px1.round() as i64,
-        y: py1.round() as i64,
-        w: (px2 - px1).round() as i64,
-        h: (py2 - py1).round() as i64,
+        x,
+        y,
+        w,
+        h,
         hit_frames: frames_with_hit.iter().filter(|h| **h).count(),
         total_frames: frames.len(),
     };
@@ -276,6 +292,20 @@ mod tests {
         }];
         let b = subtitle_band(&frames, 1080, 1920).expect("好框还在，该找到");
         assert!(b.x >= 280 && b.x <= 300, "只有好框参与：{b:?}");
+    }
+
+    /// 半像素边界也不能越界：分别四舍五入曾把 x+w 撑大 1px。
+    #[test]
+    fn rounding_never_pushes_the_band_past_the_edge() {
+        let frames = vec![OcrFrame {
+            time_ms: 0,
+            text: "贴右边界".into(),
+            boxes: vec![OcrBox { x1: 0.0, y1: 1700.0, x2: 1080.0, y2: 1800.0 }],
+        }];
+        let b = subtitle_band(&frames, 1080, 1920).expect("该找到");
+        assert!(b.x + b.w <= 1080, "右边越界：{b:?}");
+        assert!(b.y + b.h <= 1920, "下边越界：{b:?}");
+        assert!(b.w > 0 && b.h > 0, "宽高必须为正：{b:?}");
     }
 
     #[test]

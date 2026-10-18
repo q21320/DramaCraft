@@ -55,6 +55,20 @@ const COVER_HINTS: [&str; 6] = ["封面", "cover", "poster", "海报", "folder",
 /// 只认中文关键词会漏掉。
 const SYNOPSIS_HINTS: [&str; 7] = ["简介", "说明", "介绍", "intro", "synopsis", "desc", "readme"];
 
+/// 每部剧的产出目录固定叫这个（就在剧目录下面）。
+///
+/// ```text
+/// 下载/<剧名>/
+///     第01集.mp4 …
+///     二创/            ← 这里
+///         <AI剧名>/
+///             去重/ quzimu/ qiepian/ …
+/// ```
+///
+/// 扫描时**按名字整棵跳过**：不跳过的话，下次扫描会把已经加工过的片子
+/// 当成源片再加工一遍。
+pub const OUTPUT_DIR_NAME: &str = "二创";
+
 fn ext_of(path: &Path) -> String {
     path.extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -95,14 +109,17 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
         if path.is_dir() {
             // **产出目录整棵跳过。**
             //
-            // 产出现在放在源目录里面（`<源目录>/<源目录名>二创/`），
+            // 产出现在放在每部剧自己的目录里（`<剧目录>/二创/`），
             // 不跳过的话下次扫描会把它当成另一部剧 —— 把用户自己加工过的
             // 去重片、去字幕片、切片**再加工一遍**。
             //
-            // 判据用**目录里有没有 `剧名.txt`**，而不是按名字匹配：
-            // AI 起的剧名每次都变，按名字根本认不出来；而 `剧名.txt`
-            // 是产出目录一定会有的标记（写剧名和简介时就写了）。
-            if is_marked_output(&path) {
+            // `二创` 是固定名，直接按名字认；老版本的
+            // `<源目录名>二创` 仍靠 `is_marked_output`（有剧名.txt 且无平铺视频）识别。
+            let is_output_dir = path
+                .file_name()
+                .map(|n| n.to_string_lossy() == OUTPUT_DIR_NAME)
+                .unwrap_or(false);
+            if is_output_dir || is_marked_output(&path) {
                 continue;
             }
             walk(&path, out, depth + 1);
@@ -114,11 +131,23 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 
 /// 这个目录是不是 DramaDist 自己的产出目录？
 ///
-/// 判据是**有没有 `剧名.txt`** —— 那是产出目录一定会写的标记。
-/// 不用固定目录名判断，因为产出目录可能叫 `<源目录名>二创`，
-/// 也可能是以前用 AI 剧名建的旧目录。
+/// 不能只看 `剧名.txt`：下载/素材包也是「剧名.txt + 简介.txt + 平铺视频」，
+/// 只看它会把用户刚下好的源剧目录整棵跳过。产出目录的 `剧名.txt` 旁边
+/// 只有 `去重` / `quzimu` / `qiepian` 这些子目录，**没有平铺视频**，
+/// 所以用「有剧名.txt 且没有平铺视频」来区分两者。
 fn is_marked_output(dir: &Path) -> bool {
-    dir.join("剧名.txt").is_file()
+    if !dir.join("剧名.txt").is_file() {
+        return false;
+    }
+    let has_flat_video = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .any(|p| p.is_file() && is_video(&p))
+        })
+        .unwrap_or(false);
+    !has_flat_video
 }
 /// 从候选里挑一个，优先名字带关键词的。
 fn pick_by_hint(candidates: &[PathBuf], hints: &[&str]) -> Option<PathBuf> {
@@ -140,7 +169,11 @@ fn pick_by_hint(candidates: &[PathBuf], hints: &[&str]) -> Option<PathBuf> {
 }
 
 /// 读取简介文本。读不动就当没有，不阻断扫描。
-fn read_synopsis(path: &Path) -> String {
+/// 读简介正文。
+///
+/// 真实素材包的 `intro.txt` 常写成「剧名 / 空行 / 正文」（百度网盘那份就是），
+/// 首行就是剧名的话要跳过 —— 否则 AI 改写简介时会把剧名当成正文的一部分。
+fn read_synopsis(path: &Path, name: &str) -> String {
     let Ok(bytes) = std::fs::read(path) else {
         return String::new();
     };
@@ -153,7 +186,11 @@ fn read_synopsis(path: &Path) -> String {
         }
     };
     let trimmed = text.trim();
-    trimmed.chars().take(SYNOPSIS_LIMIT).collect()
+    let body = match trimmed.split_once('\n') {
+        Some((first, rest)) if first.trim() == name.trim() => rest.trim_start(),
+        _ => trimmed,
+    };
+    body.chars().take(SYNOPSIS_LIMIT).collect()
 }
 
 /// 极简 GBK 解码：只处理「非 ASCII 双字节」这一最常见情况。
@@ -481,8 +518,17 @@ pub fn start_pipeline(
     header_label: Option<HeaderLabel>,
     renames: &std::collections::HashMap<String, NewName>,
     regroup: Option<&RegroupOptions>,
+    only: &[String],
 ) -> AppResult<StartOutcome> {
-    let scan = scan_source(root)?;
+    let mut scan = scan_source(root)?;
+    // **只跑点名的剧。**
+    //
+    // 下载完自动跳过来时，源目录常常是「下载根」—— 里面还躺着以前下的剧。
+    // 不过滤的话，用户只下了一部，整个库却被重新排了一遍：实测 1 部 20 集
+    // 变成 3 部 81 集、117 个任务。用户的原话是「我只选择了下载一部剧啊，
+    // 怎么把之前的也算上了呢？」
+    let scanned_total = scan.dramas.len();
+    keep_only(&mut scan, only)?;
     let run_id = crate::db::create_pipeline_run(
         conn,
         &scan.root,
@@ -507,10 +553,18 @@ pub fn start_pipeline(
         None,
         "info",
         &format!(
-            "扫描「{}」：{} 部剧、共 {} 集。步骤：{}",
+            "扫描「{}」：{} 部剧、共 {} 集{}。步骤：{}",
             scan.root,
             scan.dramas.len(),
             scan.total_episodes,
+            if scan.dramas.len() < scanned_total {
+                format!(
+                    "（源目录共 {scanned_total} 部，本次只跑勾选的 {} 部，其余不动）",
+                    scan.dramas.len()
+                )
+            } else {
+                String::new()
+            },
             stages
                 .iter()
                 .map(|s| stage_label(s))
@@ -541,7 +595,9 @@ pub fn start_pipeline(
                 .get(&drama.name)
                 .map(|n| safe_drama_name(&n.title))
                 .unwrap_or_else(|| safe_drama_name(&drama.name));
-            match regroup_drama(&opt.ffmpeg, drama, out_root, &target, opt.target_ms) {
+            // 重组产物也在**这部剧自己的二创目录**下，不落到全局输出根
+            let drama_base = Path::new(&drama.dir).join(OUTPUT_DIR_NAME);
+            match regroup_drama(&opt.ffmpeg, drama, &drama_base, &target, opt.target_ms) {
                 Ok(made) => {
                     let after = made.len();
                     drama.episodes = made;
@@ -609,7 +665,7 @@ pub fn start_pipeline(
             }
             None => crate::db::create_project(conn, &display_name, &drama.dir)?,
         };
-        let drama_out = out_root.join(&safe);
+        let drama_out = Path::new(&drama.dir).join(OUTPUT_DIR_NAME).join(&safe);
         let drama_id = crate::db::add_pipeline_drama(
             conn,
             run_id,
@@ -1364,6 +1420,52 @@ pub fn scan_source(root: &Path) -> AppResult<SourceScan> {
     })
 }
 
+/// 只保留用户点名的剧；`only` 为空 = 不过滤（整目录全跑）。
+///
+/// 匹配三个口径：**剧名、目录名、目录全路径**。
+/// 前端从下载页跳过来时手里只有剧名，而落盘目录名经过 `safe_file_name`
+/// 清洗（非法字符换成下划线），所以还要用清洗后的名字和目录名比一次 ——
+/// 少一个口径，用户就会看到「没找到刚下载的剧」。
+pub fn keep_only(scan: &mut SourceScan, only: &[String]) -> AppResult<()> {
+    let wanted: Vec<String> = only
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+
+    let found: Vec<String> = scan.dramas.iter().map(|d| d.name.clone()).collect();
+    scan.dramas.retain(|d| {
+        let dir_name = Path::new(&d.dir)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        wanted.iter().any(|w| {
+            w == &d.name
+                || w == &dir_name
+                || w == &d.dir
+                || crate::fanqie::safe_file_name(w) == dir_name
+        })
+    });
+    scan.total_episodes = scan.dramas.iter().map(|d| d.episodes.len() as i64).sum();
+
+    if scan.dramas.is_empty() {
+        // 一长串名字糊在错误里没法看，最多列前几个
+        let mut listing = found.iter().take(8).cloned().collect::<Vec<_>>().join("、");
+        if found.len() > 8 {
+            listing.push_str(" 等");
+        }
+        return Err(AppError::Msg(format!(
+            "源目录里没有要跑的剧：{}。目录里现有：{}",
+            wanted.join("、"),
+            if listing.is_empty() { "（一部也没扫到）".to_string() } else { listing }
+        )));
+    }
+    Ok(())
+}
+
 /// 这个视频属于哪部剧：根目录的一级子目录；直接在根目录下就取根目录本身。
 fn drama_dir_of(root: &Path, file: &Path) -> PathBuf {
     match file.parent() {
@@ -1502,9 +1604,14 @@ fn build_drama(dir: &Path, videos: &[PathBuf]) -> AppResult<SourceDrama> {
         ));
     }
 
+    // 剧名后面还要用（认简介首行、兜底命名），先算出来
+    let dir_name = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "未命名".to_string());
     let synopsis = synopsis_path
         .as_ref()
-        .map(|p| read_synopsis(p))
+        .map(|p| read_synopsis(p, &dir_name))
         .unwrap_or_default();
 
     let mut episodes: Vec<SourceEpisode> = videos
@@ -1555,10 +1662,6 @@ fn build_drama(dir: &Path, videos: &[PathBuf]) -> AppResult<SourceDrama> {
 
     // 剧名：优先用文件名解析出来的，其次用目录名
     let from_name = crate::series::parse_series(&episodes[0].file_name);
-    let dir_name = dir
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "未命名".to_string());
     let name = if from_name.is_empty() || from_name == "未命名" {
         dir_name
     } else if from_name != dir_name && episodes.len() == 1 {
@@ -1582,26 +1685,20 @@ fn build_drama(dir: &Path, videos: &[PathBuf]) -> AppResult<SourceDrama> {
     })
 }
 
-/// 默认的导出目录：源目录旁边加一个后缀，不污染原素材。
-/// 默认产出目录 = **源目录里面的 `<源目录名>二创`**。
-///
-/// 用户要的：一部剧的所有东西放在同一个文件夹里，不要散在盘上成两个兄弟目录。
+/// 产出的约定：**每部剧自己的目录下面叫 `二创`**。
 ///
 /// ```text
-/// 弟弟结婚…\                      ← 源
+/// 下载/<剧名>/
 ///     第01集.mp4 …
-///     弟弟结婚…二创\              ← 产出（固定名字，这一层是新增的）
-///         家庭首付的拉扯\         ← 原有的按 AI 剧名分，逻辑没动
-///             去重\ quzimu\ qiepian\ …
+///     二创/                 ← 固定名字（扫描时整棵跳过）
+///         <AI剧名>/
+///             去重/ quzimu/ qiepian/ …
 /// ```
 ///
-/// **扫描时必须跳过它**（见 `is_marked_output`），否则会把产出当成源片。
+/// 传进来的 `root` 是整个下载根；这里返回 `<root>/二创` 只作为运行记录里的
+/// 「约定位置」，真正每部剧的目录由 `start_pipeline` 按剧目录算。
 pub fn default_out_dir(root: &Path, suffix: &str) -> PathBuf {
-    let name = root
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "输出".to_string());
-    root.join(format!("{name}{suffix}"))
+    root.join(suffix)
 }
 
 #[cfg(test)]
@@ -1810,6 +1907,53 @@ mod tests {
     }
 
     #[test]
+    fn keep_only_runs_the_named_dramas_and_ignores_the_rest() {
+        // 用户下了一部剧就从下载根跳过来 —— 目录里还躺着以前下的剧，
+        // 不过滤的话 1 部会变成 3 部、20 集变成 81 集。
+        let t = TempTree::new("keep_only");
+        t.file("剧甲/第01集.mp4", b"x");
+        t.file("剧甲/第02集.mp4", b"x");
+        t.file("剧乙/第01集.mp4", b"x");
+
+        let mut scan = scan_source(t.path()).unwrap();
+        assert_eq!(scan.dramas.len(), 2);
+
+        keep_only(&mut scan, &["剧乙".to_string()]).unwrap();
+        assert_eq!(scan.dramas.len(), 1);
+        assert_eq!(scan.dramas[0].name, "剧乙");
+        assert_eq!(scan.total_episodes, 1, "集数要跟着过滤后的剧重新算");
+
+        // 空列表 = 不过滤，保持「整个目录全跑」的老行为
+        let mut all = scan_source(t.path()).unwrap();
+        keep_only(&mut all, &[]).unwrap();
+        assert_eq!(all.dramas.len(), 2);
+    }
+
+    #[test]
+    fn keep_only_matches_the_cleaned_download_folder_name() {
+        // 下载落盘时目录名被 `safe_file_name` 洗过：非法字符换成下划线。
+        // 前端手里还是原始剧名，拿不到清洗后的目录名。
+        let t = TempTree::new("keep_only_clean");
+        t.file("剧_甲/第01集.mp4", b"x");
+        let mut scan = scan_source(t.path()).unwrap();
+        keep_only(&mut scan, &["剧:甲".to_string()]).unwrap();
+        assert_eq!(scan.dramas.len(), 1);
+    }
+
+    #[test]
+    fn keep_only_reports_when_nothing_matches() {
+        let t = TempTree::new("keep_only_none");
+        t.file("剧甲/第01集.mp4", b"x");
+        let mut scan = scan_source(t.path()).unwrap();
+        let err = keep_only(&mut scan, &["不存在的剧".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("没有要跑的剧"), "{err}");
+        // 不能只说没找到 —— 要把目录里到底有什么列出来
+        assert!(err.contains("剧甲"), "{err}");
+    }
+
+    #[test]
     fn empty_directory_is_reported_clearly() {
         let t = TempTree::new("empty");
         let err = scan_source(t.path()).unwrap_err().to_string();
@@ -1850,29 +1994,20 @@ mod tests {
         assert_eq!(scan.dramas[0].name, "都市爽剧");
     }
 
-    /// 默认产出目录 = **源目录里面的 `<源目录名>二创`**。
+    /// 产出的约定位置：**下载根下的 `二创`**（每部剧真正用的是自己的 `二创/`）。
     ///
-    /// 用户要的：一部剧的所有东西放在同一个文件夹里，不要散成两个兄弟目录。
-    /// 产出的完整结构是：
-    ///
-    ///     <源目录>\<源目录名>二创\<AI剧名>\去重\…
-    ///     └─ 新增这一层（固定名）  └─ 原有的按剧名分（逻辑没动）
+    /// 运行记录里存的是这个「约定根」，`PipelineDrama.out_dir` 才是
+    /// 每部剧具体的 `<剧目录>/二创/<AI剧名>`。
     #[test]
-    fn default_out_dir_is_inside_the_source() {
-        let got = default_out_dir(Path::new("G:/10.12"), "二创");
-        assert_eq!(
-            got,
-            PathBuf::from("G:/10.12/10.12二创"),
-            "产出该在源目录里面，不是它旁边"
-        );
-        // **关键的连带约束**：产出放在源目录里之后，扫描必须跳过它，
-        // 否则下次跑会把用户加工过的产出当成源片再加工一遍。
+    fn default_out_dir_is_the_output_name_under_the_root() {
+        let got = default_out_dir(Path::new("G:/10.12"), OUTPUT_DIR_NAME);
+        assert_eq!(got, PathBuf::from("G:/10.12/二创"));
     }
 
     /// **扫描必须跳过产出目录。**
     ///
-    /// 判据是目录里有没有 `剧名.txt` —— AI 起的剧名每次变，按名字认不出来；
-    /// 而 `剧名.txt` 是产出目录一定会写的标记。
+    /// 旧版产出在 `<源目录>/<源目录名>二创/`，有 `剧名.txt`，
+    /// 但视频都在 `去重/` 这类子目录里，没有平铺视频。
     #[test]
     fn scanning_skips_output_folders_inside_the_source() {
         let t = TempTree::new("skipout");
@@ -1886,6 +2021,44 @@ mod tests {
         let scan = scan_source(t.path()).unwrap();
         assert_eq!(scan.dramas.len(), 1, "产出目录不该被当成另一部剧");
         assert_eq!(scan.dramas[0].episode_count, 2, "只该看到源片那 2 集");
+    }
+
+    /// 新结构：产出在**每部剧自己的 `二创/`** 里，固定名要直接跳过。
+    #[test]
+    fn scanning_skips_the_per_drama_output_folder() {
+        let t = TempTree::new("skipout2");
+        t.file("某剧/剧名.txt", "某剧".as_bytes());
+        t.file("某剧/第01集.mp4", b"x");
+        t.file("某剧/第02集.mp4", b"y");
+        // 产出：`<剧目录>/二创/<AI剧名>/…`
+        t.file("某剧/二创/新剧名/剧名.txt", "新剧名".as_bytes());
+        t.file("某剧/二创/新剧名/去重/第01集_去重.mp4", b"z");
+        t.file("某剧/二创/新剧名/quzimu/第01集_quzimu.mp4", b"w");
+
+        let scan = scan_source(t.path()).unwrap();
+        assert_eq!(scan.dramas.len(), 1);
+        assert_eq!(
+            scan.dramas[0].episode_count, 2,
+            "二创里的产出不能算成源片"
+        );
+    }
+
+    /// 下载/素材包目录也有 `剧名.txt`，**不能**被当成产出跳过。
+    ///
+    /// 用户要的结构：`剧名.txt` + `简介.txt` + 平铺的 `第01集.mp4`。
+    /// 判据必须把「有平铺视频」的目录留在源片里。
+    #[test]
+    fn scanning_keeps_source_folders_that_have_flat_videos() {
+        let t = TempTree::new("keepflat");
+        t.file("雨夜双星念/剧名.txt", "雨夜双星念".as_bytes());
+        t.file("雨夜双星念/简介.txt", "一句简介".as_bytes());
+        t.file("雨夜双星念/第01集.mp4", b"x");
+        t.file("雨夜双星念/第02集.mp4", b"y");
+
+        let scan = scan_source(t.path()).unwrap();
+        assert_eq!(scan.dramas.len(), 1, "带剧名.txt 的源剧目录不能被跳过");
+        assert_eq!(scan.dramas[0].episode_count, 2);
+        assert_eq!(scan.dramas[0].synopsis, "一句简介");
     }
 
     #[test]
@@ -1984,6 +2157,7 @@ mod tests {
             None,
             &no_renames(),
             None,
+            &[],
         )
         .expect("起流水线失败");
 
@@ -2185,6 +2359,7 @@ mod tests {
             None,
             &renames,
             None,
+            &[],
         )
         .expect("起流水线失败");
 
@@ -2276,7 +2451,7 @@ mod tests {
         let stages = vec!["slice".to_string()];
 
         let first =
-            start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames(), None)
+            start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames(), None, &[])
                 .expect("第一次跑失败");
         assert_eq!(first.imported, 2);
         assert_eq!(first.reused_projects, 0);
@@ -2301,7 +2476,7 @@ mod tests {
             .collect();
 
         let second =
-            start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames(), None)
+            start_pipeline(&conn, &ffprobe, t.path(), &out, &stages, 10_000, "", None, &no_renames(), None, &[])
                 .expect("第二次跑失败");
 
         // **这次是全新导入，不是复用**
@@ -2355,6 +2530,7 @@ mod tests {
             None,
             &no_renames(),
             None,
+            &[],
         )
         .expect("起流水线失败");
 
@@ -2885,6 +3061,7 @@ mod tests {
             None,
             &no_renames(),
             None,
+            &[],
         )
         .expect("一部坏的素材不该让整条流水线起不来");
 
@@ -2962,6 +3139,17 @@ mod tests {
     }
 
     #[test]
+    fn synopsis_drops_the_title_line_but_keeps_real_text() {
+        let t = TempTree::new("synopsis");
+        // 素材包格式：首行剧名 + 空行 + 正文
+        let p = t.file("pack/intro.txt", "某剧\n\n第一段正文".as_bytes());
+        assert_eq!(read_synopsis(&p, "某剧"), "第一段正文");
+        // 首行不是剧名：原样保留，别误删正文
+        let p = t.file("pack2/intro.txt", "第一行正文\n第二行正文".as_bytes());
+        assert_eq!(read_synopsis(&p, "某剧"), "第一行正文\n第二行正文");
+    }
+
+    #[test]
     fn real_world_material_pack_is_scanned_correctly() {
         // 照着一份真实的短剧素材包写的（百度网盘下的）：
         //   intro.txt        ← 英文名，不是「简介.txt」
@@ -2981,7 +3169,9 @@ mod tests {
             &format!("{DRAMA}/{DRAMA}-第11集.mp4.baiduyun.p.downloading"),
             b"partial",
         );
-        t.file(&format!("{DRAMA}/intro.txt"), "简介正文".as_bytes());
+        // 真实素材包的 intro.txt：首行剧名，空行之后才是正文
+        let intro = format!("{DRAMA}\n\n简介正文");
+        t.file(&format!("{DRAMA}/intro.txt"), intro.as_bytes());
         t.file(&format!("{DRAMA}/poster.jpg"), b"img");
 
         // 以素材包所在的那一层为根目录（里面只有一个剧的子目录）

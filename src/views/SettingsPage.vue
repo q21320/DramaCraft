@@ -100,6 +100,37 @@ async function pickCostFile(field: "sealPath" | "signPath") {
   });
   if (typeof picked === "string") costForm.value[field] = picked;
 }
+
+// 下载目录：一次选定，从「视频」页下载的所有剧都放这里。
+// 没设置过时，第一次下载会先弹目录选择。
+const downloadRoot = ref("");
+const downloadRootSaving = ref(false);
+
+async function loadDownloadRoot() {
+  try {
+    downloadRoot.value = await api.fanqieDownloadRoot();
+  } catch {
+    // 读不出来当没配过
+  }
+}
+
+async function pickDownloadRoot() {
+  const picked = await open({
+    directory: true,
+    multiple: false,
+    title: "选择下载目录（以后所有剧都放这里）",
+  });
+  if (typeof picked !== "string" || !picked) return;
+  downloadRootSaving.value = true;
+  try {
+    downloadRoot.value = await api.setFanqieDownloadRoot(picked);
+    message.success("下载目录已保存");
+  } catch (e) {
+    message.error((e as Error).message);
+  } finally {
+    downloadRootSaving.value = false;
+  }
+}
 function syncCloudForm() {
   const cfg = store.cloud;
   cloudForm.value = {
@@ -183,10 +214,24 @@ onMounted(() => {
   // 成本报告落款：一次配好，每部剧都用
   void loadCostForm();
   void loadDraftAudio();
+  void loadDownloadRoot();
 });
 </script>
 
 <template>
+  <div class="dd-card">
+    <div class="dd-card-title">下载目录</div>
+    <div class="dd-card-desc">
+      从「视频」页下载的短剧都放在这里：每部剧一个子文件夹（加原名），
+      里面有 <span class="dd-mono">剧名.txt / intro.txt / poster.jpg / 第NN集.mp4 / 二创</span>。
+      第一次下载时没设置会先让你选。
+    </div>
+    <div class="dd-row" style="margin-bottom: 4px">
+      <n-input :value="downloadRoot" readonly size="small" style="width: 480px" placeholder="还没有设置" />
+      <n-button size="small" :loading="downloadRootSaving" @click="pickDownloadRoot">选择目录</n-button>
+    </div>
+  </div>
+
   <div class="dd-card">
     <div class="dd-card-title">外部工具</div>
     <div class="dd-card-desc">

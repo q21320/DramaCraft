@@ -1341,3 +1341,182 @@ pub struct AppInfo {
     pub version: String,
     pub data_dir: String,
 }
+
+// ---------------- 在线短剧（番茄） ----------------
+
+/// 番茄接口里的一条在线短剧（原始字段是 `video_data` 里那坨）。
+/// 只挑界面要用的字段，内部结构不往前端泄。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnlineDrama {
+    pub vid: String,
+    pub series_id: String,
+    pub title: String,
+    pub desc: String,
+    pub cover: String,
+    /// 秒
+    pub duration_sec: i64,
+    pub play_count: i64,
+    /// 热度原文（「1578万」这种）；接口没给时为空
+    pub heat: String,
+    pub score: String,
+    pub episode_count: i64,
+    pub tags: Vec<String>,
+    pub copyright: String,
+    pub is_new: bool,
+}
+
+/// 「最新上线」一页：游标和 session 都要原样带回去才能继续翻。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqieCategoryPage {
+    pub items: Vec<OnlineDrama>,
+    pub has_more: bool,
+    pub next_offset: i64,
+    pub session_id: String,
+}
+
+/// 分类接口 `select_items` 的 8 个筛选键。
+/// 字段名必须保持 snake_case，跟接口请求体一致。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FanqieSelectItems {
+    #[serde(default)]
+    pub genre: Vec<String>,
+    #[serde(default)]
+    pub sort: Vec<String>,
+    #[serde(default)]
+    pub category_dim_theme: Vec<String>,
+    #[serde(default)]
+    pub category_dim_role: Vec<String>,
+    #[serde(default)]
+    pub category_dim_epoch: Vec<String>,
+    #[serde(default)]
+    pub gender: Vec<String>,
+    #[serde(default)]
+    pub online_time: Vec<String>,
+    #[serde(default)]
+    pub creation_status: Vec<String>,
+}
+
+/// 筛选面板里的一个可选项，ID 是接口下发的 `selector_item_id`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqieSelectorItem {
+    pub id: String,
+    pub name: String,
+}
+
+/// 筛选面板的一行：体裁 / 主题 / 设定 / 背景 / 排序 / 受众 / 时间…
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqieSelectorRow {
+    pub key: String,
+    pub label: String,
+    pub items: Vec<FanqieSelectorItem>,
+}
+
+/// 一部在线短剧的详情：标题、简介、封面和全部分集。
+/// 优先取 App 详情接口；拿不到时退回官网 player 页，`source` 标明来源。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqieSeriesDetail {
+    pub series_id: String,
+    pub title: String,
+    pub intro: String,
+    /// 封面原地址；可能是 HEIC，前端可交给 `fanqie_cover` 转成 JPEG
+    pub cover: String,
+    pub episode_count: i64,
+    pub episodes: Vec<FanqieEpisode>,
+    /// app / web
+    pub source: String,
+}
+
+/// 一部剧里的一集。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqieEpisode {
+    pub vid: String,
+    /// 从 1 开始的集号
+    pub index: i64,
+    pub title: String,
+    /// 秒；接口没给时为 0
+    pub duration_sec: i64,
+}
+
+/// 一集可播放的直链。走的是官网公开流，明文 MP4。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqiePlayInfo {
+    pub url: String,
+    /// 例如 360p
+    pub quality: String,
+    /// web / web-fallback
+    pub source: String,
+}
+
+/// App 播放接口给的元信息：时长、清晰度列表、流是否加密。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqieVideoInfo {
+    pub vid: String,
+    pub duration_sec: f64,
+    pub qualities: Vec<String>,
+    pub encrypted: bool,
+}
+
+/// 一集准备好的本地可播文件。
+///
+/// App 的流是 CENC 加密的 HEVC，Rust 侧用 `spade_a` 派生的 key 交给 ffmpeg
+/// 解密并转成 H.264，落到缓存目录；前端拿 `path` 交给 `convertFileSrc` 播放。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqiePreparedVideo {
+    pub vid: String,
+    /// 本地 mp4 绝对路径
+    pub path: String,
+    /// 取自平台流的清晰度，例如 480p
+    pub quality: String,
+    /// 转码后的编码，固定 h264
+    pub codec: String,
+    pub duration_sec: f64,
+    /// app：本次下载解密；cache：命中本地缓存
+    pub source: String,
+}
+
+/// 批量下载时的一集。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqieDownloadEpisode {
+    pub vid: String,
+    /// 从 1 开始的集号
+    pub index: i64,
+}
+
+/// 请求把一部剧的全部分集下载到流水线源目录。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqieDownloadRequest {
+    pub series_id: String,
+    pub title: String,
+    /// 简介，写进 `<剧名>/intro.txt`；流水线靠这个文件拿剧情
+    #[serde(default)]
+    pub intro: String,
+    /// 封面地址；写进 `<剧名>/poster.jpg`，没拿到就留空
+    #[serde(default)]
+    pub cover: String,
+    pub episodes: Vec<FanqieDownloadEpisode>,
+}
+
+/// 一部剧的下载结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanqieDownloadReport {
+    pub series_id: String,
+    pub title: String,
+    /// 剧集目录（绝对路径）
+    pub dir: String,
+    pub downloaded: i64,
+    pub skipped: i64,
+    /// 失败集：`第 3 集：原因`
+    pub failed: Vec<String>,
+}

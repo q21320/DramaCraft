@@ -14,6 +14,7 @@ mod desubtitle;
 mod docx;
 mod error;
 mod export;
+mod fanqie;
 mod jy;
 mod media;
 mod models;
@@ -301,6 +302,18 @@ pub fn run() {
             commands::ai_rewrite,
             commands::dedup_media,
             commands::build_storyboard,
+            commands::fanqie_category,
+            commands::fanqie_selector_rows,
+            commands::fanqie_new_shelf,
+            commands::fanqie_cover,
+            commands::fanqie_series_detail,
+            commands::fanqie_play_url,
+            commands::fanqie_prepare_video,
+            commands::fanqie_video_info,
+            commands::fanqie_download_root,
+            commands::set_fanqie_download_root,
+            commands::fanqie_downloaded,
+            commands::fanqie_download_series,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

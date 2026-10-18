@@ -14,7 +14,7 @@ import {
 } from "naive-ui";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { api } from "@/api";
 import type {
   HeaderLabel,
@@ -26,6 +26,7 @@ import type {
 
 const message = useMessage();
 const router = useRouter();
+const route = useRoute();
 
 const stages = ref<PipelineStageOption[]>([]);
 const picked = ref<string[]>([]);
@@ -43,9 +44,8 @@ const willRewrite = computed(() => picked.value.includes("rewrite"));
 const root = ref("");
 
 /**
- * 实际会导出到哪 —— 和后端 `pipeline::default_out_dir` 一个规则：
- * 源目录旁边建一个「二创」。留空时就把这个算出来给用户看，
- * 免得他到处找产出。
+ * 产出位置：**每部剧自己的目录下，固定叫「二创」**。
+ * 留空时把这条约定算出来给用户看，免得他到处找产出。
  *
  * 注意**必须声明在 root 之后**：写在前面虽然因为 computed 是
  * 延迟求值而侥幸能用，但那是踩在暂时性死区的边上，没必要。
@@ -53,13 +53,12 @@ const root = ref("");
 const effectiveOutDir = computed(() => {
   const r = root.value.trim();
   if (!r) return "";
-  // 和后端 `pipeline::default_out_dir` **必须一个规则**：
-  // 产出在源目录**里面**，叫 `<源目录名>二创`。
+  // 和后端 `pipeline::OUTPUT_DIR_NAME` **必须一个规则**：
+  // 产出在每部剧目录下面，叫 `二创`。
   // 跟着源目录的分隔符风格走，别混出 `D:/a\二创`。
   const sep = r.includes("/") && !r.includes("\\") ? "/" : "\\";
   const base = r.replace(/[\\/]+$/, "");
-  const name = base.split(/[\\/]/).pop() || "输出";
-  return base + sep + name + "二创";
+  return base + sep + "<剧名>" + sep + "二创";
 });
 const sliceSeconds = ref(40);
 const model = ref("small");
@@ -97,12 +96,70 @@ const labelPositions: { label: string; value: LabelPosition }[] = [
 ];
 
 const scan = ref<SourceScan | null>(null);
+/**
+ * 从下载页跳过来时带的「刚下载的剧名」。
+ *
+ * 下载根里通常还躺着以前下的剧 —— 不过滤的话，用户只下了一部，
+ * 整个库却被重跑一遍（实测 1 部 20 集变成 3 部 81 集、117 个任务）。
+ */
+const fromDownload = ref<string[]>([]);
+/** 扫描结果里勾选要跑的剧（按剧名） */
+const chosen = ref<string[]>([]);
 const scanning = ref(false);
 const starting = ref(false);
 const runs = ref<PipelineRun[]>([]);
 const activeRunId = ref<number | null>(null);
 
 const activeRun = computed(() => runs.value.find((r) => r.id === activeRunId.value) ?? null);
+
+/** 勾选的剧一共多少集 —— 让用户确认这次到底要跑多少活 */
+const chosenEpisodes = computed(() => {
+  const s = scan.value;
+  if (!s) return 0;
+  return s.dramas
+    .filter((d) => chosen.value.includes(d.name))
+    .reduce((n, d) => n + d.episodeCount, 0);
+});
+
+/** 取路径最后一段：扫出来的剧名就是目录名，两者对得上 */
+function folderName(p: string): string {
+  return p.split(/[\\/]/).filter(Boolean).pop() || p;
+}
+
+/** 扫完后默认勾谁：从下载页来的只勾刚下的，否则全勾（保持老行为） */
+function applyChosenFromScan() {
+  const s = scan.value;
+  if (!s) {
+    chosen.value = [];
+    return;
+  }
+  if (fromDownload.value.length === 0) {
+    chosen.value = s.dramas.map((d) => d.name);
+    return;
+  }
+  const wanted = new Set(fromDownload.value);
+  const hit = s.dramas.filter((d) => wanted.has(d.name) || wanted.has(folderName(d.dir)));
+  if (hit.length > 0) {
+    chosen.value = hit.map((d) => d.name);
+    return;
+  }
+  // 刚下的剧没在目录里（改名、挪走了）—— 不替用户做主
+  chosen.value = [];
+  message.warning("没在源目录里找到刚下载的剧，请手动勾选要跑的剧");
+}
+
+function toggleChosen(name: string, on: boolean) {
+  const next = new Set(chosen.value);
+  if (on) next.add(name);
+  else next.delete(name);
+  chosen.value = [...next];
+}
+
+/** 「改为全部」：把从下载页带过来的限制撤掉 */
+function chooseAll() {
+  chosen.value = scan.value?.dramas.map((d) => d.name) ?? [];
+  fromDownload.value = [];
+}
 
 /**
  * 最后一次成功刷新的时刻。
@@ -161,6 +218,7 @@ async function doScan() {
   scan.value = null;
   try {
     scan.value = await api.pipelineScan(root.value.trim());
+    applyChosenFromScan();
     message.success(
       `扫到 ${scan.value.dramas.length} 部剧，共 ${scan.value.totalEpisodes} 集`,
     );
@@ -180,6 +238,18 @@ async function start() {
     message.warning("至少要勾选一个步骤");
     return;
   }
+  // 没扫过就先扫一遍：让「开始」跑的就是界面上看到的那几部，
+  // 而不是后端自己再扫一遍、跑出用户没见过的剧。
+  if (!scan.value) {
+    await doScan();
+    if (!scan.value) return;
+  }
+  // 一部都没勾就不跑 —— 不然传到后端就是「整目录全跑」，正是这次要防的事
+  if (chosen.value.length === 0) {
+    message.warning("至少要勾选一部剧");
+    return;
+  }
+  const only = chosen.value;
   starting.value = true;
   try {
     // **片头标识要真的传下去。**
@@ -209,6 +279,7 @@ async function start() {
       sliceSeconds.value,
       model.value,
       headerLabel,
+      only,
     );
     activeRunId.value = run.id;
     await refreshRuns();
@@ -336,17 +407,43 @@ function scheduleSave() {
   }, 500);
 }
 onMounted(async () => {
+  // 从列表页下载完跳过来：`?root=<下载根>&only=<刚下的剧名>&autostart=1`
+  const autoRoot = typeof route.query.root === "string" ? route.query.root : "";
+  const autostart = route.query.autostart === "1";
+  // 下载页带来的「只跑这几部」—— 必须先读，下面的 replace 会把 query 清掉
+  const onlyRaw = typeof route.query.only === "string" ? route.query.only : "";
+  if (onlyRaw) {
+    try {
+      const arr: unknown = JSON.parse(onlyRaw);
+      if (Array.isArray(arr)) {
+        fromDownload.value = arr.filter(
+          (x): x is string => typeof x === "string" && x.trim().length > 0,
+        );
+      }
+    } catch {
+      // 坏参数当作没有，别让页面打不开
+    }
+  }
+  // 先清掉 query，刷新页面不会重复自动开跑
+  if (autoRoot || autostart || onlyRaw) void router.replace({ name: "pipeline" });
+
   // **先把上次填的读回来，再谈默认值。**
   // 顺序反了的话，默认勾选会把用户上次的选择盖掉。
   const restored = await loadForm();
+  // 下载完跳过来的目录优先 —— 这次要跑的就是刚落的原片
+  if (autoRoot) root.value = autoRoot;
   try {
     stages.value = await api.pipelineStages();
+    const defaults = () =>
+      stages.value.filter((s) => s.enabledByDefault).map((s) => s.key);
     if (!restored) {
-      picked.value = stages.value.filter((s) => s.enabledByDefault).map((s) => s.key);
+      picked.value = defaults();
     } else {
       // 只保留后端这次真有的步骤（万一以后删了某一步，旧勾选不该留着）
       const valid = new Set(stages.value.map((s) => s.key));
       picked.value = picked.value.filter((k) => valid.has(k));
+      // 自动开跑时不能一步都不跑；上次全取消过就退回默认勾选
+      if (autostart && picked.value.length === 0) picked.value = defaults();
     }
   } catch (e) {
     message.error((e as Error).message);
@@ -357,6 +454,13 @@ onMounted(async () => {
     () => scheduleSave(),
     { deep: true },
   );
+  // 手动改了源目录：旧的扫描结果、勾选、刚下载的剧名都不作数了
+  // （不然会把不在新目录里的剧名传给后端，直接报「没找到」）
+  watch(root, () => {
+    scan.value = null;
+    chosen.value = [];
+    fromDownload.value = [];
+  });
   await refreshRuns();
   startPolling();
   // 忙闲切换时调整刷新频率
@@ -364,6 +468,15 @@ onMounted(async () => {
   unlisten = await listen("queue:progress", () => {
     void refreshRuns();
   });
+
+  // 下载完直接开跑。
+  // **先扫一遍再开跑**：一是让用户看到这次只跑哪几部，
+  // 二是确认刚下的剧真在目录里 —— 名字对不上就停下来让他手动勾选，
+  // 而不是默默把整个目录重跑一遍。
+  if (autostart && autoRoot) {
+    await doScan();
+    if (scan.value) await start();
+  }
 });
 
 onUnmounted(() => {
@@ -406,11 +519,25 @@ onUnmounted(() => {
 
     <n-alert v-if="scan" type="success" title="扫描结果" style="margin-bottom: 14px">
       <div class="dd-wrap">
-        共 <b>{{ scan.dramas.length }}</b> 部剧、<b>{{ scan.totalEpisodes }}</b> 集
+        共 <b>{{ scan.dramas.length }}</b> 部剧、<b>{{ scan.totalEpisodes }}</b> 集；
+        本次勾选 <b>{{ chosen.length }}</b> 部、<b>{{ chosenEpisodes }}</b> 集
+        <n-button
+          v-if="fromDownload.length > 0"
+          text
+          size="tiny"
+          style="margin-left: 8px"
+          @click="chooseAll"
+        >
+          改为处理全部
+        </n-button>
+      </div>
+      <div v-if="fromDownload.length > 0" class="dd-muted" style="margin-top: 2px">
+        只跑刚下载的剧；目录里其他的剧不会动
       </div>
       <table class="dd-table" style="margin-top: 8px">
         <thead>
           <tr>
+            <th style="width: 44px">本次</th>
             <th style="width: 200px">剧目</th>
             <th style="width: 70px">集数</th>
             <th style="width: 90px">简介</th>
@@ -420,6 +547,12 @@ onUnmounted(() => {
         </thead>
         <tbody>
           <tr v-for="d in scan.dramas" :key="d.dir">
+            <td>
+              <n-checkbox
+                :checked="chosen.includes(d.name)"
+                @update:checked="(v: boolean) => toggleChosen(d.name, v)"
+              />
+            </td>
             <td>{{ d.name }}</td>
             <td>{{ d.episodeCount }}</td>
             <td>

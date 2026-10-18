@@ -212,7 +212,8 @@ async function clearAll() {
   }
 }
 
-let unlisten: UnlistenFn | null = null;
+let unlistenQueue: UnlistenFn | null = null;
+let unlistenDownload: UnlistenFn | null = null;
 let timer: number | null = null;
 
 function startPolling() {
@@ -234,14 +235,20 @@ onMounted(async () => {
   await refreshRuns();
   await pullLogs(true);
   startPolling();
-  unlisten = await listen("queue:progress", () => {
+  unlistenQueue = await listen("queue:progress", () => {
     void refreshRuns();
+    if (follow.value) triggerPull();
+  });
+  // 下载也在写日志（保存路径 / 第几集），事件到了就拉一把，
+  // 不用等 5 秒轮询 —— 用户正盯着看。
+  unlistenDownload = await listen("fanqie:download", () => {
     if (follow.value) triggerPull();
   });
 });
 
 onUnmounted(() => {
-  unlisten?.();
+  unlistenQueue?.();
+  unlistenDownload?.();
   stopPolling();
   if (coalesceTimer !== null) window.clearTimeout(coalesceTimer);
 });
@@ -259,10 +266,10 @@ onUnmounted(() => {
       </n-space>
     </div>
     <div class="dd-card-desc">
-      跑流水线时这里会一步步写下来：扫到什么、导入了多少、哪一步成没成。
+      跑流水线、下载原片时这里都会一步步写下来：扫到什么、保存到哪、第几集下完了、哪一步成没成。
       <b>卡住的时候先看这里</b> —— 状态只是结果，日志才有过程。
       <br />
-      <b>带播放图标的行可以直接点开看产出</b>，不用去别处找。
+      <b>带播放图标的行可以直接点开看</b>（产出、下好的原片都可以），不用去别处找。
     </div>
 
     <div class="dd-row" style="gap: 14px; margin-bottom: 8px; margin-top: 8px">
@@ -273,7 +280,7 @@ onUnmounted(() => {
 
     <div ref="boxRef" class="dd-logbox">
       <div v-if="logs.length === 0" class="dd-muted" style="padding: 12px">
-        还没有日志。跑一次流水线就有了。
+        还没有日志。跑一次流水线或下载一部剧就有了。
       </div>
       <div
         v-for="l in logs"

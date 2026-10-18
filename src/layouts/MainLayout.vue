@@ -16,10 +16,12 @@ import {
 } from "naive-ui";
 import { navByPath, navGroups, primaryNav, videoNav } from "./nav";
 import { useAppStore } from "@/stores/app";
+import { useDownloadStore } from "@/stores/download";
 
 const route = useRoute();
 const router = useRouter();
 const store = useAppStore();
+const dl = useDownloadStore();
 
 const current = computed(() => navByPath(route.path) ?? primaryNav);
 
@@ -87,20 +89,37 @@ const toolWarning = computed(() => {
           <div class="dd-title">{{ current.label }}</div>
           <div class="dd-subtitle">{{ current.subtitle }}</div>
         </div>
-        <n-space v-if="route.path !== videoNav.path" align="center" :size="12">
-          <n-tag v-if="store.info" size="small" :bordered="false">
-            v{{ store.info.version }}
-          </n-tag>
-          <n-select
-            v-if="store.projects.length > 0"
-            :value="store.currentProjectId"
-            :options="projectOptions"
+        <div class="dd-header-actions">
+          <!-- 下载是全局任务：在哪个页面都能看到进度，点一下回视频页 -->
+          <n-tag
+            v-if="dl.active"
             size="small"
-            style="width: 200px"
-            placeholder="选择项目"
-            @update:value="(v: number) => store.selectProject(v)"
-          />
-        </n-space>
+            :bordered="false"
+            :type="dl.running ? 'info' : dl.error ? 'error' : 'success'"
+            style="cursor: pointer"
+            @click="router.push(videoNav.path)"
+          >
+            <template v-if="dl.running">
+              下载中 {{ Math.min(dl.seriesIndex + 1, dl.seriesTotal) }}/{{ dl.seriesTotal }} 部 · {{ dl.percent }}%
+            </template>
+            <template v-else-if="dl.error">下载失败</template>
+            <template v-else>下载完成</template>
+          </n-tag>
+          <n-space v-if="!route.path.startsWith(`${videoNav.path}/`) && route.path !== videoNav.path" align="center" :size="12">
+            <n-tag v-if="store.info" size="small" :bordered="false">
+              v{{ store.info.version }}
+            </n-tag>
+            <n-select
+              v-if="store.projects.length > 0"
+              :value="store.currentProjectId"
+              :options="projectOptions"
+              size="small"
+              style="width: 200px"
+              placeholder="选择项目"
+              @update:value="(v: number) => store.selectProject(v)"
+            />
+          </n-space>
+        </div>
       </n-layout-header>
 
       <n-layout-content class="dd-content">
@@ -152,6 +171,11 @@ const toolWarning = computed(() => {
   align-items: center;
   justify-content: space-between;
   padding: 12px 20px;
+}
+.dd-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 .dd-title {
   font-size: 16px;
