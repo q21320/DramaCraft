@@ -14,7 +14,7 @@ import {
   NText,
   type MenuOption,
 } from "naive-ui";
-import { navByPath, navGroups, primaryNav } from "./nav";
+import { navByPath, navGroups, primaryNav, videoNav } from "./nav";
 import { useAppStore } from "@/stores/app";
 
 const route = useRoute();
@@ -30,6 +30,10 @@ const current = computed(() => navByPath(route.path) ?? primaryNav);
  * 分组用 `children`（可折叠），而不是 `type: 'group'`（常驻展开）。
  */
 const menuOptions = computed<MenuOption[]>(() => [
+  {
+    key: videoNav.path,
+    label: () => h(RouterLink, { to: videoNav.path }, { default: () => videoNav.label }),
+  },
   {
     key: primaryNav.path,
     label: () => h(RouterLink, { to: primaryNav.path }, { default: () => primaryNav.label }),
@@ -83,7 +87,7 @@ const toolWarning = computed(() => {
           <div class="dd-title">{{ current.label }}</div>
           <div class="dd-subtitle">{{ current.subtitle }}</div>
         </div>
-        <n-space align="center" :size="12">
+        <n-space v-if="route.path !== videoNav.path" align="center" :size="12">
           <n-tag v-if="store.info" size="small" :bordered="false">
             v{{ store.info.version }}
           </n-tag>

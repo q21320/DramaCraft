@@ -29,6 +29,14 @@ export interface NavGroup {
   items: NavItem[];
 }
 
+
+export const videoNav: NavItem = {
+  key: "video",
+  path: "/video",
+  label: "视频",
+  subtitle: "视频处理",
+};
+
 /** 主入口。直接摆在菜单最上面，不藏在任何分组里。 */
 export const primaryNav: NavItem = {
   key: "pipeline",
@@ -158,6 +166,7 @@ export const navGroups: NavGroup[] = [
 
 /** 拍平后的全部条目，供「按路径查标题」用。 */
 export const navItems: NavItem[] = [
+  videoNav,
   primaryNav,
   ...navGroups.flatMap((g) => g.items),
 ];

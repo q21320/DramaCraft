@@ -17,6 +17,8 @@ export interface Media {
   sizeBytes: number;
   formatName: string;
   createdAt: string;
+  /** 去重后的文件；空串表示还没去重过。切片优先读它。 */
+  processedPath?: string;
 }
 
 export interface SlicePlan {
