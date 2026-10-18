@@ -193,6 +193,239 @@ pub fn decode_check(ffmpeg: &Path, file: &Path) -> AppResult<()> {
     Ok(())
 }
 
+// ---------------- 产出体检：能不能播 ----------------
+
+/// 这些任务在参数里以哪个字段指向自己的产出。
+///
+/// 去重、去字幕是**一个文件**；切片、分镜、剪映草稿是**一个目录**。
+/// 不在这里的任务（改剧名、成本报告…）不去验 —— 免得误删用户的东西。
+const OUTPUT_FIELD: [(&str, &str); 5] = [
+    ("dedup", "outDir"),
+    ("desubtitle", "outPath"),
+    ("slice", "outDir"),
+    ("storyboard", "outDir"),
+    ("draft", "draftRoot"),
+];
+
+/// 任务参数里写的产出路径；`None` = 这个任务没有可验的产出。
+pub fn output_path_of(kind: &str, payload: &str) -> Option<PathBuf> {
+    let field = OUTPUT_FIELD.iter().find(|(k, _)| *k == kind)?.1;
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let p = v.get(field)?.as_str()?.trim();
+    if p.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(p))
+    }
+}
+
+/// 产出的「能不能用」体检：`Ok(())` = 能用，`Err(原因)` = 不能用。
+///
+/// **能读不等于能播。** 进程被杀时 ffmpeg 写出的 mp4 往往有几万个字节，
+/// 看上去正常，但 `moov` atom 没写 —— 播放器连时长都读不出来（`moov atom
+/// not found`）。所以这里真用 ffprobe 探一遍。
+///
+/// **验收标准得按任务类型分。** 踩过：剪映草稿的产出是**一目录 json**，
+/// 而这里原先只认「目录里的 mp4」—— 4 个写好的草稿全被判成「空目录」，
+/// 重启时会被当成坏产出删光。
+///
+/// ffprobe 自己起不来（没配工具）时**判能用** —— 宁可误留，不可误删。
+pub fn check_output(ffprobe: &Path, kind: &str, path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err("产出不存在".into());
+    }
+
+    match kind {
+        // 剪映草稿：一集一个目录，里面装的是 `draft_content.json`。
+        // 没有 mp4 是正常的，不能拿视频的标准去量它。
+        "draft" => check_draft(path),
+        // 分镜证明：一剧一个目录，里面是证明页 JPG。
+        "storyboard" => check_images(path),
+        // 其余（去重、去字幕、切片）都是视频
+        _ => check_video(ffprobe, path),
+    }
+}
+
+/// 视频产出：一个文件，或装 mp4 的目录。
+fn check_video(ffprobe: &Path, path: &Path) -> Result<(), String> {
+    if path.is_file() {
+        // 几万个字节以下一定不是有效视频（实测切片曾写出 321 字节的空容器）
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if size < 10 * 1024 {
+            return Err(format!("文件只有 {size} 字节"));
+        }
+        return probe_playable(ffprobe, path);
+    }
+
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Err("目录读不了".into());
+    };
+    let mut found = false;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if has_ext(&p, "mp4") {
+            found = true;
+            if probe_playable(ffprobe, &p).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    if found {
+        Err("目录里没有能播的文件".into())
+    } else {
+        Err("目录是空的".into())
+    }
+}
+
+/// 剪映草稿：`draft_content.json` 能解析，且里面真有内容。
+///
+/// 只查「文件在不在」不够 —— 进程被杀时可能写出一个**截断的 JSON**，
+/// 文件大小看着正常，剪映一打开就报错。所以真解析一遍，并核两件事：
+///
+/// - `materials.videos` 非空（切片真的被排进素材池了）
+/// - `tracks` 里有一条视频轨且它下面有分段
+///
+/// 这两条是剪映能不能打开并看到画面的底线。
+fn check_draft(path: &Path) -> Result<(), String> {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        return Err("草稿产出应该是一个目录".into());
+    };
+    let content = dir.join("draft_content.json");
+    if !content.is_file() {
+        return Err("没有 draft_content.json".into());
+    }
+    let raw = match std::fs::read_to_string(&content) {
+        Ok(t) => t,
+        Err(e) => return Err(format!("draft_content.json 读不了：{e}")),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => return Err(format!("draft_content.json 不完整：{e}")),
+    };
+
+    let videos = json
+        .pointer("/materials/videos")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if videos == 0 {
+        return Err("草稿里没有视频素材".into());
+    }
+
+    let segments = json
+        .get("tracks")
+        .and_then(|t| t.as_array())
+        .map(|tracks| {
+            tracks
+                .iter()
+                .filter(|t| t.get("type").and_then(|x| x.as_str()) == Some("video"))
+                .map(|t| {
+                    t.get("segments")
+                        .and_then(|s| s.as_array())
+                        .map(|s| s.len())
+                        .unwrap_or(0)
+                })
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    if segments == 0 {
+        return Err("草稿里没有视频轨".into());
+    }
+    Ok(())
+}
+
+/// 图片产出（分镜证明）：目录里至少有一张 jpg/png。
+fn check_images(path: &Path) -> Result<(), String> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Err("目录读不了".into());
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if has_ext(&p, "jpg") || has_ext(&p, "jpeg") || has_ext(&p, "png") {
+            if std::fs::metadata(&p).map(|m| m.len() > 1024).unwrap_or(false) {
+                return Ok(());
+            }
+        }
+    }
+    Err("目录里没有可用的图片".into())
+}
+
+fn has_ext(path: &Path, ext: &str) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case(ext))
+            .unwrap_or(false)
+}
+
+/// ffprobe 能不能从这个文件里读出**时长 > 0**。
+fn probe_playable(ffprobe: &Path, file: &Path) -> Result<(), String> {
+    let out = match no_window(
+        Command::new(ffprobe)
+            .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+            .arg(file),
+    )
+    .output()
+    {
+        Ok(o) => o,
+        // 启不起 ffprobe：不判坏，把决定权留在上层
+        Err(_) => return Ok(()),
+    };
+
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if let Some(line) = decode_error_line(&err) {
+        return Err(strip_pointer(line).to_string());
+    }
+    if !out.status.success() {
+        return Err(format!("ffprobe 读不了：{}", tail(&err)));
+    }
+    match text.parse::<f64>() {
+        Ok(secs) if secs > 0.0 => Ok(()),
+        // `moov atom not found` 这种就是这里的：读不到时长
+        _ => Err("读不出时长（多半是没写完的半个文件）".into()),
+    }
+}
+
+/// 把一份坏产出删掉，**只删这个任务自己的产出**。
+///
+/// 切片目录里可能有几片是好的 —— 也一并删：重跑会把它们重新切一遍，
+/// 留着“好片”反而会让重跑拼出一个缺头少尾的序列。
+///
+/// 返回删掉的东西的人话描述（给日志用）；没东西可删返回 `None`。
+pub fn remove_bad_output(path: &Path, is_dir: bool) -> Option<String> {
+    if is_dir {
+        let existed = path.is_dir();
+        let _ = std::fs::remove_dir_all(path);
+        existed.then(|| format!("删掉坏目录 {}", path.to_string_lossy()))
+    } else {
+        let existed = path.is_file();
+        let _ = std::fs::remove_file(path);
+        existed.then(|| format!("删掉坏文件 {}", path.to_string_lossy()))
+    }
+}
+
+/// 重启时、以及任务开跑前，验一验「已经存在的产出」到底能不能用。
+///
+/// 返回 `Some(说明)` = 发现坏东西并清掉了；`None` = 没事。
+pub fn drop_broken_output(ffprobe: &Path, kind: &str, payload: &str) -> Option<String> {
+    let path = output_path_of(kind, payload)?;
+    if !path.exists() {
+        return None;
+    }
+    let Err(reason) = check_output(ffprobe, kind, &path) else {
+        return None;
+    };
+    let is_dir = path.is_dir();
+    let desc = remove_bad_output(&path, is_dir);
+    Some(match desc {
+        Some(d) => format!("产出不能用（{reason}），{}，会重新做", d),
+        None => format!("产出不能用（{reason}），会重新做"),
+    })
+}
+
 // ---------------- ffmpeg 切片 ----------------
 
 #[derive(Debug)]

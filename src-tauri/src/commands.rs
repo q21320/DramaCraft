@@ -1636,7 +1636,18 @@ pub async fn desubtitle_media(
         .iter()
         .map(|s| s.to_string()),
     );
-    args.push(out.to_string_lossy().to_string());
+    // **先写临时文件，写完再换上去。**
+    //
+    // `+faststart` 要求 ffmpeg 把整部片都过一遍才能把 `moov` 写到文件头
+    // （那是播放器一打开就知道时长的前提）。代价：**中途被杀就会在目标
+    // 路径上留下一个几万万的废片** —— 播放器报 `moov atom not found`。
+    //
+    // 用户实测就撞上了：02:47 写了两份 38MB/30MB，02:49 应用重启，两份都打不开。
+    // 写到 `.part.mp4` 就不会：死在中途留下的是临时文件，目标路径上
+    // 要么是上一份完整的，要么什么都没有。
+    let tmp = out.with_extension("part.mp4");
+    let _ = std::fs::remove_file(&tmp);
+    args.push(tmp.to_string_lossy().to_string());
     let mut cmd = std::process::Command::new(&ffmpeg);
     proc::no_window(cmd.args(&args));
     let output = cmd
@@ -1644,6 +1655,7 @@ pub async fn desubtitle_media(
         .map_err(|e| AppError::Msg(format!("调 ffmpeg 失败：{e}")))?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_file(&tmp);
         let areas = bands
             .iter()
             .map(|b| format!("{}×{} @ ({}, {})", b.w, b.h, b.x, b.y))
@@ -1654,6 +1666,27 @@ pub async fn desubtitle_media(
             proc::tail(err.trim())
         )));
     }
+
+    // **换了：旧的那份先删。**
+    //
+    // 用户在重跑一部剧时，旧产出可能是坏的（上次被打断）。rename 在 Windows
+    // 上碰到已存在的目标会直接失败，所以先删——反正产物由库里那份记录说了算，
+    // 重跑就是要覆盖。
+    let _ = std::fs::remove_file(&out);
+    std::fs::rename(&tmp, &out).map_err(|e| {
+        AppError::Msg(format!(
+            "去字幕写完了，但换不到正式文件名（{} → {}）：{e}",
+            tmp.to_string_lossy(),
+            out.to_string_lossy()
+        ))
+    })?;
+
+    // **落地后再验一遍能不能播。**
+    //
+    // 到这一步失败的文件不会有（ffmpeg 已经报 0），但解码坏帧、容器异常
+    // 这类问题 ffmpeg 自己不一定报 —— 而这时候报错，用户还知道是哪一集；
+    // 等切片那一步才发现就只能看到一句莫名的错误。
+    media::decode_check(&ffmpeg, &out)?;
 
     Ok(DesubtitleReport {
         out_path: out.to_string_lossy().to_string(),

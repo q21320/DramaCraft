@@ -126,6 +126,30 @@ const activeRunId = ref<number | null>(null);
 
 const activeRun = computed(() => runs.value.find((r) => r.id === activeRunId.value) ?? null);
 
+/**
+ * 这次运行到底怎么结束的。
+ *
+ * 只显示「空闲」曾经把用户搞糊涂过：他点了「停止」，界面只写「空闲」，
+ * 而主按钮一直是「停止」—— 于是他问「点了停止 不应该更改状态？怎么还显示停止？」。
+ *
+ * 后端 `pipeline_cancel` 写的是 `canceled`，队列中途停下也会收口成 `canceled`；
+ * `failed` 是不同的意思，得分开说。
+ */
+function runStatusText(status: string): string {
+  switch (status) {
+    case "running":
+      return "正在跑";
+    case "done":
+      return "已完成";
+    case "canceled":
+      return "已停止";
+    case "failed":
+      return "有步骤失败";
+    default:
+      return status;
+  }
+}
+
 /** 勾选的剧一共多少集 —— 让用户确认这次到底要跑多少活 */
 const chosenEpisodes = computed(() => {
   const s = scan.value;
@@ -312,7 +336,18 @@ async function cancelRun(id: number) {
   try {
     const n = await api.pipelineCancel(id);
     await refreshRuns();
-    message.success(`已取消 ${n} 个待跑任务`);
+    // 数字不说人话：0 个待跑却还有剧在跑时，只报「已取消 0 个任务」
+    // 等于告诉用户「什么都没发生」，而它明明是他按下的那个停止。
+    const left = runs.value.find((r) => r.id === id)?.dramas.filter(
+      (d) => d.status === "running",
+    ).length ?? 0;
+    if (left > 0) {
+      message.success(
+        `已停止：撤掉 ${n} 个待跑任务。正在跑的那部会做完这一步再停，别再点「开始」，不然会重新排一批`,
+      );
+    } else {
+      message.success(`已停止：撤掉 ${n} 个待跑任务`);
+    }
   } catch (e) {
     message.error((e as Error).message);
   }
@@ -695,7 +730,7 @@ onUnmounted(() => {
           <n-button size="small" type="warning" secondary>停止</n-button>
         </template>
         <!-- 要说清楚停下来意味着什么，不然用户不敢点 -->
-        停止后：已经跑完的会留着，还没跑的不再跑。想接着跑就再点一次「开始整剧处理」。
+        停止后：已经跑完的会留着，还没跑的不再跑，这次运行标成「已停止」，按钮换回「开始整剧处理」。
       </n-popconfirm>
       <span v-if="willRewrite" class="dd-muted">
         会先调 AI 改简介、起新剧名（约十几秒），<b>再用新剧名建目录、排任务</b>；
@@ -716,6 +751,11 @@ onUnmounted(() => {
   <div class="dd-row" style="justify-content: space-between; padding: 2px 4px">
     <n-space :size="10" align="center">
       <span v-if="busy" class="dd-live"><span class="dd-dot" />正在跑</span>
+      <!--
+        停下之后得显示「怎么停的」。只写「空闲」的话，用户看不到自己那次
+        停止到底生效了没有 —— 而那两个按钮没换回「开始」，看着就像没生效。
+      -->
+      <span v-else-if="activeRun" class="dd-muted">{{ runStatusText(activeRun.status) }}</span>
       <span v-else class="dd-muted">空闲</span>
       <span v-if="activeRun" class="dd-muted">{{ activeRun.dramaCount }} 部剧</span>
       <span class="dd-muted dd-clock">最后更新 {{ lastUpdatedText || "—" }}</span>

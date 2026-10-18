@@ -24,7 +24,8 @@
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    ExportOptions, HeaderLabel, Job, OcrOptions, QueueReport, SliceMode, TransformOptions,
+    ExportOptions, HeaderLabel, Job, JobFailure, OcrOptions, QueueReport, SliceMode,
+    TransformOptions,
 };
 use crate::{commands, db, AppState};
 use serde::Deserialize;
@@ -418,7 +419,48 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
             let mut cues_total = 0usize;
             let mut notes: Vec<String> = Vec::new();
 
-            for mid in &p.media_ids {
+            // **草稿跟 AI 去字幕一样只做前 4 集 —— 循环就直接开前 4 集。**
+            //
+            // 不要去遍历全剧然后逐集判断“有没有切片再跳过”：那等于把
+            // “本来就不在范围里”当成一种运行状态，得为它写日志、写注释，
+            // 日志里还会出现第05集、第06集…… 看起来像出了什么事。
+            // 真正的事实是：前 4 集以外的集，草稿这一步从来不涉及。
+            //
+            // （切片也一样只切前 4 集，所以第 5 集起本来就没有切片。）
+            let scope = &p.media_ids[..p.media_ids.len().min(4)];
+
+            for mid in scope {
+                // **先看这一集有没有切片，没有就立刻跳。**
+                //
+                // 这一步必须放在补跑 ASR 之前 —— ASR 一集要十几秒，
+                // 切片没跑就白跑一遍语音转字幕，还往 `cue` 表里写一堆东西。
+                //
+                // 只要**真的有内容**的切片。踩过：第01集 81 秒 → 8 个整 10 秒
+                // + 1 秒尾巴，尾巴落在正文之外，ffmpeg 只写出一个 **321 字节
+                // 的空容器**，状态还是 ok、文件也在，`pymediainfo`/`ffprobe`
+                // 都读不出时长，一路把草稿生成搞崩。
+                // **10KB 以下的 mp4 一定不是有效视频**，直接跳过。
+                let segs = {
+                    let conn = crate::commands::lock_db(&state)?;
+                    let mut segs = db::list_segments(&conn, *mid)?;
+                    segs.retain(|s| {
+                        if s.status != "ok" {
+                            return false;
+                        }
+                        let p = std::path::Path::new(&s.out_path);
+                        p.is_file()
+                            && std::fs::metadata(p).map(|m| m.len() > 10_000).unwrap_or(false)
+                    });
+                    segs.sort_by_key(|s| s.start_ms);
+                    segs
+                };
+                if segs.is_empty() {
+                    // 前 4 集里某一集没切片，那是**真问题**（切片没跑到，
+                    // 或者切出来的全是坏片），得进结果让用户看见。
+                    log_line(app, format!("素材 #{mid} 没有可用切片，这一集出不了草稿"));
+                    notes.push(format!("素材 #{mid} 没有切片"));
+                    continue;
+                }
                 // **没字幕就先跑一遍本地 ASR。**
                 //
                 // 草稿的字幕轨来自 `cue` 表，而 `cue` 只有跑过「语音转字幕」才有。
@@ -432,6 +474,11 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                         !db::list_cues(&conn, *mid)?.is_empty()
                     };
                     if !has_cues {
+                        // **补跑 ASR 要在日志里露个脸。**
+                        //
+                        // 它很慢（一集几十秒），而用户看到的只是「剪映草稿」
+                        // 那一行卡在那里不动 —— 不说清楚就会以为是卡死了。
+                        log_line(app, format!("素材 #{mid} 没有字幕，先跑一遍语音转字幕（本集十几秒）"));
                         match commands::asr_transcribe(
                             app.clone(),
                             state.clone(),
@@ -445,6 +492,7 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                             Ok(_) => {}
                             Err(e) => {
                                 let msg = crate::proc::tail(&e.to_string());
+                                log_line(app, format!("素材 #{mid} 字幕没出：{msg}"));
                                 notes.push(format!("素材 #{mid} 字幕没出：{msg}"));
                             }
                         }
@@ -453,28 +501,8 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                 let (clips, durations_ms, srt_lines, label) = {
                     let conn = crate::commands::lock_db(&state)?;
                     let media = db::get_media(&conn, *mid)?;
-                    let mut segs = db::list_segments(&conn, *mid)?;
-                    // 只要**真的有内容**的切片。
-                    //
-                    // 踩过：第01集 81 秒 → 8 个整 10 秒 + 1 秒尾巴，
-                    // 但 `quzimu` 的实际时长比数据库记的短一点点，那 1 秒
-                    // 落在正文之外 —— ffmpeg 只写出一个 **321 字节的空容器**。
-                    // 状态还是 ok、文件也在，`pymediainfo`/`ffprobe` 都读不出时长，
-                    // 一路把草稿生成搞崩。
-                    //
-                    // **10KB 以下的 mp4 一定不是有效视频**，直接跳过。
-                    segs.retain(|s| {
-                        if s.status != "ok" {
-                            return false;
-                        }
-                        let p = std::path::Path::new(&s.out_path);
-                        p.is_file()
-                            && std::fs::metadata(p).map(|m| m.len() > 10_000).unwrap_or(false)
-                    });
-                    segs.sort_by_key(|s| s.start_ms);
-                    if segs.is_empty() {
-                        continue;
-                    }
+                    // `segs` 在循环开头已经验过（状态 ok、文件真在、> 10KB），
+                    // 这里直接用，不再查一次。
                     let cues = db::list_cues(&conn, *mid)?;
                     let mut clips: Vec<String> = Vec::new();
                     // 每片时长由这边算好传过去 —— worker 里 `pymediainfo`
@@ -543,8 +571,16 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                     if let Some(dir) = srt_path.parent() {
                         let _ = std::fs::create_dir_all(dir);
                     }
-                    std::fs::write(&srt_path, srt_lines.concat())
-                        .map_err(|e| AppError::Msg(format!("写不了 SRT：{e}")))?;
+                    // **写不了 SRT 只废这一集，不废整部。**
+                    //
+                    // 原来是 `?`，一报错整个任务红掉，前面已经生成好的
+                    // 几个草稿也跟着不计数 —— 日志里就剩一句「失败」。
+                    if let Err(e) = std::fs::write(&srt_path, srt_lines.concat()) {
+                        let msg = format!("{label}：字幕文件写不了（{e}）");
+                        log_line(app, msg.clone());
+                        notes.push(msg);
+                        continue;
+                    }
                     cues_total += srt_lines.len();
                     srt_path.to_string_lossy().to_string()
                 };
@@ -580,9 +616,22 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                         .get("error")
                         .and_then(|v| v.as_str())
                         .unwrap_or("未知错误");
+                    log_line(app, format!("{label}：草稿没生成 —— {msg}"));
                     notes.push(format!("{label}：{msg}"));
                     continue;
                 }
+                // **每集成了一行。**
+                //
+                // 原来只在最后报「生成 4 个」，四个草稿十二秒内一个接一个地写，
+                // 中间日志一动不动，用户不知道卡在哪一集。
+                log_line(
+                    app,
+                    format!(
+                        "{label}：草稿已生成（{} 片，字幕 {} 条）",
+                        clips.len(),
+                        srt_lines.len()
+                    ),
+                );
                 made += 1;
             }
 
@@ -598,10 +647,12 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
             }
             Ok(format!(
                 "剪映草稿已生成 {made} 个（一集一个，字幕共 {cues_total} 条）{}",
+                // **只拼真失败。** 没切片而跳过的不算失败，已经在过程日志里
+                // 提过了；硬拼到结果串后面，看着就像“成了 4 个但坏了 8 集”。
                 if notes.is_empty() {
                     String::new()
                 } else {
-                    format!("｜失败 {} 个", notes.len())
+                    format!("｜没成 {} 集：{}", notes.len(), notes.join("；"))
                 }
             ))
         }
@@ -889,7 +940,37 @@ pub async fn run(app: AppHandle, max_jobs: Option<i64>) -> AppResult<QueueReport
     outcome
 }
 
-/// 这个任务产出了哪个文件（能点的那个）。
+/// 在任务执行中间往日志里插一行。
+///
+/// 长任务（剪映草稿要一集一集地写、去字幕要补跑 ASR）中间得能看到进展，
+/// 否则界面上就一行标题挂着十几秒，用户以为是卡死了。
+/// 写不进去也不影响任务本身 —— 日志是旁证，不是主流程。
+fn log_line(app: &AppHandle, message: String) {
+    // 先把归属算出来 —— `log_drama_id` 自己也要拿锁，
+    // 跟这里同时持锁会直接死锁（Mutex 不可重入）。
+    let drama_id = log_drama_id(app);
+    let state = app.state::<AppState>();
+    let Ok(conn) = state.db.lock() else {
+        return;
+    };
+    db::append_log(&conn, None, drama_id, "info", &message);
+}
+
+/// 当前在跑哪部剧 —— 插的日志要归到它头上，不然日志页按运行过滤时看不见。
+fn log_drama_id(app: &AppHandle) -> Option<i64> {
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().ok()?;
+    let running: Vec<Option<i64>> = {
+        let mut stmt = conn
+            .prepare("SELECT pipeline_drama_id FROM job WHERE status = 'running' LIMIT 1")
+            .ok()?;
+        let rows = stmt.query_map([], |r| r.get(0)).ok()?;
+        rows.filter_map(Result::ok).collect()
+    };
+    running.into_iter().flatten().next()
+}
+
+/// 一个任务产出了哪个文件（能点的那个）。
 ///
 /// 用户的想法：「产出的内容在日志里尽量能直接点击播放」——
 /// 对。产出不该是另一个列表，它就该长在产生它的那一行上。
@@ -960,6 +1041,9 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
     let mut failed = 0i64;
     let mut messages: Vec<String> = Vec::new();
     let mut stopped_because = "没有待跑的任务了".to_string();
+    // 本次碰到哪些运行 —— 收口后要按它们写邮件
+    let mut run_ids: Vec<i64> = Vec::new();
+    let mut failures: Vec<JobFailure> = Vec::new();
 
     while processed < limit {
         {
@@ -1073,9 +1157,50 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                 .filter_map(|j| j.pipeline_drama_id)
                 .find_map(|d| db::run_id_of_drama(&conn, Some(d)).unwrap_or(None))
         };
+        if let Some(run_id) = batch_run_id {
+            if !run_ids.contains(&run_id) {
+                run_ids.push(run_id);
+            }
+        }
 
         let mut handles = Vec::with_capacity(batch.len());
         for job in batch {
+            // **开跑前先看眼旧产出。**
+            //
+            // 重跑一部剧时，上次留下的半截文件还在原地（进程被杀、moov 没写完）。
+            // 不验就分不清「做好了」和「写了一半」—— 去字幕会直接复用那份废片，
+            // 后面切片、分镜全都基于它做。这里先验一遍，坏的删掉再重做。
+            {
+                let state = app.state::<AppState>();
+                let ffprobe = {
+                    let configured = state.tools.lock()
+                        .map(|t| t.ffprobe.clone())
+                        .unwrap_or_default();
+                    configured
+                };
+                if !ffprobe.trim().is_empty() {
+                    let payload = job.payload.clone();
+                    let kind = job.kind.clone();
+                    let probe_path = std::path::PathBuf::from(ffprobe);
+                    if let Some(note) =
+                        tauri::async_runtime::spawn_blocking(move || {
+                            crate::media::drop_broken_output(&probe_path, &kind, &payload)
+                        })
+                        .await
+                        .unwrap_or(None)
+                    {
+                        if let Ok(conn) = state.db.lock() {
+                            let _ = db::append_log(
+                                &conn,
+                                None,
+                                job.pipeline_drama_id,
+                                "warn",
+                                &format!("任务 #{} {note}", job.id),
+                            );
+                        }
+                    }
+                }
+            }
             let app_task = app.clone();
             handles.push(tauri::async_runtime::spawn(async move {
                 let outcome = execute(&app_task, &job).await;
@@ -1145,13 +1270,18 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                         // 少了这一步，剧目会永远停在「进行中」——
                         // 真实素材那轮 64 个任务两个多小时前就跑完了，
                         // 界面上却还在转，用户以为卡死。
-                        // **两个数都要看：没跑完的 = 0，还不够；还得没有失败/被撤的。**
+                        // **三个数都要看：没跑完的 = 0，还不够；还得没有失败/被撤的，
+                        // 而且真得有跑完的。**
                         //
                         // `canceled` 是某一步失败后自动撤掉后续任务产生的。
                         // 只数 pending/running 的话，那一刻也是 0 —— 于是这部剧被
                         // 写成「全部步骤已完成」，而成本报告根本没跑。
-                        let (pending, bad) = db::drama_job_state(&conn, drama_id)?;
-                        if pending == 0 && bad == 0 {
+                        //
+                        // 反过来，用户点「停止」也会把 32 个任务里没跑的全标成
+                        // `canceled`，现场同样是一个错都没有 —— 只按 `bad == 0`
+                        // 判的话，只跑了 3 集的剧会被写成「全部步骤已完成」。
+                        let (pending, bad, ok) = db::drama_job_state(&conn, drama_id)?;
+                        if pending == 0 && bad == 0 && ok > 0 {
                             // **已经标成失败的就别再改成完成。**
                             //
                             // 踩过：某一步失败后，`cancel_jobs_of_drama` 把后面还没跑的
@@ -1224,6 +1354,12 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             }
             Err(e) => {
                 failed += 1;
+                // 记下是哪一步、为什么 —— 邮件里要按剧归到「失败原因」
+                failures.push(JobFailure {
+                    job_id: job.id,
+                    kind: job.kind.clone(),
+                    reason: e.to_string(),
+                });
                 if messages.len() < 50 {
                     messages.push(format!(
                         "#{} {}：失败 —— {e}",
@@ -1299,8 +1435,63 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
         // 队列空了就把流水线的状态收口，别让它永远停在"运行中"
         let _ = db::refresh_pipeline_run_status(&conn);
+        // **没任务可跑的幽灵剧也给个定论。**
+        //
+        // 库里的 `job` 行被清过、或被「取消待跑」撤光之后，那部剧就再也
+        // 轮不到了 —— 但它还挂着 pending，流水线于是永远收不了口。
+        // 用户看到的正是：日志早停了，页面还写着正在跑。
+        let _ = db::settle_orphan_dramas(&conn);
         db::job_counts(&conn)?.pending
     };
+
+    // **队列停在半路，得给那条流水线一个真实结论。**
+    //
+    // 用户点「停止」而队列里还有待跑任务时，`refresh_pipeline_run_status`
+    // 什么都不会做（它只收所有剧都有定论的）—— 于是这条运行永远停在
+    // 「运行中」，界面上那个按钮就一直是「停止」，用户问的正是这个：
+    // 「点了停止 不应该更改状态？怎么还显示停止？」
+    //
+    // 规矩：**队列不再跑了，就不该还挂着运行中的剧。**
+    // - 正在跑的那部：当前任务已跑完，剩下的被撤 —— 标「已取消」，不是失败；
+    // - 排在后面没轮上的：标「未执行」，别把没跑的写成「已取消」（它没被取消，是没轮到）。
+    if !stopped_because.is_empty() && stopped_because != "没有待跑的任务了" {
+        let state = app.state::<AppState>();
+        let conn = state
+            .db
+            .lock()
+            .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
+        let mut run_ids: Vec<i64> = Vec::new();
+        for drama in db::list_open_pipeline_dramas(&conn)? {
+            if db::drama_has_running_jobs(&conn, drama.id)? {
+                break;
+            }
+            // 一部剧都没跑过就被叫停，那是「未执行」；跑过一部分才是「已取消」
+            let stayed = !drama.stage.trim().is_empty();
+            let (status, message) = if stayed {
+                ("canceled", format!("已停止（{}），后面的步骤不再跑", stopped_because))
+            } else {
+                ("skipped", format!("未执行（{}）", stopped_because))
+            };
+            db::update_pipeline_drama(&conn, drama.id, &drama.stage, status, &message)?;
+            let _ = db::cancel_jobs_of_drama(&conn, drama.id);
+            if let Some(run_id) = db::run_id_of_drama(&conn, Some(drama.id))? {
+                if !run_ids.contains(&run_id) {
+                    run_ids.push(run_id);
+                }
+            }
+        }
+        // 没任务可跑的幽灵剧先给个定论，否则下面那个收口永远等不到它们
+        let _ = db::settle_orphan_dramas(&conn);
+        for run_id in run_ids {
+            db::settle_pipeline_run(&conn, run_id)?;
+        }
+    }
+
+    // 打扫一圈漏网的：这次没碰到的剧也可能早就没任务了
+    if let Ok(conn) = app.state::<AppState>().db.lock() {
+        let _ = db::settle_orphan_dramas(&conn);
+        let _ = db::refresh_pipeline_run_status(&conn);
+    }
 
     Ok(QueueReport {
         processed,
@@ -1309,6 +1500,8 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
         remaining,
         stopped_because,
         messages,
+        run_ids,
+        failures,
     })
 }
 

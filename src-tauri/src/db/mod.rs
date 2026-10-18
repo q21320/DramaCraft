@@ -1105,6 +1105,24 @@ pub fn get_pipeline_run(conn: &Connection, id: i64) -> AppResult<Option<Pipeline
     Ok(runs.into_iter().find(|r| r.id == id))
 }
 
+/// 还没定论的剧（`pending` / `running`），按队列顺序。
+///
+/// 队列停在半路时，这些剧需要一个真实结论 —— 否则流水线会永远
+/// 停在「运行中」，界面上那个按钮就一直是「停止」。
+/// 排队的先后就是 `add_pipeline_drama` 的插入顺序，也就是 `id` 升序。
+pub fn list_open_pipeline_dramas(conn: &Connection) -> AppResult<Vec<PipelineDrama>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {DRAMA_COLUMNS} FROM pipeline_drama
+          WHERE status IN ('pending','running') ORDER BY id ASC"
+    ))?;
+    let rows = stmt.query_map([], row_to_pipeline_drama)?;
+    let mut out = Vec::new();
+    for item in rows {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
 /// 把没跑完的流水线退回"待跑"状态。
 ///
 /// 和队列一样：进程被杀之后，`running` 是个假状态，没有人在跑它。
@@ -1112,10 +1130,41 @@ pub fn get_pipeline_run(conn: &Connection, id: i64) -> AppResult<Option<Pipeline
 /// 文案要説清楚"会自己接着跑"，不能只说"退回待跑" —— 之前写的是
 /// 「上次运行被中断，已退回待跑」，用户看了以为要手动重启，问我
 /// "没办法续接上嘛"。实际上队列起来就会接着干。
+///
+/// **但手里一个待跑任务都没有的剧不能退回待跑** —— 那会变成永远跑不掉的幽灵：
+/// 界面上一条「进行中」，日志里什么都不会发生，流水线也就永远收不了口。
+/// 它的任务早被取消光了，定论就是「已停止」。
 pub fn recover_interrupted_pipelines(conn: &Connection) -> AppResult<i64> {
     let changed = conn.execute(
         "UPDATE pipeline_drama SET status = 'pending', message = '上次被中断，排队的任务会自动接着跑', updated_at = ?1
+          WHERE status = 'running'
+            AND EXISTS (SELECT 1 FROM job WHERE job.pipeline_drama_id = pipeline_drama.id
+                         AND job.status IN ('pending','running'))",
+        params![now()],
+    )?;
+    // 没任务可跑的那些：当场给结论
+    conn.execute(
+        "UPDATE pipeline_drama SET status = 'canceled', message = '任务已被取消完，这条运行已停止', updated_at = ?1
           WHERE status = 'running'",
+        params![now()],
+    )?;
+    Ok(changed as i64)
+}
+
+/// 没有待跑/进行中任务、却还挂着 `pending` 的剧。
+///
+/// 每次队列跑完都打扫一遍，把这类幽灵剧给个定论。
+/// 它们不会自己好：队列只会从 `job` 表取活，一部剧一条任务都没有就永远不会被轮到。
+///
+/// 踩过：库里躺着 2026-10-18 那次的剧，一直写「进行中」，
+/// 用户看到的就是「日志早停了，页面还写着正在跑」。
+pub fn settle_orphan_dramas(conn: &Connection) -> AppResult<i64> {
+    let changed = conn.execute(
+        "UPDATE pipeline_drama SET status = 'canceled',
+                message = '没有待跑任务了，这条剧已停下', updated_at = ?1
+          WHERE status IN ('pending','running')
+            AND NOT EXISTS (SELECT 1 FROM job WHERE job.pipeline_drama_id = pipeline_drama.id
+                             AND job.status IN ('pending','running'))",
         params![now()],
     )?;
     Ok(changed as i64)
@@ -1438,6 +1487,29 @@ pub fn count_pending_jobs_of_kind(conn: &Connection, kind: &str) -> AppResult<i6
     )?)
 }
 
+/// 某部剧里，某一类任务的 `(状态, 参数)`。
+///
+/// 完成通知邮件用它核「勾了的步骤是不是真跑了、产物在不在」——
+/// 光数条数不够，还得拿着参数里的路径去磁盘上看一眼。
+pub fn jobs_of_kind_for_drama(
+    conn: &Connection,
+    drama_id: i64,
+    kind: &str,
+) -> AppResult<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT status, payload FROM job WHERE pipeline_drama_id = ?1 AND kind = ?2
+          ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![drama_id, kind], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 /// 某部剧还有多少个这种类型的待跑任务。
 ///
 /// 队列按剧串行，步骤收口的汇总行也得只看当前这部剧 —— 否则下一部剧的
@@ -1588,6 +1660,25 @@ pub fn list_logs(
                 out.push(r?);
             }
         }
+    }
+    Ok(out)
+}
+
+/// 某部剧在这次运行里写过的错误日志（最关键的几行）。
+///
+/// 完成通知邮件要写「哪部剧没成、卡在哪一步」—— 任务表只剩一句
+/// 「整集去重 失败」，真正的原因在日志的 `✗` 行里。
+/// 只取 error / warn 级，那几行里写着 `✗ 第03集.mp4 整集去重：…`。
+pub fn list_drama_error_logs(conn: &Connection, run_id: i64, drama_id: i64) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT message FROM run_log
+          WHERE run_id = ?1 AND drama_id = ?2 AND level IN ('error','warn')
+          ORDER BY id ASC LIMIT 40",
+    )?;
+    let rows = stmt.query_map(params![run_id, drama_id], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
     }
     Ok(out)
 }
@@ -1955,6 +2046,31 @@ pub fn recover_interrupted_jobs(conn: &Connection) -> AppResult<i64> {
     Ok(changed as i64)
 }
 
+/// 上次被中断、没跑完的那批任务（`(id, 类型, 参数)`）。
+///
+/// 重启时要用它去磁盘上验一下：**半截的产出要先清掉**，
+/// 不然接着跑会当成「已经做好了」直接跳过（用户实测：去字幕写了两份 38MB
+/// 的文件，mp4 连 moov 都没写完，播放器打不开，日志里一个字没有）。
+pub fn interrupted_jobs(conn: &Connection) -> AppResult<Vec<(i64, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, payload FROM job
+          WHERE status = 'pending' AND message LIKE '上次运行被中断%'
+          ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 pub fn cancel_pending_jobs(conn: &Connection) -> AppResult<i64> {
     let changed = conn.execute(
         "UPDATE job SET status = 'canceled', message = '已取消', updated_at = ?1
@@ -1981,23 +2097,68 @@ pub fn cancel_jobs_of_drama(conn: &Connection, drama_id: i64) -> AppResult<i64> 
 // 于是这部「没做完」的剧被写成「全部步骤已完成」。
 // 踩过：成本报告没跑，剧目却显示完成。
 
-/// 某部剧的任务统计：`(还没跑完的, 失败的或被撤的)`。
+/// 某部剧的任务统计：`(还没跑完的, 失败的或被撤的, 已经跑完的)`。
 ///
-/// **两个都要看。** 只看「还没跑完的 == 0」会误判 —— 某一步失败后
+/// **前两个都要看。** 只看「还没跑完的 == 0」会误判 —— 某一步失败后
 /// `cancel_jobs_of_drama` 把后面没跑的任务标成 `canceled`，那时
 /// pending 也是 0，但这部剧明明没做完。
 ///
 /// 踩过：成本报告被撤掉，剧目却显示「全部步骤已完成」，产出少一份。
-pub fn drama_job_state(conn: &Connection, drama_id: i64) -> AppResult<(i64, i64)> {
-    let row: (i64, i64) = conn.query_row(
+///
+/// **第三个也要看。** 只按「连一个错都没有」判完成同样会误判 ——
+/// 用户点了「停止」，队列把 32 个任务里还没跑的全标成 `canceled`，
+/// 那一刻一个错都没有、一个没跑完的也没有，于是这部剧被写成
+/// 「全部步骤已完成」，而它只跑了 3 集。
+/// 跑完了就是跑完了，**被撤掉的不等于做完了**。
+pub fn drama_job_state(conn: &Connection, drama_id: i64) -> AppResult<(i64, i64, i64)> {
+    let row: (i64, i64, i64) = conn.query_row(
         "SELECT
            COALESCE(SUM(CASE WHEN status IN ('pending','running') THEN 1 ELSE 0 END), 0),
-           COALESCE(SUM(CASE WHEN status IN ('failed','canceled') THEN 1 ELSE 0 END), 0)
+           COALESCE(SUM(CASE WHEN status IN ('failed','canceled') THEN 1 ELSE 0 END), 0),
+           COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0)
          FROM job WHERE pipeline_drama_id = ?1",
         params![drama_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     Ok(row)
+}
+
+/// 还有没有别的剧正在跑？
+///
+/// 队列按剧串行：只要这部不是正在跑的那部，就是「还没轮到」——
+/// 停队列时这种剧不该被标成「已取消」，它只是排在后面没轮上。
+pub fn drama_has_running_jobs(conn: &Connection, drama_id: i64) -> AppResult<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM job WHERE pipeline_drama_id = ?1 AND status = 'running'",
+        params![drama_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// 收口一条流水线：所有剧都有定论了，状态才是真的。
+///
+/// **撤掉的不算完成。** `refresh_pipeline_run_status` 只看
+/// failed / done，把「被取消」这一种吞掉了 —— 于是停掉的那次运行
+/// 只要有一部剧跑完，整条运行就被盖成「已完成」。
+pub fn settle_pipeline_run(conn: &Connection, run_id: i64) -> AppResult<()> {
+    let dramas = list_pipeline_dramas(conn, run_id)?;
+    if dramas.is_empty() {
+        return Ok(());
+    }
+    let status = if dramas
+        .iter()
+        .any(|d| d.status == "pending" || d.status == "running")
+    {
+        return Ok(());
+    } else if dramas.iter().any(|d| d.status == "canceled") {
+        RUN_CANCELED
+    } else if dramas.iter().any(|d| d.status == "failed") {
+        RUN_FAILED
+    } else {
+        RUN_DONE
+    };
+    set_pipeline_run_status(conn, run_id, status)
 }
 /// 清掉已结束的任务（done / failed / canceled），返回删除条数。
 pub fn clear_finished_jobs(conn: &Connection) -> AppResult<i64> {

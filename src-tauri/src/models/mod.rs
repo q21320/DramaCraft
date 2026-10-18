@@ -1040,6 +1040,26 @@ pub struct QueueReport {
     /// 停止原因：跑完了 / 被暂停 / 被要求停止 / 达到本次上限
     pub stopped_because: String,
     pub messages: Vec<String>,
+    /// 本次碰到的流水线运行
+    ///
+    /// 完成通知邮件要按「哪部剧成了、哪部剧没成」写，
+    /// 而 `messages` 只是任务级流水（还截在 50 条），认不出剧。
+    #[serde(default)]
+    pub run_ids: Vec<i64>,
+    /// 失败任务的 `(任务类型, 原因)`
+    ///
+    /// 邮件要写「哪一步没成」，不能只写个数。
+    #[serde(default)]
+    pub failures: Vec<JobFailure>,
+}
+
+/// 一条失败记录：哪个任务、哪一步、为什么。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobFailure {
+    pub job_id: i64,
+    pub kind: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -174,6 +174,7 @@ async function togglePause() {
 async function stop() {
   try {
     await api.requestQueueStop();
+    stopRequested.value = true;
     message.info("已请求停止，当前任务跑完后会停下");
   } catch (e) {
     message.error((e as Error).message);
@@ -202,6 +203,16 @@ async function clearFinished() {
 
 let unlisten: UnlistenFn | null = null;
 let finishedUnlisten: UnlistenFn | null = null;
+let timer: number | null = null;
+
+/**
+ * 用户已经按过「停止」。
+ *
+ * 停止不是立刻生效（当前任务会跑完），这段时间队列还是 `running`。
+ * 不把「已经请求停了」显示出来，界面就还是「运行中」——
+ * 用户会以为按钮没反应。
+ */
+const stopRequested = ref(false);
 
 onMounted(async () => {
   if (store.media.length > 0) pickedMedia.value = [store.media[0].id];
@@ -213,6 +224,7 @@ onMounted(async () => {
   });
   finishedUnlisten = await listen<QueueReport & { error?: string }>("queue:finished", (event) => {
     currentJob.value = null;
+    stopRequested.value = false;
     if (event.payload?.error) {
       message.error(event.payload.error);
     } else {
@@ -223,11 +235,19 @@ onMounted(async () => {
     }
     void refresh();
   });
+
+  // 轮询兜底。
+  //
+  // 只靠事件不够：队列停下的那条 `queue:finished` 只要漏一次（切页面、
+  // 组件刚挂载、事件先到），这一页就会永远停在上一次的快照上 ——
+  // 用户看到的就是「日志已经不跑了，页面还写着运行中、按钮还是停止」。
+  timer = window.setInterval(() => void refresh(), 2000);
 });
 
 onUnmounted(() => {
   unlisten?.();
   finishedUnlisten?.();
+  if (timer !== null) window.clearInterval(timer);
 });
 </script>
 
@@ -241,7 +261,9 @@ onUnmounted(() => {
         </div>
       </div>
       <n-space :size="8">
-        <n-tag v-if="state?.running" size="small" type="info" :bordered="false">运行中</n-tag>
+        <n-tag v-if="state?.running" size="small" :type="stopRequested ? 'warning' : 'info'" :bordered="false">
+          {{ stopRequested ? "正在停（跑完这条就停）" : "运行中" }}
+        </n-tag>
         <n-tag v-if="state?.paused" size="small" type="warning" :bordered="false">已暂停</n-tag>
         <n-tag v-if="currentJob" size="small" :bordered="false">
           正在跑：{{ kindLabel(currentJob.kind) }} #{{ currentJob.jobId }}

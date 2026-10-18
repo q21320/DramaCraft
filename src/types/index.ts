@@ -113,7 +113,12 @@ export interface PipelineDrama {
   episodeCount: number;
   /** 最后完成的步骤 key；空串表示还没开始 */
   stage: string;
-  /** pending | running | done | failed | skipped */
+  /**
+   * pending | running | done | failed | skipped | canceled
+   *
+   * `canceled` = 跑到一半被叫停；`skipped` = 排队排在那儿就被叫停（没轮到）。
+   * 两者都不是「已完成」。
+   */
   status: string;
   message: string;
   updatedAt: string;
@@ -125,6 +130,7 @@ export interface PipelineRun {
   outDir: string;
   /** 勾选的步骤，JSON 数组字符串 */
   stages: string;
+  /** running | done | failed | canceled —— 中途叫停会标成 canceled */
   status: string;
   dramaCount: number;
   createdAt: string;

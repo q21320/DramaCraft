@@ -246,6 +246,21 @@ pub fn run() {
                 }
             }
 
+            // **被中断的任务：磁盘上的半截产出先验一遍、坏的删掉。**
+            //
+            // 踩过：去字幕写了两个 38MB 的 mp4，`moov` 没写完，播放器打不开，
+            // 而日志里就一行标题。不删的话重跑时会被当成「已经有了」，
+            // 那两集永远是废片。
+            for (job_id, kind, payload) in db::interrupted_jobs(&conn)? {
+                if let Some(note) = media::drop_broken_output(
+                    std::path::Path::new(&paths.ffprobe),
+                    &kind,
+                    &payload,
+                ) {
+                    eprintln!("DramaDist: 中断的任务 #{job_id} {note}");
+                }
+            }
+
             app.manage(AppState {
                 db: Mutex::new(conn),
                 tools: Mutex::new(paths),
@@ -272,10 +287,34 @@ pub fn run() {
                     .lock()
                     .map_err(|_| crate::error::AppError::Msg("数据库锁被污染".into()))?;
                 let counts = db::job_counts(&conn)?;
+                // **先看队列是不是被叫停的。**
+                //
+                // 用户点了「停止」，队列跑完当前任务就退出，但库里还剩一堆
+                // `pending`。重启后若只看「有待跑就接着跑」，它会把用户
+                // 明确停掉的那批活全部跑完 —— 那是把用户的决定直接覆盖掉。
+                //
+                // 判据得看**队列自己留下的痕迹**，不能看 pending 上有没有
+                // 「被中断」标记 —— 踩过：一批剧排队时，被中断的只有当时
+                // 正在跑的那两条，排在后面等着的一堆 pending 本来就没有标记，
+                // 于是整批被当成「用户停过」，永远不续跑。
+                //
+                // 两个痕迹任一成立就算停过：
+                // 1. 队列计数是 paused（点了暂停）
+                // 2. 最近一次运行是 canceled（点了停止，或者被 pipeline_cancel 撤了）
+                // 「意外中断」的运行不会留 canceled —— 那种是 running 挂在那，
+                // 已经被 recover 退回 pending 了。
                 let paused = db::get_setting(&conn, "queue.auto_resume")?
                     .map(|v| v.trim() == "off")
                     .unwrap_or(false);
-                (counts.pending, paused)
+                let last_canceled: Option<String> = conn
+                    .query_row(
+                        "SELECT status FROM pipeline_run ORDER BY id DESC LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                let stopped_by_user = last_canceled.as_deref() == Some(db::RUN_CANCELED);
+                (counts.pending, paused || stopped_by_user)
             };
 
             if pending > 0 && !paused_before {
