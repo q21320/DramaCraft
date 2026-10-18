@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { NButton, NInput, NInputNumber, NSelect, NSpace, NTag, useMessage } from "naive-ui";
 import { open } from "@tauri-apps/plugin-dialog";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { api } from "@/api";
 import { useAppStore } from "@/stores/app";
 import type { EmailConfigView, ToolPaths } from "@/types";
@@ -144,6 +145,43 @@ const EMAIL_PRESETS = [
   { label: "Gmail", value: "gmail" },
   { label: "Outlook", value: "outlook" },
 ];
+
+/**
+ * 每个邮箱「怎么开通 SMTP / 拿授权码」的官方帮助页。
+ *
+ * 用户选了常用邮箱之后，光自动填服务器和端口不够 —— 真正会卡住的是
+ * 「授权码从哪来」。这一步只能去各家的帮助中心，所以直接把入口给出来，
+ * 省得用户自己搜。
+ */
+const EMAIL_HELP: Record<string, { url: string; hint: string }> = {
+  qq: {
+    url: "https://service.mail.qq.com/cgi-bin/help?subtype=1&id=28&no=1001256",
+    hint: "QQ 邮箱：设置 → 账户 → 开启 IMAP/SMTP → 生成授权码",
+  },
+  "163": {
+    url: "https://help.mail.163.com/",
+    hint: "网易邮箱：设置 → POP3/SMTP/IMAP → 开启 SMTP → 新增授权码",
+  },
+  gmail: {
+    url: "https://myaccount.google.com/apppasswords",
+    hint: "Gmail：先开两步验证，再生成「应用专用密码」",
+  },
+  outlook: {
+    url: "https://account.microsoft.com/security",
+    hint: "Outlook：安全 → 高级安全选项 → 应用密码",
+  },
+};
+
+/** 选了预设之后要显示的那条指引（没选就是 null）。 */
+const emailHelp = computed(() => (emailPreset.value ? EMAIL_HELP[emailPreset.value] ?? null : null));
+
+async function openHelp(url: string) {
+  try {
+    await openUrl(url);
+  } catch (e) {
+    message.error(`打不开浏览器：${e}`);
+  }
+}
 
 const EMAIL_HOSTS: Record<string, { host: string; port: number }> = {
   qq: { host: "smtp.qq.com", port: 465 },
@@ -305,6 +343,13 @@ onMounted(() => {
         style="width: 220px"
         @update:value="applyEmailPreset"
       />
+      <n-button v-if="emailHelp" size="tiny" text type="primary" @click="openHelp(emailHelp.url)">
+        怎么开通 / 拿授权码？
+      </n-button>
+    </div>
+
+    <div v-if="emailHelp" class="dd-row" style="margin: -4px 0 10px 100px">
+      <span class="dd-muted" style="font-size: 12px">{{ emailHelp.hint }}</span>
     </div>
 
     <div class="dd-row" style="margin-bottom: 10px">
