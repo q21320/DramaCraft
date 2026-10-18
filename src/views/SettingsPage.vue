@@ -171,8 +171,12 @@ const EMAIL_HELP: Record<string, { url: string; hint: string }> = {
     hint: "163 邮箱：设置 → POP3/SMTP/IMAP → 开启 SMTP 服务 → 新增授权码",
   },
   gmail: {
-    url: "https://myaccount.google.com/apppasswords",
-    hint: "Gmail：先开两步验证，再生成「应用专用密码」",
+    // Google 官方帮助页「使用应用专用密码登录」（简体中文版）。
+    // 直接给 myaccount.google.com/apppasswords 也能用，但那页要登录后
+    // 才看得到，而且**没开两步验证的人进去是一片空白** —— 帮助页把
+    // 前置条件写清楚了。
+    url: "https://support.google.com/accounts/answer/185833?hl=zh-Hans",
+    hint: "Gmail：先开启两步验证 → 到「应用专用密码」生成 16 位密码（不是 Google 登录密码）",
   },
   outlook: {
     url: "https://account.microsoft.com/security",
