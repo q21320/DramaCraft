@@ -605,39 +605,12 @@ pub struct AiProviderView {
     pub key_hint: String,
 }
 
-/// 哪些功能走 AI。
-///
-/// 刻意做成显式开关而不是"配了 Key 就自动用"：
-/// 用 AI 会产生费用、产出属于 AI 生成内容（有标识义务），
-/// 这两件事都该由用户点头。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiUsage {
-    /// 封面生成（图生图）
-    pub cover_generation: bool,
-    /// 剧名 / 简介改写
-    pub title_rewrite: bool,
-    /// 云端字幕识别
-    pub subtitle_cloud: bool,
-}
-
-impl Default for AiUsage {
-    fn default() -> Self {
-        Self {
-            cover_generation: false,
-            title_rewrite: false,
-            subtitle_cloud: false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiConfigView {
     pub providers: Vec<AiProviderView>,
     /// 当前启用哪一个；空串表示都没启用
     pub active: String,
-    pub usage: AiUsage,
     /// 配置上值得提醒的地方
     pub warnings: Vec<String>,
 }
@@ -891,6 +864,31 @@ pub struct CloudTranscribeReport {
 pub struct CloudTestResult {
     pub ok: bool,
     pub endpoint: String,
+    pub detail: String,
+}
+
+// ---------------- 完成通知（邮件） ----------------
+
+/// 给前端看的邮件配置。**永远不含完整授权码** —— 只返回打码后的提示。
+/// 没有单独的开关：填全了就发，没填全就不发。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailConfigView {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    /// 实际收件人；空串表示「发给自己」
+    pub to: String,
+    pub has_password: bool,
+    /// 打码后的授权码
+    pub password_hint: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailTestResult {
+    pub ok: bool,
     pub detail: String,
 }
 

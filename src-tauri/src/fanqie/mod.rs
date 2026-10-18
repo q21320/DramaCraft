@@ -23,6 +23,13 @@
 //! `encrypt_info.spade_a` 能派生出 16 字节 AES key，交给 ffmpeg 的
 //! `-decryption_key` 直接解密；再转成 H.264 落盘缓存 —— WebView2 对 HEVC 的
 //! 支持取决于系统组件，H.264 最保险。走 [`prepare_video`]。
+//!
+//! ## 批量下载为什么不转码
+//!
+//! 在线播放要「点开就能播」，才值得转 H.264。批量下载不一样：源片落盘后还要走
+//! 整剧处理，其中「整集去重」本来就要完整编码一次 —— 下载时再转一遍是纯重复劳动，
+//! 还是整部剧最慢的一环。所以 [`download_series`] 默认 `-c:v copy` 只解密，
+//! 几秒就能落盘，唯一的一次编码留给去重；copy 解不开时自动退回转码兜底。
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -1166,12 +1173,85 @@ fn playback_quality_args(encoder: crate::media::H264Encoder) -> Vec<String> {
     }
 }
 
-/// 下载一条流，用 ffmpeg 解密并转成 H.264，写到 `out`。
+/// 用 ffmpeg 把下载好的加密分片解出来，写到 `out`。
+///
+/// `copy_video` = 只解密不重编码：几秒就能落盘，产物保持平台原编码（多为 HEVC）。
+/// 这条是给「下载后还要整剧处理」准备的 —— 去重那一步本来就要完整编码一次，
+/// 下载时再转一遍 H.264 纯属重复劳动。
+///
+/// `copy` 失败会自动退回转码：个别流（比如 bytevc2）ffmpeg 只认 fourcc 不识内容，
+/// 不能让整集因为「想省一次编码」而下载失败。
+async fn decrypt_part(
+    part: &std::path::Path,
+    out: &std::path::Path,
+    ffmpeg: &std::path::Path,
+    key: Option<String>,
+    copy_video: bool,
+) -> AppResult<()> {
+    let ffmpeg = ffmpeg.to_path_buf();
+    let part_for_task = part.to_path_buf();
+    let out_for_task = out.to_path_buf();
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new(&ffmpeg);
+        proc::no_window(&mut cmd);
+        if let Some(key) = &key {
+            // 必须在 -i 之前，ffmpeg 才会按 CENC 解密输入
+            cmd.arg("-decryption_key").arg(key);
+        }
+        cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&part_for_task)
+            .args(["-map", "0:v:0", "-map", "0:a:0?"]);
+        if copy_video {
+            // 只解密、不重编码 —— 下载提速的关键
+            cmd.args(["-c:v", "copy", "-c:a", "copy"]);
+        } else {
+            // 探测编码器要真编一帧（阻塞），只在真要转码时才做
+            let encoder = crate::media::pick_h264_encoder(&ffmpeg);
+            cmd.args(["-c:v", encoder.name()])
+                .args(playback_quality_args(encoder))
+                .args([
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                ]);
+        }
+        cmd.args(["-movflags", "+faststart"])
+            .arg(&out_for_task)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.output()
+    })
+    .await
+    .map_err(|e| AppError::Msg(format!("解密任务异常：{e}")))?
+    .map_err(|e| AppError::Msg(format!("调用 ffmpeg 失败：{e}")))?;
+
+    if !output.status.success() {
+        let detail = proc::tail(&String::from_utf8_lossy(&output.stderr));
+        return Err(AppError::Msg(format!(
+            "{}失败：{detail}",
+            if copy_video { "解密直存" } else { "解密 / 转码" }
+        )));
+    }
+    if !is_nonempty(out) {
+        let _ = std::fs::remove_file(out);
+        return Err(AppError::Msg("解密失败：没有产出文件".into()));
+    }
+    Ok(())
+}
+
+/// 下载一条流并解密，写到 `out`。
+///
+/// 返回 true 表示只做了解密（原编码），false 表示转成了 H.264。
 async fn fetch_and_decrypt(
     stream: &ModelStream,
     out: &std::path::Path,
     ffmpeg: &std::path::Path,
-) -> AppResult<()> {
+    copy_video: bool,
+) -> AppResult<bool> {
     let resp = client()?
         .get(&stream.url)
         .timeout(Duration::from_secs(300))
@@ -1204,64 +1284,38 @@ async fn fetch_and_decrypt(
     } else {
         None
     };
-    let encoder = crate::media::pick_h264_encoder(ffmpeg);
-    let ffmpeg = ffmpeg.to_path_buf();
-    let part_for_task = part.clone();
     // 先写临时文件，成功后再改名，中途失败不会留下“看起来有效”的缓存
     let tmp = out.with_extension("tmp.mp4");
-    let out_for_task = tmp.clone();
-    let output = tauri::async_runtime::spawn_blocking(move || {
-        let mut cmd = Command::new(&ffmpeg);
-        proc::no_window(&mut cmd);
-        if let Some(key) = &key {
-            // 必须在 -i 之前，ffmpeg 才会按 CENC 解密输入
-            cmd.arg("-decryption_key").arg(key);
+
+    // 快速模式先试「只解密」；解不开再退回转码（少数私有编码需要重编码才能识别）
+    let modes: &[bool] = if copy_video { &[true, false] } else { &[false] };
+    let mut last_error = String::new();
+    for &copy in modes {
+        let _ = std::fs::remove_file(&tmp);
+        match decrypt_part(&part, &tmp, ffmpeg, key.clone(), copy).await {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, out) {
+                    let _ = std::fs::remove_file(&tmp);
+                    let _ = std::fs::remove_file(&part);
+                    return Err(AppError::Msg(format!("写入视频缓存失败：{e}")));
+                }
+                // 加密源只是中间产物，成不成都删掉
+                let _ = std::fs::remove_file(&part);
+                return Ok(copy);
+            }
+            Err(e) => last_error = e.to_string(),
         }
-        cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-            .arg(&part_for_task)
-            .args(["-map", "0:v:0", "-map", "0:a:0?"])
-            .args(["-c:v", encoder.name()])
-            .args(playback_quality_args(encoder))
-            .args([
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-movflags",
-                "+faststart",
-            ])
-            .arg(&out_for_task)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        cmd.output()
-    })
-    .await
-    .map_err(|e| AppError::Msg(format!("解密任务异常：{e}")))?
-    .map_err(|e| AppError::Msg(format!("调用 ffmpeg 失败：{e}")))?;
+    }
 
-    // 加密源只是中间产物，成不成都删掉
     let _ = std::fs::remove_file(&part);
-
-    if !output.status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        let detail = proc::tail(&String::from_utf8_lossy(&output.stderr));
-        return Err(AppError::Msg(format!("解密 / 转码失败：{detail}")));
-    }
-    if !is_nonempty(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(AppError::Msg("解密 / 转码失败：没有产出文件".into()));
-    }
-    if let Err(e) = std::fs::rename(&tmp, out) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(AppError::Msg(format!("写入视频缓存失败：{e}")));
-    }
-    Ok(())
+    let _ = std::fs::remove_file(&tmp);
+    Err(AppError::Msg(last_error))
 }
 
-/// 准备一集的本地可播文件：下载 App 流 → 派生 key → ffmpeg 解密并转 H.264 → 缓存。
+/// 准备一集的本地文件：下载 App 流 → 派生 key → ffmpeg 解密。
+///
+/// `copy_video`：true = 只解密不转码（下载用，快，产物是平台原编码）；
+/// false = 解密并转成 H.264（在线播放用，WebView2 直接能播）。
 ///
 /// 官网只公开前 50 集且部分文件缺失，所以播放主链路走这里；
 /// 前端失败时才退回 [`play_url`] 的官网明文流。
@@ -1271,6 +1325,7 @@ pub async fn prepare_video(
     vid: &str,
     quality: Option<&str>,
     ffmpeg: Option<PathBuf>,
+    copy_video: bool,
 ) -> AppResult<FanqiePreparedVideo> {
     let vid = vid.trim();
     if !valid_id(vid) {
@@ -1285,18 +1340,34 @@ pub async fn prepare_video(
         .join("fanqie_videos");
     std::fs::create_dir_all(&dir)?;
 
-    // 缓存文件只跟 vid 和指定清晰度有关。命中就直接返回，切回看过的集不用再请求接口。
-    let out = match quality.map(str::trim).filter(|q| !q.is_empty()) {
+    let q = quality.map(str::trim).filter(|q| !q.is_empty());
+    // H.264 缓存：播放用；下载时也优先用它 —— 有就直接拷，连解密都省。
+    let h264 = match q {
         Some(q) => dir.join(format!("{vid}_{}.mp4", safe_name(q))),
         None => dir.join(format!("{vid}.mp4")),
     };
-    if is_nonempty(&out) {
+    // 只解密不转码的缓存：平台原编码（多为 HEVC），给下载用。
+    let raw = match q {
+        Some(q) => dir.join(format!("{vid}_{}_raw.mp4", safe_name(q))),
+        None => dir.join(format!("{vid}_raw.mp4")),
+    };
+    if is_nonempty(&h264) {
         return Ok(FanqiePreparedVideo {
             vid: vid.to_string(),
-            path: out.to_string_lossy().to_string(),
+            path: h264.to_string_lossy().to_string(),
             // 缓存里没存元信息，清晰度交给前端用「本地缓存」显示
             quality: String::new(),
             codec: "h264".into(),
+            duration_sec: 0.0,
+            source: "cache".into(),
+        });
+    }
+    if copy_video && is_nonempty(&raw) {
+        return Ok(FanqiePreparedVideo {
+            vid: vid.to_string(),
+            path: raw.to_string_lossy().to_string(),
+            quality: String::new(),
+            codec: "source".into(),
             duration_sec: 0.0,
             source: "cache".into(),
         });
@@ -1312,19 +1383,42 @@ pub async fn prepare_video(
         return Err(AppError::Msg("视频详情里没有可下载的流".into()));
     }
 
+    let out = if copy_video { &raw } else { &h264 };
     let mut last_error = String::new();
     for idx in pick_model_streams(&streams, quality) {
         let stream = &streams[idx];
-        match fetch_and_decrypt(stream, &out, &ffmpeg).await {
-            Ok(()) => {
+        match fetch_and_decrypt(stream, out, &ffmpeg, copy_video).await {
+            Ok(copied) => {
+                // 本想只解密、结果退回了转码：产物就是 H.264，
+                // 挪回标准缓存名，下次播放直接命中，不用再转一遍
+                let path = if copy_video && !copied {
+                    if std::fs::rename(&raw, &h264).is_ok() {
+                        h264.clone()
+                    } else {
+                        // 目标处可能有上次留下的空壳，Windows 下 rename 不覆盖；
+                        // 还不行就直接用 raw —— 内容本身就是 H.264，播放不受影响
+                        let _ = std::fs::remove_file(&h264);
+                        if std::fs::rename(&raw, &h264).is_ok() {
+                            h264.clone()
+                        } else {
+                            raw.clone()
+                        }
+                    }
+                } else {
+                    out.clone()
+                };
                 return Ok(FanqiePreparedVideo {
                     vid: vid.to_string(),
-                    path: out.to_string_lossy().to_string(),
+                    path: path.to_string_lossy().to_string(),
                     quality: stream.definition.clone(),
-                    codec: "h264".into(),
+                    codec: if copy_video && copied {
+                        "source".into()
+                    } else {
+                        "h264".into()
+                    },
                     duration_sec,
                     source: "app".into(),
-                })
+                });
             }
             Err(e) => {
                 last_error = format!("{} {}（{}）", stream.definition, stream.codec, e);
@@ -1385,6 +1479,13 @@ pub fn count_episodes(dir: &Path) -> i64 {
 /// 否则用户看到的后果就是「缺了好几集」。
 const DOWNLOAD_ATTEMPTS: usize = 3;
 const DOWNLOAD_RETRY_WAIT_MS: u64 = 1500;
+
+/// 一部剧内同时下载几集。
+///
+/// 每集都是「取流 → ffmpeg 解密转码 → 落盘」，串行时绝大部分时间在等 ffmpeg。
+/// 3 路能明显缩短整部剧的等待；再往上会和转码抢 CPU（ffmpeg 本身吃满核），
+/// 也更容易被番茄限流，反而更慢。
+const DOWNLOAD_CONCURRENCY: usize = 3;
 
 /// 把下载过程写进运行日志（`run_log`）。
 ///
@@ -1531,12 +1632,16 @@ async fn save_cover(
 /// ```
 ///
 /// 每完成一集发一条 `fanqie:download`，前端用它显示进度。
+///
+/// `copy_video`：true = 只解密不转码（推荐）。下载阶段几乎不占 CPU，
+/// 唯一的一次 H.264 编码留给整剧处理的「整集去重」—— 反正那一步本来就要完整编码。
 pub async fn download_series(
     app: &tauri::AppHandle,
     req: &FanqieDownloadRequest,
     out_root: &std::path::Path,
     quality: Option<&str>,
     ffmpeg: Option<PathBuf>,
+    copy_video: bool,
 ) -> AppResult<FanqieDownloadReport> {
     use tauri::Emitter;
 
@@ -1576,16 +1681,18 @@ pub async fn download_series(
     let mut episodes = req.episodes.clone();
     episodes.sort_by_key(|e| e.index);
     let total = episodes.len() as i64;
-    let mut downloaded = 0i64;
-    let mut skipped = 0i64;
-    let mut failed: Vec<String> = Vec::new();
 
     log_download(
         app,
         "info",
         &format!(
-            "下载《{title}》开始：共 {total} 集，保存到 {}（已写 剧名.txt / intro.txt）",
-            dir.to_string_lossy()
+            "下载《{title}》开始：共 {total} 集，保存到 {}（{}，已写 剧名.txt / intro.txt）",
+            dir.to_string_lossy(),
+            if copy_video {
+                "只解密不转码，省下的一次编码留给整剧去重"
+            } else {
+                "解密并转成 H.264"
+            }
         ),
         "",
     );
@@ -1632,43 +1739,106 @@ pub async fn download_series(
         },
     }
 
-    for (pos, ep) in episodes.iter().enumerate() {
-        let index = ep.index.max(1);
-        let file = dir.join(format!("第{index:02}集.mp4"));
-        let progress = format!("[{}/{}]", pos + 1, total);
-        // 旧版本落盘叫 `<剧名>-第01集.mp4`。已经下好的直接改名，
-        // 不让用户为了一次命名调整把整部剧重下一遍。
-        let legacy = dir.join(format!("{title}-第{index:02}集.mp4"));
-        if !file.exists() && is_nonempty(&legacy) {
-            let _ = std::fs::rename(&legacy, &file);
-        }
-        let message;
+    // 一部剧内并行下载。串行时每集都要等完整个「取流 → ffmpeg 解密转码」，
+    // 而这几步里 ffmpeg 并不会把网络和磁盘占满 —— 3 路同时跑才吃得下带宽和 CPU。
+    let concurrency = DOWNLOAD_CONCURRENCY.min(episodes.len()).max(1);
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let done_downloaded = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let done_skipped = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let done_failed = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let mut tasks = tokio::task::JoinSet::new();
 
-        if is_nonempty(&file) {
-            skipped += 1;
-            message = format!("{progress} 第 {index} 集已存在，跳过");
-            log_download(
-                app,
-                "info",
-                &format!("{message}：{}（{}）", file.file_name().unwrap_or_default().to_string_lossy(), size_label(&file)),
-                &file.to_string_lossy(),
-            );
-        } else {
-            // 开始那一行也要写：卡住时最后一行就能告诉用户停在第几集。
-            log_download(app, "info", &format!("{progress} 第 {index} 集开始下载…"), "");
+    for ep in episodes.iter() {
+        let app = app.clone();
+        let title = title.clone();
+        let dir = dir.clone();
+        let quality = quality.map(str::to_string);
+        let ffmpeg = ffmpeg.clone();
+        let sem = sem.clone();
+        let done_downloaded = done_downloaded.clone();
+        let done_skipped = done_skipped.clone();
+        let done_failed = done_failed.clone();
+        let sid = sid.to_string();
+        let vid = ep.vid.clone();
+        let index = ep.index.max(1);
+
+        tasks.spawn(async move {
+            use std::sync::atomic::Ordering;
+
+            // 排队等一个并发名额；前面的集下完自动补位
+            let _permit = sem.acquire_owned().await;
+
+            let file = dir.join(format!("第{index:02}集.mp4"));
+            // 旧版本落盘叫 `<剧名>-第01集.mp4`。已经下好的直接改名，
+            // 不让用户为了一次命名调整把整部剧重下一遍。
+            let legacy = dir.join(format!("{title}-第{index:02}集.mp4"));
+            if !file.exists() && is_nonempty(&legacy) {
+                let _ = std::fs::rename(&legacy, &file);
+            }
+
+            // 进度按「已处理完的集数」算：并发完成顺序是乱的，
+            // 用它前端进度才单调，不会忽上忽下。
+            let progress = || {
+                done_downloaded.load(Ordering::Relaxed)
+                    + done_skipped.load(Ordering::Relaxed)
+                    + done_failed.load(Ordering::Relaxed)
+            };
+            let emit = |message: &str| {
+                let _ = app.emit(
+                    "fanqie:download",
+                    serde_json::json!({
+                        "seriesId": &sid,
+                        "title": &title,
+                        "index": progress(),
+                        "episodeIndex": index,
+                        "total": total,
+                        "phase": "episode",
+                        "message": message,
+                        "downloaded": done_downloaded.load(Ordering::Relaxed),
+                        "skipped": done_skipped.load(Ordering::Relaxed),
+                        "failed": done_failed.load(Ordering::Relaxed),
+                    }),
+                );
+            };
+
+            if is_nonempty(&file) {
+                done_skipped.fetch_add(1, Ordering::Relaxed);
+                let message = format!("第 {index} 集已存在，跳过");
+                log_download(
+                    &app,
+                    "info",
+                    &format!("{message}（{}/{total}）：{}（{}）", progress(), file.file_name().unwrap_or_default().to_string_lossy(), size_label(&file)),
+                    &file.to_string_lossy(),
+                );
+                emit(&message);
+                return (index, None);
+            }
+
+            // 开始那一行也要写：并发时哪几集在跑，看日志最清楚。
+            log_download(&app, "info", &format!("第 {index} 集开始下载…"), "");
+            emit(&format!("第 {index} 集开始下载…"));
+
             let mut last_error = String::new();
             let mut ok = false;
             for attempt in 0..DOWNLOAD_ATTEMPTS {
                 if attempt > 0 {
                     log_download(
-                        app,
+                        &app,
                         "warn",
-                        &format!("{progress} 第 {index} 集第 {attempt} 次重试…"),
+                        &format!("第 {index} 集第 {attempt} 次重试…"),
                         "",
                     );
                     tokio::time::sleep(Duration::from_millis(DOWNLOAD_RETRY_WAIT_MS)).await;
                 }
-                match prepare_video(app, &ep.vid, quality, ffmpeg.clone()).await {
+                match prepare_video(
+                    &app,
+                    &vid,
+                    quality.as_deref(),
+                    ffmpeg.clone(),
+                    copy_video,
+                )
+                .await
+                {
                     Ok(prepared) => match std::fs::copy(&prepared.path, &file) {
                         Ok(_) => {
                             ok = true;
@@ -1685,38 +1855,42 @@ pub async fn download_series(
                     Err(e) => last_error = e.to_string(),
                 }
             }
+
             if ok {
-                downloaded += 1;
-                message = format!("{progress} 第 {index} 集完成");
+                done_downloaded.fetch_add(1, Ordering::Relaxed);
+                let message = format!("第 {index} 集完成");
                 log_download(
-                    app,
+                    &app,
                     "ok",
-                    &format!("{message} → {}（{}）", file.file_name().unwrap_or_default().to_string_lossy(), size_label(&file)),
+                    &format!("{message}（{}/{total}）→ {}（{}）", progress(), file.file_name().unwrap_or_default().to_string_lossy(), size_label(&file)),
                     &file.to_string_lossy(),
                 );
+                emit(&message);
+                (index, None)
             } else {
-                message = format!("第 {index} 集：{last_error}");
-                failed.push(message.clone());
-                log_download(app, "error", &format!("{progress} {message}"), "");
+                done_failed.fetch_add(1, Ordering::Relaxed);
+                let message = format!("第 {index} 集：{last_error}");
+                log_download(&app, "error", &format!("{message}（{}/{total}）", progress()), "");
+                emit(&message);
+                (index, Some(message))
             }
-        }
-
-        let _ = app.emit(
-            "fanqie:download",
-            serde_json::json!({
-                "seriesId": sid,
-                "title": title,
-                "index": pos + 1,
-                "episodeIndex": index,
-                "total": total,
-                "phase": "episode",
-                "message": message,
-                "downloaded": downloaded,
-                "skipped": skipped,
-                "failed": failed.len(),
-            }),
-        );
+        });
     }
+
+    // 等所有集跑完。失败按集号排回去 —— 并发完成顺序是乱的，
+    // 报告/提示里按集数读起来才顺。
+    let mut failures: Vec<(i64, String)> = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((index, Some(message))) => failures.push((index, message)),
+            Ok((_, None)) => {}
+            Err(e) => failures.push((0, format!("某集下载任务异常退出：{e}"))),
+        }
+    }
+    failures.sort_by_key(|(index, _)| *index);
+    let failed: Vec<String> = failures.into_iter().map(|(_, message)| message).collect();
+    let downloaded = done_downloaded.load(std::sync::atomic::Ordering::Relaxed);
+    let skipped = done_skipped.load(std::sync::atomic::Ordering::Relaxed);
 
     let _ = app.emit(
         "fanqie:download",

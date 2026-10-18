@@ -1398,10 +1398,31 @@ pub fn has_log_with_message(
 }
 
 /// 还有多少个这种类型的待跑任务。
+///
+/// 旧版的跨剧计数，现在只在测试里用 —— 生产走
+/// [`count_pending_jobs_of_kind_for_drama`]（队列已经按剧串行）。
+#[allow(dead_code)]
 pub fn count_pending_jobs_of_kind(conn: &Connection, kind: &str) -> AppResult<i64> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM job WHERE status = 'pending' AND kind = ?1",
         params![kind],
+        |r| r.get(0),
+    )?)
+}
+
+/// 某部剧还有多少个这种类型的待跑任务。
+///
+/// 队列按剧串行，步骤收口的汇总行也得只看当前这部剧 —— 否则下一部剧的
+/// 同名步骤还在排队，汇总行永远不出来。`None` = 手动任务。
+pub fn count_pending_jobs_of_kind_for_drama(
+    conn: &Connection,
+    kind: &str,
+    drama_id: Option<i64>,
+) -> AppResult<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM job
+          WHERE status = 'pending' AND kind = ?1 AND pipeline_drama_id IS ?2",
+        params![kind, drama_id],
         |r| r.get(0),
     )?)
 }
@@ -1755,6 +1776,50 @@ pub fn list_jobs(conn: &Connection, limit: i64) -> AppResult<Vec<Job>> {
     Ok(out)
 }
 
+/// 队首那条待跑任务。
+///
+/// 队列要**按剧串行**：先看队首属于哪部剧，再把这部剧的任务成批取出来。
+/// 只看类型的话，整剧一步的任务（封面/成本/分镜）会把 A 剧和 B 剧
+/// 拼进同一批并发跑 —— 用户看到的就是「步骤乱了」。
+pub fn next_pending_job(conn: &Connection) -> AppResult<Option<Job>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {JOB_COLUMNS} FROM job
+          WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+    ))?;
+    let mut rows = stmt.query([])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row_to_job(row)?)),
+        None => Ok(None),
+    }
+}
+
+/// 取**同一部剧、同一类型**的待跑任务，用来并行执行。
+///
+/// 两个条件缺一不可：
+/// - 同类型：切片必须等去重全跑完；
+/// - 同剧：一部剧做完再做下一部，不能把 A 的封面和 B 的封面一起跑。
+///
+/// `drama_id` 为 `None` 时取的是**手动任务**（不属于任何剧），
+/// 用 `IS` 而不是 `=`，NULL 才能正确匹配。
+pub fn next_pending_jobs_of_kind_for_drama(
+    conn: &Connection,
+    kind: &str,
+    drama_id: Option<i64>,
+    limit: i64,
+) -> AppResult<Vec<Job>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {JOB_COLUMNS} FROM job
+          WHERE status = 'pending' AND kind = ?1 AND pipeline_drama_id IS ?2
+          ORDER BY id ASC LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(params![kind, drama_id, limit.max(1)], row_to_job)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 /// 取一批**同类型**的待跑任务，用来并行执行。
 ///
 /// **为什么必须是同类型**：任务之间并不是都能并行的。
@@ -1764,6 +1829,10 @@ pub fn list_jobs(conn: &Connection, limit: i64) -> AppResult<Vec<Job>> {
 /// 但**同一类型内部彼此独立**：第 3 集去重和第 7 集去重互不相干，
 /// 可以一起跑。所以规则很简单：看队首是什么类型，就只并发取这个类型。
 /// 这样天然保证「上一步全部跑完，才轮到下一步」。
+///
+/// 旧版的跨剧批量，现在只在测试里用 —— 生产走
+/// [`next_pending_jobs_of_kind_for_drama`]（队列已经按剧串行）。
+#[allow(dead_code)]
 pub fn next_pending_jobs_of_kind(
     conn: &Connection,
     kind: &str,
@@ -1785,6 +1854,9 @@ pub fn next_pending_jobs_of_kind(
 /// 用过的任务类型（除了给定类型之外，还有没有别的在排队）。
 ///
 /// 用来判断「这一步是不是全跑完了」—— 队首换类型了就说明上一步结束。
+///
+/// 旧版判断，现在只在测试里用 —— 生产走 [`next_pending_job`]，直接拿队首任务。
+#[allow(dead_code)]
 pub fn next_pending_kind(conn: &Connection) -> AppResult<Option<String>> {
     let mut stmt = conn.prepare(
         "SELECT kind FROM job WHERE status = 'pending' ORDER BY id ASC LIMIT 1",
@@ -2286,6 +2358,37 @@ mod tests {
         assert_eq!(batch[0].id, b.id);
     }
 
+    /// 并行取任务：**同一部剧、同一类型**。
+    ///
+    /// 踩过的坑：只按类型取，整剧一步的任务（封面/成本/分镜）会把 A 剧和
+    /// B 剧拼进同一批 —— 用户看到的是「多个视频一起下，流水线步骤乱了」。
+    #[test]
+    fn parallel_batches_stay_inside_one_drama() {
+        let conn = mem();
+        let run = create_pipeline_run(&conn, "D:/src", "D:/out", &[]).unwrap();
+        let a = add_pipeline_drama(&conn, run, "A", "D:/src/A", "D:/out/A", 2, None).unwrap();
+        let b = add_pipeline_drama(&conn, run, "B", "D:/src/B", "D:/out/B", 2, None).unwrap();
+
+        // A 的去重排在 B 的去重之前（整剧串行的最小例子）
+        enqueue_job_for(&conn, Some(1), "dedup", OK_DEDUP, Some(a)).unwrap();
+        enqueue_job_for(&conn, Some(2), "dedup", OK_DEDUP, Some(b)).unwrap();
+        enqueue_job_for(&conn, Some(3), "dedup", OK_DEDUP, Some(a)).unwrap();
+
+        let head = next_pending_job(&conn).unwrap().unwrap();
+        assert_eq!(head.pipeline_drama_id, Some(a));
+        let batch =
+            next_pending_jobs_of_kind_for_drama(&conn, &head.kind, head.pipeline_drama_id, 10)
+                .unwrap();
+        assert_eq!(batch.len(), 2, "只该取 A 的，B 的不行");
+        assert!(batch.iter().all(|j| j.pipeline_drama_id == Some(a)));
+
+        // 手动任务（不属于任何剧）单独成批，不会把流水线任务卷进来
+        let manual = enqueue_job(&conn, Some(4), "dedup", OK_DEDUP).unwrap();
+        let batch = next_pending_jobs_of_kind_for_drama(&conn, "dedup", None, 10).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, manual.id);
+    }
+
     /// 并行取任务：**只能取同一类型**。
     ///
     /// 跨类型并行会出事：「切片」读的是去重产物，去重还没跑完就切片，
@@ -2446,6 +2549,7 @@ mod tests {
     /// 那种写法以前能过，现在会被当场拦下。这里给的是真形状。
     const OK_SLICE: &str =
         r#"{"mediaId":1,"mode":{"mode":"equalParts","parts":3},"outDir":"E:/o"}"#;
+    const OK_DEDUP: &str = r#"{"mediaId":1,"outDir":"E:/o"}"#;
     const OK_OCR: &str = r#"{"mediaId":2}"#;
     /// 清空运行记录：**正在跑的不删、素材不动**。
     ///

@@ -404,9 +404,9 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
                     crate::tools::require(&configured.ffmpeg, "ffmpeg")?,
                 )
             };
-            let worker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("resources")
-                .join("jy_draft_worker.py");
+            // 和 `commands::worker_script` 走同一套解析：安装包里有 `<安装目录>/resources/jy_draft_worker.py`，
+            // 只拼 `CARGO_MANIFEST_DIR` 的话在别人机器上必挂。
+            let worker = crate::commands::worker_script(app, "jy_draft_worker.py");
             let mut made = 0i64;
             let mut cues_total = 0usize;
             let mut notes: Vec<String> = Vec::new();
@@ -658,6 +658,7 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
         "storyboard" => {
             let p: StoryboardPayload = parse_payload(job)?;
             let report = commands::build_storyboard(
+                app.clone(),
                 state,
                 p.media_ids,
                 p.out_dir,
@@ -960,26 +961,32 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
             }
         }
 
-        // **取一批同类型的任务一起跑。**
+        // **按剧串行，剧内同类型并行。**
         //
-        // 为什么必须是同类型：任务之间不是都能并行 ——「切片」得在「去重」
+        // 为什么是同类型：任务之间不是都能并行 ——「切片」得在「去重」
         // 之后（切片读的正是去重产物），去重没跑完就切片，切出来的是原片。
         // 但同一类型内部彼此独立：第 3 集去重和第 7 集去重互不相干。
         //
-        // 规则：看队首是什么类型，就只并发取这个类型 —— 天然保证
-        // 「上一步全部跑完，才轮到下一步」。
-        //
-        // 61 集去重原来一个个跑要半小时以上，这是用户抱怨「很慢很慢」的根源。
-        let (kind, batch) = {
+        // 为什么还要限定同一部剧：只看类型的话，整剧一步的任务
+        // （封面 / 成本 / 分镜）会把 A 剧和 B 剧拼进同一批并发跑 ——
+        // 用户看到的就是「多个视频一起下，步骤乱了」。
+        // 规矩：**一部剧的活全部跑完，才轮到下一部**。
+        let (kind, drama_id, batch) = {
             let state = app.state::<AppState>();
             let conn = state
                 .db
                 .lock()
                 .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
-            let Some(kind) = db::next_pending_kind(&conn)? else {
+            let Some(head) = db::next_pending_job(&conn)? else {
                 break;
             };
-            let jobs = db::next_pending_jobs_of_kind(&conn, &kind, concurrency_for(&kind))?;
+            let kind = head.kind.clone();
+            let jobs = db::next_pending_jobs_of_kind_for_drama(
+                &conn,
+                &kind,
+                head.pipeline_drama_id,
+                concurrency_for(&kind),
+            )?;
             for job in &jobs {
                 db::mark_job_running(&conn, job.id)?;
                 // **步骤标题只打一次。**
@@ -1021,7 +1028,7 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                     }
                 }
             }
-            (kind, jobs)
+            (kind, head.pipeline_drama_id, jobs)
         };
         if batch.is_empty() {
             break;
@@ -1233,7 +1240,9 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                 .db
                 .lock()
                 .map_err(|_| AppError::Msg("数据库锁被污染，请重启应用".into()))?;
-            if db::count_pending_jobs_of_kind(&conn, &kind)? == 0 {
+            // 汇总也只算**当前这部剧**：下一部剧的同名步骤还在排队，
+            // 用全量计数的话这行永远不出现。
+            if db::count_pending_jobs_of_kind_for_drama(&conn, &kind, drama_id)? == 0 {
                 let n = db::count_done_jobs_of_kind(&conn, run_id, &kind).unwrap_or(0);
                 db::append_log(
                     &conn,

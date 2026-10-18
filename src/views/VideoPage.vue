@@ -20,6 +20,10 @@ import type {
   OnlineDrama,
 } from "@/types";
 
+// 让 MainLayout 的 <keep-alive include="VideoPage"> 能命中它：
+// 从别的页返回时保留列表与筛选，不重新拉一遍。
+defineOptions({ name: "VideoPage" });
+
 type OnlineTab = "fresh" | "shelf";
 
 // ---------------- 在线短剧（番茄接口） ----------------
@@ -495,8 +499,6 @@ const selectedCount = computed(() => selectedSeries.value.size);
  */
 const dl = useDownloadStore();
 const downloading = computed(() => dl.running);
-const downloadError = computed(() => dl.error);
-const dlPercent = computed(() => dl.percent);
 
 function isSelected(v: OnlineDrama): boolean {
   return !!v.seriesId && selectedSeries.value.has(v.seriesId);
@@ -630,7 +632,7 @@ onMounted(() => {
             :disabled="selectedCount === 0"
             @click="downloadSelected"
           >
-            下载 → 跑流水线
+            下载 → 整剧处理
           </n-button>
         </template>
         <span class="dd-muted" style="font-size: 12px">已加载 {{ currentOnline.length }} 条</span>
@@ -819,44 +821,6 @@ onMounted(() => {
         </div>
       </div>
     </n-modal>
-
-    <!-- 批量下载进度：下载完自动跳流水线并开跑 -->
-    <div v-if="dl.active" class="o-dl">
-      <div class="o-dl-head">
-        <b>下载到默认下载目录</b>
-        <span class="dd-muted">
-          {{ Math.min(dl.seriesIndex + 1, dl.seriesTotal) }} / {{ dl.seriesTotal }} 部
-        </span>
-        <button v-if="!dl.running" class="o-dl-close" title="收起" @click="dl.dismiss()">
-          ×
-        </button>
-      </div>
-      <div class="o-dl-bar"><i :style="{ width: dlPercent + '%' }" /></div>
-      <div class="o-dl-line">
-        《{{ dl.title || "…" }}》
-        <span v-if="dl.episodes > 0" class="dd-muted">
-          第 {{ dl.episode }} / {{ dl.episodes }} 集
-        </span>
-      </div>
-      <div class="o-dl-line dd-muted dd-wrap">{{ dl.message }}</div>
-      <div class="o-dl-line dd-muted">
-        已完成 {{ dl.done }} 集
-        <template v-if="dl.failed > 0"> · 失败 {{ dl.failed }}</template>
-      </div>
-      <div v-if="dl.root" class="o-dl-line dd-muted dd-wrap" style="font-size: 11px">
-        保存到：{{ dl.root }}（每部剧自己的「二创」在剧目录里）
-      </div>
-      <div v-if="downloadError" class="o-dl-error dd-wrap">{{ downloadError }}</div>
-      <div class="dd-muted" style="font-size: 11px; margin-top: 4px">
-        {{
-          dl.running
-            ? "下载在后台继续，切到别的页面不会中断"
-            : dl.failed > 0
-              ? "有失败集时不会自动开跑；再点一次「下载」只补缺的集"
-              : "下载完会自动跳到流水线并开始"
-        }}
-      </div>
-    </div>
   </div>
 </template>
 
@@ -1146,68 +1110,5 @@ onMounted(() => {
 }
 .o-detail table th {
   width: 84px;
-}
-
-/* 批量下载进度浮层：固定在右下角，不挡列表 */
-.o-dl {
-  position: fixed;
-  right: 24px;
-  bottom: 24px;
-  z-index: 60;
-  width: 320px;
-  box-sizing: border-box;
-  padding: 12px 14px;
-  border-radius: 10px;
-  border: 1px solid rgba(128, 128, 128, 0.24);
-  background: var(--n-color, #fff);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
-  font-size: 12px;
-}
-.o-dl-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-  font-size: 13px;
-}
-.o-dl-head b {
-  flex: none;
-}
-.o-dl-head .dd-muted {
-  margin-left: auto;
-}
-.o-dl-close {
-  flex: none;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  font-size: 16px;
-  line-height: 1;
-  cursor: pointer;
-  opacity: 0.55;
-}
-.o-dl-close:hover {
-  opacity: 1;
-}
-.o-dl-bar {
-  height: 6px;
-  margin-bottom: 8px;
-  border-radius: 999px;
-  background: rgba(128, 128, 128, 0.18);
-  overflow: hidden;
-}
-.o-dl-bar i {
-  display: block;
-  height: 100%;
-  background: #18a058;
-  transition: width 0.3s ease;
-}
-.o-dl-line {
-  line-height: 1.7;
-}
-.o-dl-error {
-  margin-top: 4px;
-  color: #d03050;
-  line-height: 1.6;
 }
 </style>

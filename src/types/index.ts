@@ -203,18 +203,10 @@ export interface AiProvider {
   keyHint?: string;
 }
 
-/** 哪些功能走 AI。默认全关。 */
-export interface AiUsage {
-  coverGeneration: boolean;
-  titleRewrite: boolean;
-  subtitleCloud: boolean;
-}
-
 export interface AiConfigView {
   providers: AiProvider[];
   /** 当前启用哪一个；空串表示都没启用 */
   active: string;
-  usage: AiUsage;
   warnings: string[];
 }
 
@@ -485,6 +477,26 @@ export interface CloudTranscribeReport {
 export interface CloudTestResult {
   ok: boolean;
   endpoint: string;
+  detail: string;
+}
+
+// ---------------- 完成通知（邮件） ----------------
+
+/** 前端能看到的邮件配置：**永远不含完整授权码**；没有开关，填全就发 */
+export interface EmailConfigView {
+  host: string;
+  port: number;
+  username: string;
+  /** 实际收件人；空串表示发给自己 */
+  to: string;
+  hasPassword: boolean;
+  /** 打码后的授权码 */
+  passwordHint: string;
+  warnings: string[];
+}
+
+export interface EmailTestResult {
+  ok: boolean;
   detail: string;
 }
 
@@ -895,7 +907,7 @@ export interface FanqiePreparedVideo {
   path: string;
   /** 平台流的清晰度，例如 480p */
   quality: string;
-  /** 转码后的编码，固定 h264 */
+  /** h264：可直接播放；source：平台原编码（下载快速模式的产物，解码仍靠 ffmpeg） */
   codec: string;
   durationSec: number;
   /** app：本次下载解密；cache：命中本地缓存 */
@@ -945,7 +957,7 @@ export interface DownloadedDrama {
 export interface FanqieDownloadProgress {
   seriesId: string;
   title: string;
-  /** 当前第几集（按下载顺序） */
+  /** 已处理完的集数（并发下载时完成顺序不固定，用它算进度才单调） */
   index: number;
   /** 集号 */
   episodeIndex: number;

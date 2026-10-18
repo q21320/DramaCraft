@@ -1,27 +1,30 @@
-//! AI 服务配置：一页管住所有外部服务（Key、Base URL、模型、用途开关）。
+//! AI 服务配置：一页管住所有外部服务（Key、Base URL、模型）。
 //!
 //! ## 为什么单独一层
 //!
 //! 原软件把「火山 API」做成独立一页：连接配置（Key / Base URL / 语言模型 /
-//! 视觉生图）+ 用途开关（封面生成 / 工程图 AI 辅助）。这是对的 ——
-//! 把 Key 散在各个功能页里，用户根本不知道自己配了哪些、哪些在用。
+//! 视觉生图）。这是对的 —— 把 Key 散在各个功能页里，用户根本不知道
+//! 自己配了哪些、哪些在用。
 //!
 //! ## 两条硬规矩
 //!
 //! 1. **API Key 永远不发给前端**。前端只拿到 `keyHint`（打码后的样子），
 //!    保存时留空表示"不改动"。这样 Key 不会出现在界面、日志、截图里。
-//! 2. **用不用 AI 由用户显式点头**。配了 Key 不等于要用 ——
-//!    会产生费用，产出还属于 AI 生成内容（有标识义务）。
-//!    所以 [`AiUsage`] 是显式开关，默认全关。
+//! 2. **配好就能用，不再额外设开关**。服务商启用 + 有 Key + 有 Base URL，
+//!    需要 AI 的功能就直接走 AI；没配就退回本地处理。
+//!    默认选中火山方舟 —— 它是内置预设里唯一不用改 Base URL 就能用的。
 
 use crate::error::{AppError, AppResult};
-use crate::models::{AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage};
+use crate::models::{AiConfigView, AiProvider, AiProviderView, AiTestResult};
 use rusqlite::{params, Connection};
 use std::time::{Duration, Instant};
 
 pub const SETTING_PROVIDERS: &str = "ai.providers";
 pub const SETTING_ACTIVE: &str = "ai.active";
-pub const SETTING_USAGE: &str = "ai.usage";
+
+/// 新用户默认用哪个服务商。火山方舟的 Base URL 与模型名都是现成的，
+/// 用户只要贴一个 Key 就能跑；其余两家要么要改地址，要么模型要自己找。
+pub const DEFAULT_ACTIVE: &str = "ark";
 
 /// 内置服务商预设。用户换个 Key 就能用，不用去翻文档抄 Base URL。
 pub const PRESETS: [(&str, &str, &str, &str, &str); 3] = [
@@ -48,13 +51,16 @@ fn preset(id: &str) -> Option<(&'static str, &'static str, &'static str, &'stati
 }
 
 /// 全部预设，按内置顺序。
+///
+/// 默认只把火山方舟勾成「启用」并设为当前使用 —— 另外两家是备选，
+/// 用户真要用时再自己勾（避免出现「当前使用」挂着一个没启用的服务商）。
 pub fn default_providers() -> Vec<AiProvider> {
     PRESETS
         .iter()
         .map(|&(id, label, base, text, image)| AiProvider {
             id: id.to_string(),
             label: label.to_string(),
-            enabled: false,
+            enabled: id == DEFAULT_ACTIVE,
             base_url: base.to_string(),
             text_model: text.to_string(),
             image_model: image.to_string(),
@@ -115,19 +121,13 @@ pub fn save_providers(conn: &Connection, providers: &[AiProvider]) -> AppResult<
     put_setting(conn, SETTING_PROVIDERS, &serde_json::to_string(providers)?)
 }
 
-pub fn load_usage(conn: &Connection) -> AppResult<AiUsage> {
-    match get_setting(conn, SETTING_USAGE)? {
-        Some(raw) => Ok(serde_json::from_str(&raw).unwrap_or_default()),
-        None => Ok(AiUsage::default()),
-    }
-}
-
-pub fn save_usage(conn: &Connection, usage: &AiUsage) -> AppResult<()> {
-    put_setting(conn, SETTING_USAGE, &serde_json::to_string(usage)?)
-}
-
 pub fn load_active(conn: &Connection) -> AppResult<String> {
-    Ok(get_setting(conn, SETTING_ACTIVE)?.unwrap_or_default())
+    // 没存过 = 新用户，默认火山方舟；
+    // 存过空串 = 用户主动选了「不用 AI」，要尊重，不能替他改回去。
+    Ok(match get_setting(conn, SETTING_ACTIVE)? {
+        Some(v) => v,
+        None => DEFAULT_ACTIVE.to_string(),
+    })
 }
 
 pub fn save_active(conn: &Connection, id: &str) -> AppResult<()> {
@@ -178,18 +178,13 @@ fn to_view(p: &AiProvider) -> AiProviderView {
 /// 组装给界面看的配置，并顺手挑出值得提醒的地方。
 pub fn view(conn: &Connection) -> AppResult<AiConfigView> {
     let providers = load_providers(conn)?;
-    let usage = load_usage(conn)?;
     let active = load_active(conn)?;
 
     let mut warnings = Vec::new();
     let active_provider = providers.iter().find(|p| p.id == active);
 
     if active.is_empty() {
-        if usage.cover_generation || usage.title_rewrite {
-            warnings.push(
-                "开了 AI 用途但没选服务商 —— 相关功能会退回本地处理，或直接跳过".into(),
-            );
-        }
+        warnings.push("没选服务商 —— 需要 AI 的功能会退回本地处理，或直接跳过".into());
     } else if let Some(p) = active_provider {
         if !p.enabled {
             warnings.push(format!("当前服务商「{}」没有启用", p.label));
@@ -200,10 +195,10 @@ pub fn view(conn: &Connection) -> AppResult<AiConfigView> {
         if normalize_base_url(&p.base_url).is_empty() {
             warnings.push(format!("「{}」还没填 Base URL", p.label));
         }
-        if usage.cover_generation && p.image_model.trim().is_empty() {
-            warnings.push(format!("「{}」没填生图模型，封面生成用不了", p.label));
+        if p.image_model.trim().is_empty() {
+            warnings.push(format!("「{}」没填生图模型，封面生成会走本地合成", p.label));
         }
-        if usage.title_rewrite && p.text_model.trim().is_empty() {
+        if p.text_model.trim().is_empty() {
             warnings.push(format!("「{}」没填语言模型，剧名简介改写用不了", p.label));
         }
     }
@@ -211,7 +206,6 @@ pub fn view(conn: &Connection) -> AppResult<AiConfigView> {
     Ok(AiConfigView {
         providers: providers.iter().map(to_view).collect(),
         active,
-        usage,
         warnings,
     })
 }
@@ -224,7 +218,6 @@ pub fn apply_view(
     conn: &Connection,
     providers: &[AiProvider],
     active: &str,
-    usage: &AiUsage,
 ) -> AppResult<()> {
     let mut existing = load_providers(conn)?;
     for incoming in providers {
@@ -255,7 +248,6 @@ pub fn apply_view(
     }
     save_providers(conn, &existing)?;
     save_active(conn, active.trim())?;
-    save_usage(conn, usage)?;
     Ok(())
 }
 
@@ -1325,16 +1317,20 @@ mod tests {
         // 预设要照抄原软件里那两个模型名，用户换 Key 就能用
         assert!(ark.base_url.contains("ark.cn-beijing.volces.com"));
         assert!(ark.image_model.contains("seedream"));
-        // 默认全部关闭：配了不代表要用
-        assert!(ps.iter().all(|p| !p.enabled));
+        // 默认勾上火山方舟（新用户填个 Key 就能用），其余两家保持关闭
+        assert!(ark.enabled, "火山方舟应当默认启用");
+        assert!(ps.iter().filter(|p| p.id != "ark").all(|p| !p.enabled));
         assert!(ps.iter().all(|p| p.api_key.is_empty()));
     }
 
     #[test]
-    fn usage_defaults_to_all_off() {
-        // 用 AI 会产生费用、产出还带标识义务，默认必须全关
-        let u = AiUsage::default();
-        assert!(!u.cover_generation && !u.title_rewrite && !u.subtitle_cloud);
+    fn new_install_defaults_to_ark_but_explicit_none_is_respected() {
+        let c = conn();
+        // 没存过 → 默认火山方舟
+        assert_eq!(load_active(&c).unwrap(), "ark");
+        // 用户主动选了「不用」→ 空串要原样返回
+        save_active(&c, "").unwrap();
+        assert_eq!(load_active(&c).unwrap(), "");
     }
 
     #[test]
@@ -1369,7 +1365,7 @@ mod tests {
         let mut incoming = default_providers();
         incoming[0].enabled = true;
         incoming[0].base_url = "https://ark.cn-beijing.volces.com/api/v3".into();
-        apply_view(&c, &incoming, "ark", &AiUsage::default()).unwrap();
+        apply_view(&c, &incoming, "ark").unwrap();
 
         let after = load_providers(&c).unwrap();
         assert_eq!(
@@ -1389,7 +1385,7 @@ mod tests {
         // 界面把打码值原样提交回来（用户没动那个输入框）
         let mut incoming = default_providers();
         incoming[0].api_key = "ark-****alue".into();
-        apply_view(&c, &incoming, "ark", &AiUsage::default()).unwrap();
+        apply_view(&c, &incoming, "ark").unwrap();
 
         let after = load_providers(&c).unwrap();
         assert_eq!(after[0].api_key, "ark-realsecret-value");
@@ -1408,19 +1404,11 @@ mod tests {
     #[test]
     fn warnings_point_out_incomplete_setup() {
         let c = conn();
-        // 选了服务商、开了生图用途，但没 Key 没模型
+        // 选了服务商，但没 Key、没 Base URL、没生图模型
         let mut ps = default_providers();
         ps[2].image_model = String::new();
         save_providers(&c, &ps).unwrap();
         save_active(&c, "custom").unwrap();
-        save_usage(
-            &c,
-            &AiUsage {
-                cover_generation: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
 
         let v = view(&c).unwrap();
         assert!(v.warnings.iter().any(|w| w.contains("API Key")), "{:?}", v.warnings);

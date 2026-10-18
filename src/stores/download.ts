@@ -30,11 +30,11 @@ let unlisten: UnlistenFn | null = null;
  *
  * - 流程不依赖页面，切页面下载照跑；
  * - 进度事件由 store 监听，回来直接看到当前值；
- * - 顶部导航也能显示「下载中 x/y」。
+ * - 进度浮层挂在 MainLayout 上（`DownloadPanel`），在哪个页面都看得见。
  */
 export const useDownloadStore = defineStore("download", {
   state: () => ({
-    /** 面板是否可见（下载结束也保留，直到用户收起） */
+    /** 面板是否可见：下载中一直显示；整批成功几秒后自动收起，失败时保留等用户关 */
     active: false,
     /** 流程是否还在跑 */
     running: false,
@@ -45,6 +45,9 @@ export const useDownloadStore = defineStore("download", {
     episodes: 0,
     done: 0,
     failed: 0,
+    /** 当前这部剧开始前已完成的集数 / 失败数：进度事件里的计数是单部剧的，加上这个才是总数 */
+    doneBase: 0,
+    failedBase: 0,
     message: "",
     root: "",
     error: "",
@@ -84,6 +87,8 @@ export const useDownloadStore = defineStore("download", {
       this.episodes = 0;
       this.done = 0;
       this.failed = 0;
+      this.doneBase = 0;
+      this.failedBase = 0;
       this.message = "正在准备下载目录…";
 
       // 监听跟着 store 走：页面卸载不会把它带走
@@ -99,7 +104,8 @@ export const useDownloadStore = defineStore("download", {
           this.episode = p.index;
           this.episodes = p.total;
           this.message = p.message;
-          this.failed = Math.max(this.failed, p.failed);
+          this.done = this.doneBase + p.downloaded + p.skipped;
+          this.failed = this.failedBase + p.failed;
         });
       } catch {
         // 监听挂了不影响下载本身，最终结果仍会回来
@@ -127,6 +133,10 @@ export const useDownloadStore = defineStore("download", {
         const landed: string[] = [];
         for (let i = 0; i < list.length; i++) {
           const v = list[i];
+          // 进度事件里的 downloaded/skipped/failed 只算当前这部剧，
+          // 记下开跑前的总数，面板上的「已完成」才是跨剧累计值。
+          this.doneBase = this.done;
+          this.failedBase = this.failed;
           this.seriesIndex = i;
           this.title = v.title;
           this.episode = 0;
@@ -138,7 +148,7 @@ export const useDownloadStore = defineStore("download", {
             .filter((e) => !!e.vid)
             .map((e) => ({ vid: e.vid, index: e.index }));
           if (episodes.length === 0) {
-            this.failed += 1;
+            this.failed = this.failedBase + 1;
             this.message = `《${v.title}》没有可下载的分集`;
             continue;
           }
@@ -155,8 +165,8 @@ export const useDownloadStore = defineStore("download", {
             },
             root,
           );
-          this.done += report.downloaded + report.skipped;
-          this.failed += report.failed.length;
+          this.done = this.doneBase + report.downloaded + report.skipped;
+          this.failed = this.failedBase + report.failed.length;
           landed.push(report.title);
           this.message = report.failed.length
             ? `《${report.title}》有 ${report.failed.length} 集失败：${report.failed[0]}`
@@ -177,7 +187,7 @@ export const useDownloadStore = defineStore("download", {
           return;
         }
 
-        this.message = "下载完成，正在打开流水线…";
+        this.message = "下载完成，正在打开整剧处理…";
         onDone?.(root, landed);
       } catch (e) {
         this.message = "下载中断";
@@ -188,7 +198,17 @@ export const useDownloadStore = defineStore("download", {
           unlisten();
           unlisten = null;
         }
+        // 用户要的「处理完就隐藏」：整批成功后面板自己收起，
+        // 留几秒把「下载完成」看清；有失败/错误时留着，得让人看到原因
+        if (!this.error && this.failed === 0) this.hideLater();
       }
+    },
+
+    /** 延迟收起面板。定时器到点时会重新确认状态 —— 这中间可能又开了一批。 */
+    hideLater(delay = 3000) {
+      window.setTimeout(() => {
+        if (!this.running && !this.error && this.failed === 0) this.active = false;
+      }, delay);
     },
 
     /** 收起面板：下载中不收，否则用户又看不到进度了。 */

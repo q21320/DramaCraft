@@ -6,8 +6,9 @@ use crate::models::{
     AppInfo, AsrOutcome, AsrRequest, Asset, AssetApplyReport, AssetImportReport, AssetKindOption,
     AssetSummary, CloudConfigView, CloudTestResult, CloudTranscribeReport, CostDocRequest, Cue,
     DiscoveredAsset, DocxReport, EpisodeBoundary, EpisodeDetection, ExportOptions, ExportOutcome,
-    AiConfigView, AiProvider, AiProviderView, AiTestResult, AiUsage, CostReportRow, DedupReport,
-    DesubtitleReport, RewriteOutcome, StoryboardReport, CoverReport, CoverRequest, HeaderLabel,
+    AiConfigView, AiProvider, AiProviderView, AiTestResult, CostReportRow, DedupReport,
+    DesubtitleReport, RewriteOutcome, StoryboardReport, CoverReport, CoverRequest, EmailConfigView,
+    EmailTestResult, HeaderLabel,
     FanqieCategoryPage, FanqieDownloadReport, FanqieDownloadRequest, FanqiePlayInfo,
     FanqiePreparedVideo, FanqieSelectItems, FanqieSelectorRow, FanqieSeriesDetail, FanqieVideoInfo,
     IpDocRequest, Job, Media, MediaProbe, OcrFrame, OcrOptions, OcrReport, PipelineRun,
@@ -18,8 +19,8 @@ use crate::models::{
     TransformOptions, TransformReport, VerifyItem, VerifyReport,
 };
 use crate::{
-    ai, asr, asset, cloud, cover, docx, export, fanqie, jy, media, ocr, pipeline, proc, proof, publish,
-    queue, series, subtitle, tools, transform, verify, AppState,
+    ai, asr, asset, cloud, cover, docx, export, fanqie, jy, mail, media, ocr, pipeline, proc, proof,
+    publish, queue, series, subtitle, tools, transform, verify, AppState,
 };
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -426,20 +427,34 @@ pub fn export_srt(
 // ---------------- ASR ----------------
 
 /// worker 脚本位置：打包后在资源目录，开发时在 `src-tauri/resources`。
-fn worker_script(app: &tauri::AppHandle, file_name: &str) -> PathBuf {
-    if let Ok(dir) = app.path().resource_dir() {
-        for candidate in [
-            dir.join("resources").join(file_name),
-            dir.join(file_name),
-        ] {
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
+///
+/// **业务代码不要再自己拼 `CARGO_MANIFEST_DIR`** —— 那是编译机的源码路径，
+/// 装到别的机器上根本不存在。分镜证明就栽过：脚本明明已经打进安装包，
+/// 代码却只认源码目录，于是报「找不到 worker 脚本 E:\...\src-tauri\resources\…」。
+pub(crate) fn worker_script(app: &tauri::AppHandle, file_name: &str) -> PathBuf {
+    // 打包器可能保留 `resources/` 这一层，也可能不保留，两个候选都试。
+    let in_resources: Vec<PathBuf> = app
+        .path()
+        .resource_dir()
+        .map(|dir| {
+            vec![
+                dir.join("resources").join(file_name),
+                dir.join(file_name),
+            ]
+        })
+        .unwrap_or_default();
+    if let Some(hit) = in_resources.iter().find(|p| p.is_file()) {
+        return hit.clone();
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("resources")
-        .join(file_name)
+        .join(file_name);
+    if dev.is_file() {
+        return dev;
+    }
+    // 两处都没有：优先报资源目录里的期望位置，好判断是打包漏了还是装错了，
+    // 而不是甩一个编译机的源码路径出去。
+    in_resources.into_iter().next().unwrap_or(dev)
 }
 
 /// 把成本报告渲染成 JPG（照真实软件的产出：`zhengming/<剧名>_成本配置比例情况报告.jpg`）。
@@ -2293,7 +2308,8 @@ pub async fn pipeline_start(
     } else {
         PathBuf::from(out_dir.trim())
     };
-    let slice_ms = ((slice_seconds.unwrap_or(40.0)).clamp(3.0, 600.0) * 1000.0).round() as i64;
+    // 默认切片时长 10 秒：前端没传时以后端为准，两边别各写一个数。
+    let slice_ms = ((slice_seconds.unwrap_or(10.0)).clamp(3.0, 600.0) * 1000.0).round() as i64;
     let asr_model = model.unwrap_or_default();
     // 点名的剧（从下载页跳过来时就是刚下的那一两部）。空 = 整目录全跑。
     let only: Vec<String> = only.unwrap_or_default();
@@ -2338,7 +2354,7 @@ pub async fn pipeline_start(
                 log_line(
                     &state,
                     "warn",
-                    "勾了「AI 改剧名简介」但没有可用的 AI 服务（或用途开关没开），本次跳过改剧名",
+                    "勾了「AI 改剧名简介」但没有可用的 AI 服务（服务商未启用 / 缺 Key / 缺 Base URL），本次跳过改剧名",
                 );
             }
             Some(p) => {
@@ -2444,7 +2460,7 @@ pub async fn pipeline_start(
     if !outcome.skipped.is_empty() {
         // 读不出来的文件不能悄悄咽掉 —— 但要让它可查，而不是弹一堆错误
         eprintln!(
-            "DramaDist: 流水线有 {} 个文件没能导入：{}",
+            "DramaDist: 整剧处理有 {} 个文件没能导入：{}",
             outcome.skipped.len(),
             outcome.skipped.join("；")
         );
@@ -2460,7 +2476,7 @@ pub async fn pipeline_start(
     }
 
     db::get_pipeline_run(&conn, outcome.run_id)?
-        .ok_or_else(|| AppError::Msg("流水线建好了却读不出来".into()))
+        .ok_or_else(|| AppError::Msg("整剧处理建好了却读不出来".into()))
 }
 
 #[tauri::command]
@@ -2572,29 +2588,43 @@ pub fn save_ai_config(
     state: tauri::State<'_, AppState>,
     providers: Vec<AiProvider>,
     active: String,
-    usage: AiUsage,
 ) -> AppResult<AiConfigView> {
     ai::validate(&providers, &active)?;
     let conn = lock_db(&state)?;
-    ai::apply_view(&conn, &providers, &active, &usage)?;
+    ai::apply_view(&conn, &providers, &active)?;
     ai::view(&conn)
 }
 
 /// 测试某个服务商通不通。
 ///
 /// **只做一次廉价的探测请求，不触发任何生成，不产生费用。**
+///
+/// `base_url` / `api_key` 是界面上“刚填、还没点保存”的值：
+/// 不传或传空 Key 时用库里已存的，传入时优先用界面上的 ——
+/// 否则用户刚填完 Key 就点测试，测的却是旧 Key，会误以为 Key 不对。
 #[tauri::command]
 pub async fn ai_test(
     state: tauri::State<'_, AppState>,
     provider_id: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
 ) -> AppResult<AiTestResult> {
-    let provider = {
+    let mut provider = {
         let conn = lock_db(&state)?;
         ai::load_providers(&conn)?
             .into_iter()
             .find(|p| p.id == provider_id)
             .ok_or_else(|| AppError::Msg(format!("没有这个服务商：{provider_id}")))?
     };
+    if let Some(base) = base_url {
+        provider.base_url = base;
+    }
+    if let Some(key) = api_key {
+        let key = key.trim();
+        if !key.is_empty() {
+            provider.api_key = key.to_string();
+        }
+    }
     Ok(ai::test_provider(&provider).await)
 }
 
@@ -2635,19 +2665,32 @@ fn log_line(state: &tauri::State<'_, AppState>, level: &str, message: &str) {
 ///
 /// 直接用 `GET {base}/models`。为什么值得做：用户填的模型名常常是错的
 /// （写 `Doubao-Seedream-5.0-flash`，真名是 `doubao-seedream-5-0-260128`），
-/// 或者账号根本没开通 —— 与其让他一次次试错，不如把列表摆出来让他选。
+/// 或者账号根本没开通。
+///
+/// 同样接收界面上还没保存的 `base_url` / `api_key`。
 #[tauri::command]
 pub async fn ai_list_models(
     state: tauri::State<'_, AppState>,
     provider_id: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
 ) -> AppResult<Vec<ai::ModelInfo>> {
-    let provider = {
+    let mut provider = {
         let conn = lock_db(&state)?;
         ai::load_providers(&conn)?
             .into_iter()
             .find(|p| p.id == provider_id)
             .ok_or_else(|| AppError::Msg(format!("没有这个服务商：{provider_id}")))?
     };
+    if let Some(base) = base_url {
+        provider.base_url = base;
+    }
+    if let Some(key) = api_key {
+        let key = key.trim();
+        if !key.is_empty() {
+            provider.api_key = key.to_string();
+        }
+    }
     ai::list_models(&provider).await
 }
 // ---------------- AI 改写剧名 / 简介 ----------------
@@ -2886,6 +2929,7 @@ fn mmss(sec: f64) -> String {
 
 #[tauri::command]
 pub async fn build_storyboard(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     media_ids: Vec<i64>,
     out_dir: String,
@@ -3182,9 +3226,9 @@ pub async fn build_storyboard(
             "total_pages": total_pages,
             "shots": page_shots,
         });
-        let worker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join("storyboard_render.py");
+        // 走统一的资源目录解析：安装包里脚本在 `<安装目录>/resources/` 下，
+        // 只认源码路径的话装到别人机器上必报「找不到 worker 脚本」。
+        let worker = worker_script(&app, "storyboard_render.py");
         let value = crate::proc::run_json_worker(
             &python,
             &worker,
@@ -3230,7 +3274,7 @@ pub async fn build_storyboard(
 
 /// 生成封面。
 ///
-/// 两条路自动选：配好 AI 且开了「封面生成」就走**图生图**（能擦掉原封面
+/// 两条路自动选：配好 AI 且填了生图模型就走**图生图**（能擦掉原封面
 /// 上的旧剧名）；否则走**本地合成**（用标题条盖住旧字 + 写新剧名）。
 /// 结果里会说明实际用了哪条 —— 别让用户以为一定是 AI 出的。
 #[tauri::command]
@@ -3238,12 +3282,11 @@ pub async fn render_cover(
     state: tauri::State<'_, AppState>,
     req: CoverRequest,
 ) -> AppResult<CoverReport> {
-    let (configured, provider, use_ai) = {
+    let (configured, provider) = {
         let conn = lock_db(&state)?;
         let configured = lock_tools(&state)?.clone();
-        let usage = ai::load_usage(&conn)?;
         let provider = ai::usable_provider(&conn)?;
-        (configured, provider, usage.cover_generation)
+        (configured, provider)
     };
     let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
 
@@ -3256,8 +3299,11 @@ pub async fn render_cover(
     let mut notes: Vec<String> = Vec::new();
     let engine;
 
-    match (use_ai, provider) {
-        (true, Some(p)) => {
+    // 没填生图模型就只能本地合成 —— 别发一个必然失败的请求出去。
+    let has_provider = provider.is_some();
+    let ai_provider = provider.filter(|p| !p.image_model.trim().is_empty());
+    match ai_provider {
+        Some(p) => {
             let poster = PathBuf::from(req.poster.trim());
             let bytes =
                 ai::generate_cover_image(&p, &poster, &req.title, req.width, req.height).await?;
@@ -3267,18 +3313,14 @@ pub async fn render_cover(
             // 这一步很重要：AI 生成的封面属于 AI 生成内容，有标识义务
             notes.push("这是 AI 生成的封面 —— 按《人工智能生成合成内容标识办法》应当标识".into());
         }
-        (true, None) => {
-            notes.push(
-                "开了「封面生成」但 AI 服务没配全（Key / Base URL / 生图模型缺一个），已退回本地合成"
-                    .into(),
-            );
+        None => {
             cover::render(&ffmpeg, &req, &out)?;
             engine = "local".to_string();
-        }
-        (false, _) => {
-            cover::render(&ffmpeg, &req, &out)?;
-            engine = "local".to_string();
-            notes.push("本地合成：用标题条盖住原封面上的旧字，不擦除、不生成".into());
+            if has_provider {
+                notes.push("当前服务商没填生图模型，已退回本地合成".into());
+            } else {
+                notes.push("本地合成：用标题条盖住原封面上的旧字，不擦除、不生成".into());
+            }
         }
     }
 
@@ -3459,6 +3501,66 @@ pub fn enqueue_batch(
     Ok(count)
 }
 
+// ---------------- 完成通知（邮件） ----------------
+
+#[tauri::command]
+pub fn email_config(state: tauri::State<'_, AppState>) -> AppResult<EmailConfigView> {
+    let conn = lock_db(&state)?;
+    let cfg = mail::load_config(&conn)?;
+    Ok(mail::view(&cfg))
+}
+
+/// 保存邮件通知配置。`password` 传 `null` 表示不改动已存的授权码。
+/// 没有单独的开关：填全了队列结束就发，没填全就不发。
+#[tauri::command]
+pub fn save_email_config(
+    state: tauri::State<'_, AppState>,
+    host: String,
+    port: u16,
+    username: String,
+    password: Option<String>,
+    to: String,
+) -> AppResult<EmailConfigView> {
+    let conn = lock_db(&state)?;
+    let cfg = mail::save_config(
+        &conn,
+        &host,
+        port,
+        &username,
+        password.as_deref(),
+        &to,
+    )?;
+    Ok(mail::view(&cfg))
+}
+
+/// 测试发信。授权码留空就用已保存的 —— 和 AI 的「测试连接」一个语义：
+/// 刚填、还没保存的值也能先试，不用先存一遍。
+#[tauri::command]
+pub async fn email_test(
+    state: tauri::State<'_, AppState>,
+    host: String,
+    port: u16,
+    username: String,
+    password: Option<String>,
+    to: String,
+) -> AppResult<EmailTestResult> {
+    let mut cfg = {
+        let conn = lock_db(&state)?;
+        mail::load_config(&conn)?
+    };
+    cfg.host = host;
+    cfg.port = if port == 0 { mail::DEFAULT_PORT } else { port };
+    cfg.username = username;
+    cfg.to = to;
+    if let Some(pw) = password {
+        if !pw.trim().is_empty() {
+            cfg.password = pw;
+        }
+    }
+    // 测试不看开关：没开启也能先验证配置
+    Ok(mail::test_result(&cfg).await)
+}
+
 /// 启动队列。后台跑、立即返回，进度通过 `queue:progress` 事件推送。
 #[tauri::command]
 pub fn start_queue(app: tauri::AppHandle, max_jobs: Option<i64>) -> AppResult<()> {
@@ -3482,6 +3584,14 @@ pub fn start_queue(app: tauri::AppHandle, max_jobs: Option<i64>) -> AppResult<()
         match queue::run(handle.clone(), max_jobs).await {
             Ok(report) => {
                 let _ = handle.emit("queue:finished", &report);
+                // 邮件通知独立跑：发信慢、还可能失败，不能拖住「队列结束」这个信号。
+                // 没开 / 没配全 / 一个任务都没跑时 send_completion 会静默跳过。
+                let mail_handle = handle.clone();
+                let summary = report.clone();
+                tauri::async_runtime::spawn(async move {
+                    let result = mail::send_completion(&mail_handle, &summary).await;
+                    mail::log_result(&mail_handle, &result);
+                });
             }
             Err(e) => {
                 let _ = handle.emit(
@@ -3926,6 +4036,7 @@ pub async fn fanqie_play_url(series_id: String, vid: String) -> AppResult<Fanqie
 
 /// 下载并解密 App 流，转成 H.264 落到本地缓存，返回可直接播放的文件路径。
 /// 这是覆盖全部集数的主链路；解不开时前端再退回官网直链。
+/// 在线播放要的是「马上能播」，所以这里固定转码，不复用下载阶段的快速模式。
 #[tauri::command]
 pub async fn fanqie_prepare_video(
     app: tauri::AppHandle,
@@ -3937,7 +4048,7 @@ pub async fn fanqie_prepare_video(
         let configured = lock_tools(&state)?.ffmpeg.clone();
         tools::resolve(&configured, "ffmpeg")
     };
-    fanqie::prepare_video(&app, &vid, quality.as_deref(), ffmpeg).await
+    fanqie::prepare_video(&app, &vid, quality.as_deref(), ffmpeg, false).await
 }
 
 /// App 播放接口给的元信息：时长、全部清晰度、是否加密。
@@ -4066,7 +4177,11 @@ pub fn fanqie_downloaded(
     Ok(out)
 }
 
-/// 把一部剧的全部分集下载到流水线源目录（解密 + 转 H.264）。
+/// 把一部剧的全部分集下载到流水线源目录。
+///
+/// `transcode`：前端一般不传。不传 = 快速模式，只解密不转码（原编码落盘），
+/// 把唯一的一次 H.264 编码留给整剧处理的去重。传 true 才逐集转 H.264，
+/// 用于「不跑去重、只要通用播放格式」的场景。
 #[tauri::command]
 pub async fn fanqie_download_series(
     app: tauri::AppHandle,
@@ -4074,6 +4189,7 @@ pub async fn fanqie_download_series(
     req: FanqieDownloadRequest,
     out_root: String,
     quality: Option<String>,
+    transcode: Option<bool>,
 ) -> AppResult<FanqieDownloadReport> {
     let root = PathBuf::from(out_root.trim());
     if !root.is_dir() {
@@ -4086,7 +4202,16 @@ pub async fn fanqie_download_series(
         let configured = lock_tools(&state)?.ffmpeg.clone();
         tools::resolve(&configured, "ffmpeg")
     };
-    let report = fanqie::download_series(&app, &req, &root, quality.as_deref(), ffmpeg).await?;
+    let copy_video = !transcode.unwrap_or(false);
+    let report = fanqie::download_series(
+        &app,
+        &req,
+        &root,
+        quality.as_deref(),
+        ffmpeg,
+        copy_video,
+    )
+    .await?;
     // 记下 seriesId → 目录。列表页靠它标「已下载」—— 拿剧名当键，
     // 接口标题一变就对不上，用户会以为没下过。
     if report.downloaded + report.skipped > 0 {

@@ -266,7 +266,7 @@ onUnmounted(() => {
       </n-space>
     </div>
     <div class="dd-card-desc">
-      跑流水线、下载原片时这里都会一步步写下来：扫到什么、保存到哪、第几集下完了、哪一步成没成。
+      跑整剧处理、下载原片时这里都会一步步写下来：扫到什么、保存到哪、第几集下完了、哪一步成没成。
       <b>卡住的时候先看这里</b> —— 状态只是结果，日志才有过程。
       <br />
       <b>带播放图标的行可以直接点开看</b>（产出、下好的原片都可以），不用去别处找。
@@ -280,7 +280,7 @@ onUnmounted(() => {
 
     <div ref="boxRef" class="dd-logbox">
       <div v-if="logs.length === 0" class="dd-muted" style="padding: 12px">
-        还没有日志。跑一次流水线或下载一部剧就有了。
+        还没有日志。跑一次整剧处理或下载一部剧就有了。
       </div>
       <div
         v-for="l in logs"

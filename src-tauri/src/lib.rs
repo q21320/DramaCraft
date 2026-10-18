@@ -16,6 +16,7 @@ mod error;
 mod export;
 mod fanqie;
 mod jy;
+mod mail;
 mod media;
 mod models;
 mod ocr;
@@ -246,6 +247,9 @@ pub fn run() {
             commands::save_cloud_config,
             commands::cloud_test,
             commands::cloud_transcribe,
+            commands::email_config,
+            commands::save_email_config,
+            commands::email_test,
             commands::proof_default_layout,
             commands::proof_load_layout,
             commands::proof_save_layout,

@@ -19,6 +19,8 @@ export interface NavItem {
   label: string;
   /** 页头副标题：这一页到底负责什么 */
   subtitle: string;
+  /** 菜单里不显示（路由保留，直链/旧书签仍能用） */
+  hidden?: boolean;
 }
 
 export interface NavGroup {
@@ -26,6 +28,8 @@ export interface NavGroup {
   title: string;
   /** 一句话说明这组什么时候用得上 */
   hint: string;
+  /** 整组不在菜单里显示 */
+  hidden?: boolean;
   items: NavItem[];
 }
 
@@ -41,7 +45,7 @@ export const videoNav: NavItem = {
 export const primaryNav: NavItem = {
   key: "pipeline",
   path: "/pipeline",
-  label: "流水线",
+  label: "整剧处理",
   subtitle: "指一个源目录，从头到尾把一批剧做完（一部做完再做下一部）",
 };
 
@@ -49,12 +53,16 @@ export const primaryNav: NavItem = {
  * 其余按用途分组，**默认全部收起**。
  *
  * 顺序按「从流水线出来之后最可能想干什么」排，不按实现顺序排。
+ *
+ * 用户确认「单步工具」「素材与证明」两组都用不上、任务队列也不用看 ——
+ * 整组/整项标记 `hidden`，菜单不再渲染；路由保留，页面本身不删。
  */
-export const navGroups: NavGroup[] = [
+const allNavGroups: NavGroup[] = [
   {
     key: "tools",
     title: "单步工具",
-    hint: "只想处理某一件小事时用（流水线里已经自动做了这些）",
+    hint: "只想处理某一件小事时用（整剧处理里已经自动做了这些）",
+    hidden: true,
     items: [
       {
         key: "slice",
@@ -104,6 +112,7 @@ export const navGroups: NavGroup[] = [
     key: "assets",
     title: "素材与证明",
     hint: "素材从哪来、要交的证明怎么出",
+    hidden: true,
     items: [
       {
         key: "library",
@@ -147,28 +156,39 @@ export const navGroups: NavGroup[] = [
         path: "/queue",
         label: "任务队列",
         subtitle: "把长任务排成一队顺序跑，关掉应用再打开会接着跑",
+        hidden: true,
       },
       {
         key: "ai",
         path: "/ai",
         label: "AI 服务",
-        subtitle: "API Key、接口地址、模型名，以及哪些功能走 AI",
+        subtitle: "API Key、接口地址、模型名与云端字幕",
       },
       {
         key: "settings",
         path: "/settings",
         label: "设置",
-        subtitle: "指定 ffmpeg / ffprobe / Python 路径，查看各组件可用性",
+        subtitle: "下载目录、成本报告落款（外部工具等归入高级设置）",
       },
     ],
   },
 ];
 
-/** 拍平后的全部条目，供「按路径查标题」用。 */
+/** 菜单实际渲染的分组：去掉 hidden 的组和项。 */
+export const navGroups: NavGroup[] = allNavGroups
+  .filter((g) => !g.hidden)
+  .map((g) => ({ ...g, items: g.items.filter((i) => !i.hidden) }));
+
+/**
+ * 拍平后的全部条目，供「按路径查标题」用。
+ *
+ * **用 allNavGroups 而不是 navGroups** —— 隐藏页的页头标题也要对，
+ * 否则直接打开 /queue 会顶着「流水线」的名字。
+ */
 export const navItems: NavItem[] = [
   videoNav,
   primaryNav,
-  ...navGroups.flatMap((g) => g.items),
+  ...allNavGroups.flatMap((g) => g.items),
 ];
 
 export function navByPath(path: string): NavItem | undefined {
@@ -178,5 +198,5 @@ export function navByPath(path: string): NavItem | undefined {
 
 /** 某个路径属于哪个分组（首页要按分组显示入口）。 */
 export function groupOf(path: string): NavGroup | undefined {
-  return navGroups.find((g) => g.items.some((i) => i.path === path));
+  return allNavGroups.find((g) => g.items.some((i) => i.path === path));
 }

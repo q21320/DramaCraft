@@ -60,7 +60,7 @@ const effectiveOutDir = computed(() => {
   const base = r.replace(/[\\/]+$/, "");
   return base + sep + "<剧名>" + sep + "二创";
 });
-const sliceSeconds = ref(40);
+const sliceSeconds = ref(10);
 const model = ref("small");
 
 /**
@@ -96,6 +96,20 @@ const labelPositions: { label: string; value: LabelPosition }[] = [
 ];
 
 const scan = ref<SourceScan | null>(null);
+/**
+ * 扫描结果默认只列前几部。
+ *
+ * 下载根里常坐着几十部旧剧，全展开会把页面拉得很长；默认收成 6 行，
+ * 需要时点「展开全部」。不用内部滚动 ——— 页面上已经只有一条滚动条，
+ * 再嵌一个反而更难滚。
+ */
+const SCAN_PREVIEW_ROWS = 6;
+const scanShowAll = ref(false);
+const scanRows = computed(() =>
+  scanShowAll.value
+    ? scan.value?.dramas ?? []
+    : (scan.value?.dramas ?? []).slice(0, SCAN_PREVIEW_ROWS),
+);
 /**
  * 从下载页跳过来时带的「刚下载的剧名」。
  *
@@ -216,6 +230,7 @@ async function doScan() {
   }
   scanning.value = true;
   scan.value = null;
+  scanShowAll.value = false;
   try {
     scan.value = await api.pipelineScan(root.value.trim());
     applyChosenFromScan();
@@ -458,6 +473,7 @@ onMounted(async () => {
   // （不然会把不在新目录里的剧名传给后端，直接报「没找到」）
   watch(root, () => {
     scan.value = null;
+    scanShowAll.value = false;
     chosen.value = [];
     fromDownload.value = [];
   });
@@ -487,7 +503,7 @@ onUnmounted(() => {
 
 <template>
   <div class="dd-card">
-    <div class="dd-card-title">流水线</div>
+    <div class="dd-card-title">整剧处理</div>
     <div class="dd-card-desc">
       指一个源目录，剩下的按顺序做完：
       <b>改剧名简介 → 整剧重组 → 整集去重 → AI 去字幕 → 视频切片 → 分镜证明 → 封面 → 成本报告</b>。
@@ -546,7 +562,7 @@ onUnmounted(() => {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="d in scan.dramas" :key="d.dir">
+          <tr v-for="d in scanRows" :key="d.dir">
             <td>
               <n-checkbox
                 :checked="chosen.includes(d.name)"
@@ -569,6 +585,18 @@ onUnmounted(() => {
           </tr>
         </tbody>
       </table>
+      <div
+        v-if="scan.dramas.length > SCAN_PREVIEW_ROWS"
+        class="dd-muted"
+        style="margin-top: 6px; display: flex; align-items: center; gap: 8px"
+      >
+        <span>
+          显示 {{ scanRows.length }} / {{ scan.dramas.length }} 部
+        </span>
+        <n-button text size="tiny" @click="scanShowAll = !scanShowAll">
+          {{ scanShowAll ? "收起" : `展开全部 ${scan.dramas.length} 部` }}
+        </n-button>
+      </div>
       <ul v-if="scan.warnings.length > 0" style="margin: 8px 0 0; padding-left: 18px">
         <li v-for="(w, i) in scan.warnings" :key="i" class="dd-wrap">{{ w }}</li>
       </ul>
@@ -660,14 +688,14 @@ onUnmounted(() => {
         :loading="starting"
         @click="start"
       >
-        {{ starting && willRewrite ? "正在调 AI 起新剧名…" : "开始流水线" }}
+        {{ starting && willRewrite ? "正在调 AI 起新剧名…" : "开始整剧处理" }}
       </n-button>
       <n-popconfirm v-else @positive-click="cancelRun(activeRunId!)">
         <template #trigger>
           <n-button size="small" type="warning" secondary>停止</n-button>
         </template>
         <!-- 要说清楚停下来意味着什么，不然用户不敢点 -->
-        停止后：已经跑完的会留着，还没跑的不再跑。想接着跑就再点一次「开始流水线」。
+        停止后：已经跑完的会留着，还没跑的不再跑。想接着跑就再点一次「开始整剧处理」。
       </n-popconfirm>
       <span v-if="willRewrite" class="dd-muted">
         会先调 AI 改简介、起新剧名（约十几秒），<b>再用新剧名建目录、排任务</b>；

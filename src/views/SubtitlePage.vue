@@ -156,7 +156,7 @@ async function runCloud() {
     return;
   }
   if (!store.cloud?.hasKey) {
-    message.warning("还没配置云端 API Key，请到「设置 → 云端字幕」填写");
+    message.warning("还没配置云端 API Key，请到「AI 服务 → 云端字幕」填写");
     return;
   }
   if (cues.value.length > 0 && !asrOverwrite.value) {

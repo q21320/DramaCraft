@@ -4,7 +4,6 @@ import type {
   AiProvider,
   AiModelInfo,
   AiTestResult,
-  AiUsage,
   AppInfo,
   AsrOutcome,
   Asset,
@@ -28,6 +27,8 @@ import type {
   DiscoveredAsset,
   DocxReport,
   DraftReport,
+  EmailConfigView,
+  EmailTestResult,
   EpisodeBoundary,
   EpisodeDetection,
   ExportOptions,
@@ -144,6 +145,31 @@ export const api = {
   cloudTest: () => call<CloudTestResult>("cloud_test"),
   cloudTranscribe: (mediaId: number, overwrite: boolean) =>
     call<CloudTranscribeReport>("cloud_transcribe", { mediaId, overwrite }),
+
+  // 完成通知（邮件）
+  emailConfig: () => call<EmailConfigView>("email_config"),
+  saveEmailConfig: (input: {
+    host: string;
+    port: number;
+    username: string;
+    password?: string | null;
+    to: string;
+  }) =>
+    call<EmailConfigView>("save_email_config", {
+      ...input,
+      password: input.password ?? null,
+    }),
+  emailTest: (input: {
+    host: string;
+    port: number;
+    username: string;
+    password?: string | null;
+    to: string;
+  }) =>
+    call<EmailTestResult>("email_test", {
+      ...input,
+      password: input.password ?? null,
+    }),
 
   // 证明材料
   proofDefaultLayout: () => call<ProofLayout>("proof_default_layout"),
@@ -354,13 +380,26 @@ export const api = {
 
   // AI 服务配置（Key 只存在本机，读回来的是打码值）
   aiConfig: () => call<AiConfigView>("ai_config"),
-  saveAiConfig: (providers: AiProvider[], active: string, usage: AiUsage) =>
-    call<AiConfigView>("save_ai_config", { providers, active, usage }),
-  /** 只发一次廉价探测，不触发生成、不产生费用 */
-  aiTest: (providerId: string) => call<AiTestResult>("ai_test", { providerId }),
+  saveAiConfig: (providers: AiProvider[], active: string) =>
+    call<AiConfigView>("save_ai_config", { providers, active }),
+  /**
+   * 只发一次廉价探测，不触发生成、不产生费用。
+   * baseUrl / apiKey 传界面上「还没保存」的值；Key 传空 = 用已保存的。
+   */
+  aiTest: (providerId: string, baseUrl?: string, apiKey?: string) =>
+    call<AiTestResult>("ai_test", {
+      providerId,
+      baseUrl: baseUrl ?? null,
+      apiKey: apiKey ?? null,
+    }),
   /** 把 Base URL / 模型恢复成内置预设；不动 Key */
   /** 列出账号能看到的模型（GET {base}/models）。名字写错/没开通都能在这里看出来。 */
-  aiListModels: (providerId: string) => call<AiModelInfo[]>("ai_list_models", { providerId }),
+  aiListModels: (providerId: string, baseUrl?: string, apiKey?: string) =>
+    call<AiModelInfo[]>("ai_list_models", {
+      providerId,
+      baseUrl: baseUrl ?? null,
+      apiKey: apiKey ?? null,
+    }),
 
   aiResetPreset: (providerId: string) => call<AiProvider>("ai_reset_preset", { providerId }),
 
@@ -400,15 +439,22 @@ export const api = {
   /** 查这些剧在下载目录里已经落了多少集（按 seriesId 匹配，没下过的不返回） */
   fanqieDownloaded: (items: { seriesId: string; title: string }[]) =>
     call<DownloadedDrama[]>("fanqie_downloaded", { items }),
-  /** 把一部剧的全部分集下载到下载根（解密 + 转 H.264） */
+  /**
+   * 把一部剧的全部分集下载到下载根。
+   *
+   * 默认只解密不转码（原编码落盘，几乎不占 CPU），唯一的一次编码留给
+   * 整剧处理的去重。传 `transcode: true` 才逐集转 H.264。
+   */
   fanqieDownloadSeries: (
     req: FanqieDownloadRequest,
     outRoot: string,
     quality?: string,
+    transcode?: boolean,
   ) =>
     call<FanqieDownloadReport>("fanqie_download_series", {
       req,
       outRoot,
       quality: quality ?? null,
+      transcode: transcode ?? null,
     }),
 };

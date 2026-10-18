@@ -92,9 +92,72 @@ table.dd-table td.dd-wrap {
   border-radius: var(--dd-radius);
 }
 
+/*
+ * 滚动条统一压细。
+ *
+ * Windows / WebView2 默认是 17px 的宽灰条：页面主滚动区、列表内滚动区、
+ * 横向表格叠在一起时，右侧会排出一片竖条。这里统一成 10px 半透明，
+ * 不抢内容的注意力；悬停时再加深一点。
+ */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.32);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(128, 128, 128, 0.52);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 .dd-empty {
   padding: 34px 0;
   text-align: center;
   color: var(--dd-muted);
   font-size: 13px;
+}
+
+/*
+ * 默认折叠的「高级设置」卡片。
+ *
+ * 用的原生 details：不引组件、默认合上，summary 就是卡片标题。
+ * 设置页把「装好基本不用动」的东西收在里面，页面一眼只剩常用项。
+ */
+details.dd-advanced > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+details.dd-advanced > summary::-webkit-details-marker {
+  display: none;
+}
+details.dd-advanced > summary::before {
+  content: "▸";
+  font-size: 12px;
+  color: var(--dd-muted);
+}
+details.dd-advanced[open] > summary::before {
+  content: "▾";
+}
+.dd-adv-body {
+  margin-top: 12px;
+}
+.dd-adv-sec + .dd-adv-sec {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(128, 128, 128, 0.18);
 }
