@@ -164,8 +164,11 @@ const EMAIL_HELP: Record<string, { url: string; hint: string }> = {
     hint: "QQ 邮箱：设置 → 账号与安全 → POP3/IMAP/SMTP 服务 → 开启 → 短信验证 → 得到 16 位授权码",
   },
   "163": {
-    url: "https://help.mail.163.com/",
-    hint: "网易邮箱：设置 → POP3/SMTP/IMAP → 开启 SMTP → 新增授权码",
+    // 实测能打开的精准页，标题就是「如何新增授权码」。
+    // 网易这个 code 是一长串哈希，看着像乱码，但这就是它的文章 ID ——
+    // 别嫌长，换短链反而会掉到帮助中心首页。
+    url: "https://help.mail.163.com/faqDetail.do?code=d7a5dc8471cd0c0e8b4b8f4f8e49998b374173cfe9171305fa1ce630d7f67ac286624f309a1a7089",
+    hint: "163 邮箱：设置 → POP3/SMTP/IMAP → 开启 SMTP 服务 → 新增授权码",
   },
   gmail: {
     url: "https://myaccount.google.com/apppasswords",
