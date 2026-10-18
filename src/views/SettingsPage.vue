@@ -155,8 +155,13 @@ const EMAIL_PRESETS = [
  */
 const EMAIL_HELP: Record<string, { url: string; hint: string }> = {
   qq: {
-    url: "https://service.mail.qq.com/cgi-bin/help?subtype=1&id=28&no=1001256",
-    hint: "QQ 邮箱：设置 → 账户 → 开启 IMAP/SMTP → 生成授权码",
+    // **这条链接是实测打开的**：标题就叫「如何开启 POP3/SMTP/IMAP
+    // 服务并获取授权码？」。之前用的是 `service.mail.qq.com` 那个老地址，
+    // 会重定向到帮助中心首页 —— 用户点进去还得自己翻。
+    url: "https://help.mail.qq.com/detail/0/1087",
+    // 新版 QQ 邮箱的入口是「账号与安全」，不是老版本的「账户」。
+    // 用户自己找都找不到，所以把四步写全。
+    hint: "QQ 邮箱：设置 → 账号与安全 → POP3/IMAP/SMTP 服务 → 开启 → 短信验证 → 得到 16 位授权码",
   },
   "163": {
     url: "https://help.mail.163.com/",
