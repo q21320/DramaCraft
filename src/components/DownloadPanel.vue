@@ -52,13 +52,18 @@ onMounted(() => void dl.restore());
         已处理 {{ dl.episode }} / {{ dl.episodes }} 集
       </span>
     </div>
+    <!-- 并发下载时 message 只留最后一条，像只有一集在跑；
+         这里把并行的那几集都摆出来。 -->
+    <div v-if="dl.running && dl.inflight.length > 0" class="dd-dl-line dd-muted dd-wrap">
+      正在下载 {{ dl.inflight.length }} 集：{{ dl.inflight.join("、") }}
+    </div>
     <div class="dd-dl-line dd-muted dd-wrap">{{ dl.message }}</div>
     <div class="dd-dl-line dd-muted">
       已完成 {{ dl.done }} 集
       <template v-if="dl.failed > 0"> · 失败 {{ dl.failed }} 项</template>
     </div>
     <div v-if="dl.root" class="dd-dl-line dd-muted dd-wrap" style="font-size: 11px">
-      保存到：{{ dl.root }}（每部剧自己的「二创」在剧目录里）
+      保存到：{{ dl.root }}（每部剧的产出会生成在自己的剧目录里）
     </div>
     <div v-if="dl.error" class="dd-dl-error dd-wrap">{{ dl.error }}</div>
     <n-button

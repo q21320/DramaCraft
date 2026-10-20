@@ -44,7 +44,7 @@ const willRewrite = computed(() => picked.value.includes("rewrite"));
 const root = ref("");
 
 /**
- * 产出位置：**每部剧自己的目录下，固定叫「二创」**。
+ * 产出位置：**每部剧自己的目录下，以 AI 新剧名命名**（和源片平级）。
  * 留空时把这条约定算出来给用户看，免得他到处找产出。
  *
  * 注意**必须声明在 root 之后**：写在前面虽然因为 computed 是
@@ -53,12 +53,12 @@ const root = ref("");
 const effectiveOutDir = computed(() => {
   const r = root.value.trim();
   if (!r) return "";
-  // 和后端 `pipeline::OUTPUT_DIR_NAME` **必须一个规则**：
-  // 产出在每部剧目录下面，叫 `二创`。
-  // 跟着源目录的分隔符风格走，别混出 `D:/a\二创`。
+  // 和后端 `pipeline::start_pipeline` **必须一个规则**：
+  // 产出 = `<源目录>/<剧名>/<AI新剧名>`，中间不再套「二创」。
+  // 跟着源目录的分隔符风格走，别混出 `D:/a\<剧名>`。
   const sep = r.includes("/") && !r.includes("\\") ? "/" : "\\";
   const base = r.replace(/[\\/]+$/, "");
-  return base + sep + "<剧名>" + sep + "二创";
+  return base + sep + "<剧名>" + sep + "<新剧名>";
 });
 const sliceSeconds = ref(10);
 const model = ref("small");
@@ -312,7 +312,8 @@ async function start() {
     const run = await api.pipelineStart(
       root.value.trim(),
       // **永远传空** —— 导出位置是设计决定，不再给用户改。
-      // 传空后端就用 `default_out_dir`：`<源目录>/<源目录名>二创`。
+      // 传空后端就用 `default_out_dir`（源目录本身）；
+      // 每部剧的产出实际落在 `<源目录>/<剧名>/<新剧名>`。
       "",
       picked.value,
       sliceSeconds.value,
@@ -558,7 +559,8 @@ onUnmounted(() => {
     <!--
       **导出位置不给改，只显示。**
       用户说：「导出的输入框直接删除就好了啊 默认在原视频路径」——
-      对。产出固定在源目录里面的 `<源目录名>二创`，这是设计决定，不是选项。
+      对。产出固定在每部剧自己的目录下（`<源目录>/<剧名>/<新剧名>`），
+      这是设计决定，不是选项。
       留一个输入框反而让人以为要填、还可能填错（填到源目录里就会互相踩）。
     -->
     <div class="dd-row" style="margin-bottom: 14px; font-size: 12px">

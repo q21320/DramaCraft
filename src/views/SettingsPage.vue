@@ -347,7 +347,8 @@ onMounted(() => {
     <div class="dd-card-title">下载目录</div>
     <div class="dd-card-desc">
       从「视频」页下载的短剧都放在这里：每部剧一个子文件夹（加原名），
-      里面有 <span class="dd-mono">剧名.txt / intro.txt / poster.jpg / 第NN集.mp4 / 二创</span>。
+      里面有 <span class="dd-mono">剧名.txt / intro.txt / poster.jpg / 第NN集.mp4</span>。
+      跑完流水线后，产出会以新剧名文件夹的形式放在同一层（和源片平级）。
       第一次下载时没设置会先让你选。
     </div>
     <div class="dd-row" style="margin-bottom: 4px">

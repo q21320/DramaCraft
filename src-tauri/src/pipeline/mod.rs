@@ -55,19 +55,12 @@ const COVER_HINTS: [&str; 6] = ["封面", "cover", "poster", "海报", "folder",
 /// 只认中文关键词会漏掉。
 const SYNOPSIS_HINTS: [&str; 7] = ["简介", "说明", "介绍", "intro", "synopsis", "desc", "readme"];
 
-/// 每部剧的产出目录固定叫这个（就在剧目录下面）。
+/// **历史**产出目录名：老版本把每部剧的产出放在 `<剧目录>/二创/<AI剧名>/`。
 ///
-/// ```text
-/// 下载/<剧名>/
-///     第01集.mp4 …
-///     二创/            ← 这里
-///         <AI剧名>/
-///             去重/ quzimu/ qiepian/ …
-/// ```
-///
-/// 扫描时**按名字整棵跳过**：不跳过的话，下次扫描会把已经加工过的片子
-/// 当成源片再加工一遍。
-pub const OUTPUT_DIR_NAME: &str = "二创";
+/// 现在产出去掉了这一层（`<剧目录>/<AI剧名>/`，和源片平级），但用户盘上
+/// 的旧目录还在，扫描时必须继续按这个名字整棵跳过 —— 否则下次扫描会把
+/// 已经加工过的去重片、去字幕片、切片**再加工一遍**。
+pub const LEGACY_OUTPUT_DIR_NAME: &str = "二创";
 
 fn ext_of(path: &Path) -> String {
     path.extension()
@@ -109,17 +102,17 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
         if path.is_dir() {
             // **产出目录整棵跳过。**
             //
-            // 产出现在放在每部剧自己的目录里（`<剧目录>/二创/`），
-            // 不跳过的话下次扫描会把它当成另一部剧 —— 把用户自己加工过的
-            // 去重片、去字幕片、切片**再加工一遍**。
+            // 新结构：产出直接是 `<剧目录>/<AI剧名>/`，和源片平级，
+            // 靠 `is_marked_output`（有剧名.txt 且无平铺视频）认。
+            // 老结构：`<剧目录>/二创/<AI剧名>/`，按固定名认。
             //
-            // `二创` 是固定名，直接按名字认；老版本的
-            // `<源目录名>二创` 仍靠 `is_marked_output`（有剧名.txt 且无平铺视频）识别。
-            let is_output_dir = path
+            // 两种情况都必须跳：不跳的话下次扫描会把已经加工过的
+            // 去重片、去字幕片、切片**再加工一遍**。
+            let is_legacy_output = path
                 .file_name()
-                .map(|n| n.to_string_lossy() == OUTPUT_DIR_NAME)
+                .map(|n| n.to_string_lossy() == LEGACY_OUTPUT_DIR_NAME)
                 .unwrap_or(false);
-            if is_output_dir || is_marked_output(&path) {
+            if is_legacy_output || is_marked_output(&path) {
                 continue;
             }
             walk(&path, out, depth + 1);
@@ -264,7 +257,7 @@ pub const STAGES: [(&str, &str, bool, &str); 9] = [
         false,
         // 注意：这句是**纯文本**渲染到界面上的，不能写 markdown 星号 ——
         // 模板不认，会把 `**` 原样显示出来（这个错犯过两次）。
-        "把零碎源片段拼成 60~90 秒的集。会改变集数 —— 源已经是整集时别开",
+        "把零碎源片段拼成 60~90 秒的集。会改变集数 —— 源已经是整集时别开；跑完自动清理重组临时视频",
     ),
     (
         "dedup",
@@ -358,6 +351,354 @@ pub fn stage_label(key: &str) -> String {
         .unwrap_or_else(|| key.to_string())
 }
 
+/// 整剧重组的临时目录名。放在产出目录下，和 `去重/`、`quzimu/` 平级。
+const REGROUP_DIR: &str = "重组";
+
+/// 只删重组目录里**我们自己生成**的文件。
+///
+/// 不能直接 `remove_dir_all`：这个目录虽然约定是程序独占，但用户也可能
+/// 往里放过东西。只认 `第NN集.mp4`、`_merged.mp4`、`_concat.txt` 三类。
+fn clear_regroup_files(work: &Path) -> (usize, u64) {
+    if !work.is_dir() {
+        return (0, 0);
+    }
+    let mut removed = 0usize;
+    let mut bytes = 0u64;
+    let Ok(entries) = std::fs::read_dir(work) else {
+        return (0, 0);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let ours = name == "_merged.mp4"
+            || name == "_concat.txt"
+            || (name.starts_with('第') && name.ends_with(".mp4"));
+        if !ours {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+            bytes += size;
+        }
+    }
+    (removed, bytes)
+}
+
+/// 清掉整剧重组的临时视频。
+///
+/// 重组的产物只是给后面「去重 / 去字幕 / 切片」当输入；流水线跑完后
+/// `去重/` 和 `quzimu/` 里的成品才是要留的。不清理的话，一部剧会多出
+/// 一整套和源片等大的 `重组/第NN集.mp4`，磁盘占用直接翻倍。
+///
+/// 返回 (删掉的文件数, 释放的字节数)。只删自己生成的文件，目录里还有
+/// 别的东西就保留目录。
+pub fn cleanup_regroup(out_dir: &Path) -> (usize, u64) {
+    if out_dir.as_os_str().is_empty() {
+        return (0, 0);
+    }
+    let work = out_dir.join(REGROUP_DIR);
+    let freed = clear_regroup_files(&work);
+    // 非空（有用户文件）时 remove_dir 会失败，正好把目录留下
+    let _ = std::fs::remove_dir(&work);
+    freed
+}
+
+// ---------------- 重组：能不能走 `-c copy` -------------
+
+/// 一条源片的「拼接指纹」。
+///
+/// 只要两部片的这几项有任何一项不同，`-c copy` 拼接就会在参数切换点出问题：
+/// 新参数要等下一个关键帧才能生效，而切段边界不认这个规则。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConcatFingerprint {
+    codec: String,
+    profile: String,
+    width: i64,
+    height: i64,
+    fps: String,
+    pix_fmt: String,
+}
+
+impl std::fmt::Display for ConcatFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}×{} {} {}",
+            self.codec, self.width, self.height, self.profile, self.fps
+        )
+    }
+}
+
+/// 只取拼接需要的字段。`-show_entries` 限定到 stream，比整份 json 快得多。
+fn concat_fingerprint(ffprobe: &Path, path: &Path) -> Option<ConcatFingerprint> {
+    let out = crate::proc::no_window(
+        std::process::Command::new(ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,profile,width,height,r_frame_rate,pix_fmt",
+                "-of",
+                "default=nw=1",
+            ])
+            .arg(path),
+    )
+    .output()
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let get = |key: &str| -> String {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    Some(ConcatFingerprint {
+        codec: get("codec_name"),
+        profile: get("profile"),
+        width: get("width").parse().unwrap_or(0),
+        height: get("height").parse().unwrap_or(0),
+        fps: get("r_frame_rate"),
+        pix_fmt: get("pix_fmt"),
+    })
+}
+
+/// 源片参数能不能直接 `-c copy` 拼起来。
+///
+/// 返回 `None` = 可以；`Some(原因)` = 不可以，必须重编码。
+///
+/// **为什么必须先判断而不是先试：**
+/// `-c copy` 拼接 + 切段在参数不一致时**不会报错**，ffmpeg 退出码照样是 0，
+/// 只是切出来的段解不出画面。真实撞过一次：一部剧 15 集里
+/// 1920 / 1882 / 1880 / HEVC 1254×720 四种参数混着，重组“成功”切出 21 集，
+/// 其中一整集 173 个包一帧都解不出来，去重时才报“源文件坏了”—— 冤枉了源文件。
+fn concat_blocker(ffprobe: &Path, paths: &[&str]) -> Option<String> {
+    let fps: Vec<ConcatFingerprint> = paths
+        .iter()
+        .map(|p| concat_fingerprint(ffprobe, Path::new(p)))
+        .collect::<Option<_>>()?;
+    let first = fps.first()?;
+    for (i, fp) in fps.iter().enumerate() {
+        if fp.width <= 0 || fp.height <= 0 {
+            return Some(format!("第 {} 段探测不到分辨率", i + 1));
+        }
+        if fp != first {
+            return Some(format!(
+                "第 {} 段是 {}，第一段是 {} —— 参数不一致就没法直接拼",
+                i + 1,
+                fp,
+                first
+            ));
+        }
+    }
+    None
+}
+
+// ---------------- 重组：切出来的段到底能不能用 ----------------
+
+/// 一个切出来的分段的体检结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentCheck {
+    pub file: String,
+    /// 解出来的帧数
+    pub frames: i64,
+    /// 首个视频包是不是关键帧 —— 不是的话，这一段开头缺参考帧
+    pub starts_on_keyframe: bool,
+    /// 有没有 `missing picture` / `no frame` 这类缺参考帧告警
+    pub missing_frames: usize,
+    /// 有没有 `non monotonically increasing dts` 这类时间戳倒退告警
+    pub broken_dts: usize,
+}
+
+impl SegmentCheck {
+    /// 这一段能不能直接交给下游。
+    pub fn is_ok(&self) -> bool {
+        self.frames > 0
+            && self.starts_on_keyframe
+            && self.missing_frames == 0
+            && self.broken_dts == 0
+    }
+
+    fn reason(&self) -> String {
+        if self.frames == 0 {
+            return "一帧都解不出来".into();
+        }
+        if !self.starts_on_keyframe {
+            return "开头不是关键帧（切点穿过了帧中间）".into();
+        }
+        if self.missing_frames > 0 {
+            return format!("缺参考帧 {} 处", self.missing_frames);
+        }
+        format!("时间戳倒退 {} 处（参数切换点没落对）", self.broken_dts)
+    }
+}
+
+/// 给切出来的一个段做体检。
+///
+/// **不能只看退出码。** segment 复用器切出坏段时返回 0，只有解码器会抱怨；
+/// 而 `-loglevel error` 又把抱怨吞掉了。所以这里主动探三件事：
+///
+/// 1. 首包是不是关键帧 —— 切点穿过帧中间时段的开头缺参考帧；
+/// 2. 解出来的帧数是不是 0 —— `profile=unknown` 那种空壳；
+/// 3. 有没有 DTS 倒退 —— SPS 切换点写坏的那种“解得出但输出错”。
+///
+/// 第 3 条最阴：它不阻碍解码，成片能播，只是中间有帧内容错位。
+pub fn check_segment(ffmpeg: &Path, file: &Path) -> SegmentCheck {
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // 一次解码：`-f null -` 不落盘，只把帧数和告警拿出来
+    let out = crate::proc::no_window(
+        std::process::Command::new(ffmpeg)
+            .args(["-hide_banner", "-nostdin", "-i"])
+            .arg(file)
+            .args(["-f", "null", "-"]),
+    )
+    .output();
+
+    let (frames, missing_frames, broken_dts) = match out {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stderr).to_string();
+            // `frame= 1234` 是末尾的进度行，取最后一个
+            let frames = text
+                .lines()
+                .filter_map(|l| {
+                    let l = l.trim_start();
+                    l.strip_prefix("frame=")
+                        .and_then(|v| v.split_whitespace().next())
+                        .and_then(|v| v.parse::<i64>().ok())
+                })
+                .last()
+                .unwrap_or(0);
+            let missing = text.matches("missing picture").count()
+                + text.matches("no frame!").count();
+            let dts = text.matches("non monotonically increasing dts").count();
+            (frames, missing, dts)
+        }
+        Err(_) => (0, 0, 0),
+    };
+
+    SegmentCheck {
+        file: name,
+        frames,
+        starts_on_keyframe: first_packet_is_keyframe(ffmpeg, file),
+        missing_frames,
+        broken_dts,
+    }
+}
+
+/// 一个文件的首个视频包是不是关键帧。
+///
+/// 用 `-encoders` 那套太绕，直接读前 5 个包的 flags 就够 ——
+/// 如果第一个包是 `___`，这一段注定缺参考帧。
+fn first_packet_is_keyframe(ffmpeg: &Path, file: &Path) -> bool {
+    // ffmpeg 自带的 ffprobe 和 ffmpeg 同目录，直接推出来
+    let ffprobe = ffmpeg.with_file_name(if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    });
+    if !ffprobe.is_file() {
+        // 没有 ffprobe 就退一步：当作通过，别因为缺工具把好段判死
+        return true;
+    }
+    let out = crate::proc::no_window(
+        std::process::Command::new(&ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-read_intervals",
+                "%+#1",
+                "-show_entries",
+                "packet=flags",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(file),
+    )
+    .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.lines().next().map(|l| l.contains('K')).unwrap_or(false)
+        }
+        _ => true,
+    }
+}
+
+/// 一个段都过不了就整批重切。
+///
+/// **整批而不是逐段**：`-c copy` 的损坏是边界性质的 —— 坏的是某一刀的
+/// 切点，重切时该改的是那一刀，不是把坏段单独修一遍。逐段补救还会带进
+/// 已切坏分段的污染。
+fn all_segments_ok(ffmpeg: &Path, work: &Path) -> std::result::Result<(), String> {
+    let mut entries: Vec<_> = std::fs::read_dir(work)
+        .map_err(|e| format!("读不了重组目录：{e}"))?
+        .filter_map(|r| r.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().map(|x| x == "mp4").unwrap_or(false)
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with('第'))
+                    .unwrap_or(false)
+        })
+        .collect();
+    entries.sort();
+    for p in entries {
+        let c = check_segment(ffmpeg, &p);
+        if !c.is_ok() {
+            return Err(format!("{} {}", c.file, c.reason()));
+        }
+    }
+    Ok(())
+}
+
+/// 用哪种方式切段。
+///
+/// 这是「先判断再动手」的结果：能 `-c copy` 就用 copy，不能就直接重编码，
+/// 而不是先 copy 一遍切坏了再去补救。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegroupMode {
+    /// 流复制：秒级完成，不损失画质
+    Copy,
+    /// 重编码：慢，但切点能精确对齐关键帧
+    Reencode,
+}
+
+impl RegroupMode {
+    fn label(self) -> &'static str {
+        match self {
+            RegroupMode::Copy => "流复制",
+            RegroupMode::Reencode => "重编码",
+        }
+    }
+}
+
+/// 切段结果：新集列表 + 走的哪条路径 + 中间发生的降级原因。
+#[derive(Debug, Clone)]
+pub struct RegroupResult {
+    pub episodes: Vec<SourceEpisode>,
+    pub mode: RegroupMode,
+    /// 降级到重编码的原因（没降级就是 `None`），要给用户看到。
+    ///
+    /// 不能吞：一旦降级，一部剧要多花十几分钟，用户有权知道为什么。
+    pub fallback: Option<String>,
+}
+
 /// 整剧重组的参数。
 #[derive(Debug, Clone)]
 pub struct RegroupOptions {
@@ -374,19 +715,30 @@ pub struct RegroupOptions {
 /// **源目录里已经是整集时不该开这一步** —— 它会把原本的集数边界打乱。
 /// 所以界面上写明「源已经是整集时会跳过」，并且用户可以关掉。
 ///
-/// 实现走 ffmpeg 的两条标准命令：
-/// 1. `-f concat -c copy` 拼成一条
-/// 2. `-f segment -c copy` 按时间切回多段
+/// ## 三条路径（先判断再动手）
 ///
-/// 用 `-c copy` 不重编码：这一步只调整分段，画质不该有损。
-/// 代价是切点落在关键帧上，实际时长和目标值有几秒出入 —— 这是可接受的。
+/// ```text
+/// 扫源片参数
+///   ├─ 全部一致  → -c copy 快路径（秒级）→ 体检
+///   │                                   ├─ 过  → 用这批
+///   │                                   └─ 不过 → 整批退回重编码
+///   └─ 有一项不一致 → 直接重编码（不赌）
+/// ```
+///
+/// **为什之举这不是简单加个重试**：`-c copy` 拼参数不一的片时退出码照样是 0，
+/// 切出的段可能整段解不出画面，也可能“解得出但帧内容错位”（DTS 倒退）。
+/// 前者能体检出来，后者只有从源头就不走 copy 才能避开。
+///
+/// 切出来的分段只是下游的临时输入；流水线收尾时由 [`cleanup_regroup`] 删除。
+///
+/// 返回 (新集列表, 实际走的模式)。
 pub fn regroup_drama(
     ffmpeg: &Path,
     drama: &SourceDrama,
     out_root: &Path,
     target_name: &str,
     target_ms: i64,
-) -> AppResult<Vec<SourceEpisode>> {
+) -> AppResult<RegroupResult> {
     if drama.episodes.is_empty() {
         return Err(AppError::Msg("这部剧没有可用的片段".into()));
     }
@@ -397,56 +749,88 @@ pub fn regroup_drama(
 
     // 目录名由调用方给 —— 它才知道这部剧最终叫什么（可能已经被 AI 改过名）。
     // 这里用原剧名的话，一次运行会写出两个文件夹。
-    let work = out_root.join(target_name).join("重组");
+    let work = out_root.join(target_name).join(REGROUP_DIR);
     std::fs::create_dir_all(&work)
         .map_err(|e| AppError::Msg(format!("建不了重组目录：{e}")))?;
+    // **先清上一次的分段。**
+    //
+    // 上次可能切出 20 集、这次只有 15 集；不清的话，旧的
+    // `第16集.mp4`… 会被当成这一次的集导入，内容却是上一版的。
+    clear_regroup_files(&work);
 
     // 1) 拼接清单。ffmpeg 的 concat 需要转义单引号。
     let list = work.join("_concat.txt");
     let mut body = String::new();
-    for ep in &drama.episodes {
-        let p = ep.path.replace('\'', "'\\''");
-        body.push_str(&format!("file '{p}'\n"));
+    let paths: Vec<&str> = drama.episodes.iter().map(|e| e.path.as_str()).collect();
+    for p in &paths {
+        body.push_str(&format!("file '{}'\n", p.replace('\'', "'\\''")));
     }
     std::fs::write(&list, body)
         .map_err(|e| AppError::Msg(format!("写不了拼接清单：{e}")))?;
 
-    let merged = work.join("_merged.mp4");
-    let st = crate::proc::no_window(
-        std::process::Command::new(ffmpeg)
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
-            .arg(&list)
-            .args(["-c", "copy"])
-            .arg(&merged),
-    )
-    .status()
-    .map_err(|e| AppError::Msg(format!("启动 ffmpeg 拼接失败：{e}")))?;
-    if !st.success() || !merged.is_file() {
-        return Err(AppError::Msg(
-            "拼接失败 —— 源片段的编码参数可能不一致（分辨率/编码不同就没法直接拼）".into(),
-        ));
-    }
-
-    // 2) 按目标时长切回多段
-    //
-    // **`-segment_start_number 1` 不能省。** ffmpeg 的 segment 复用器
-    // 序号默认从 **0** 开始，切出来是「第00集、第01集…」——
-    // 用户看到「第00集」直接懵了，而且集数也比实际多一个。
     let secs = (target_ms.max(5_000) as f64 / 1000.0).round() as i64;
     let pattern = work.join("第%02d集.mp4");
-    let st = crate::proc::no_window(
-        std::process::Command::new(ffmpeg)
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-            .arg(&merged)
-            .args(["-c", "copy", "-f", "segment", "-segment_time", &secs.to_string()])
-            .args(["-segment_start_number", "1"])
-            .args(["-reset_timestamps", "1"])
-            .arg(&pattern),
-    )
-    .status()
-    .map_err(|e| AppError::Msg(format!("启动 ffmpeg 分段失败：{e}")))?;
-    if !st.success() {
-        return Err(AppError::Msg("按目标时长分段失败".into()));
+
+    // 2) **第一道关：源片参数一致吗？**
+    //
+    // ffprobe 和 ffmpeg 同目录，推出来就能用。找不到就保守当成不一致，
+    // 宁可慢一点重编码，也不要切出一堆解不开的段。
+    let ffprobe = ffmpeg.with_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
+    let blocker = if ffprobe.is_file() {
+        concat_blocker(&ffprobe, &paths)
+    } else {
+        Some("找不到 ffprobe，不确认参数一致就不走流复制".to_string())
+    };
+
+    let mut mode = if blocker.is_none() {
+        RegroupMode::Copy
+    } else {
+        RegroupMode::Reencode
+    };
+    let mut fallback: Option<String> = None;
+    if let Some(why) = &blocker {
+        fallback = Some(format!("不进流复制：{why}"));
+    }
+
+    // 3) 切。copy 不成或体检不过就重编码重切一次。
+    let mut attempt = run_segment(
+        ffmpeg,
+        &list,
+        &pattern,
+        secs,
+        mode,
+    );
+    // copy 切完必须体检：退出码 0 不代表段能用
+    if attempt.is_ok() && mode == RegroupMode::Copy {
+        if let Err(bad) = all_segments_ok(ffmpeg, &work) {
+            fallback = Some(format!("流复制切开后体检不过：{bad}"));
+            mode = RegroupMode::Reencode;
+            clear_regroup_files(&work);
+            attempt = run_segment(ffmpeg, &list, &pattern, secs, mode);
+        }
+    }
+
+    // 清单是中间产物，成功失败都清掉
+    let _ = std::fs::remove_file(&list);
+
+    if let Err(e) = attempt {
+        clear_regroup_files(&work);
+        let _ = std::fs::remove_dir(&work);
+        return Err(AppError::Msg(e));
+    }
+
+    // 4) 重编码切完也要体检 —— 这次不过就没有兵了，直接报错。
+    //
+    // 但只有能解码这一项是硬性的：重编码后的首包一定是关键帧，
+    // DTS 也该是单调的。真不过就说明素材本身有问题，得让人看到。
+    if mode == RegroupMode::Reencode {
+        if let Err(bad) = all_segments_ok(ffmpeg, &work) {
+            clear_regroup_files(&work);
+            let _ = std::fs::remove_dir(&work);
+            return Err(AppError::Msg(format!(
+                "重编码切段后检查不过：{bad}"
+            )));
+        }
     }
 
     // 收尾：把切出来的段落按名字排好，作为这部剧的新「集」
@@ -477,17 +861,93 @@ pub fn regroup_drama(
         });
     }
 
-    // 拼出来的长片是中间产物，删掉免得占地方、也免得被当成一集导入
-    let _ = std::fs::remove_file(&merged);
-    // 拼接清单同样是中间产物
-    let _ = std::fs::remove_file(&list);
-
+    // 分段文件要继续给去重 / 去字幕当输入；流水线跑完后由
+    // `cleanup_regroup()` 统一删掉，别让它们长期占着地方。
     if made.len() < 2 {
+        clear_regroup_files(&work);
+        let _ = std::fs::remove_dir(&work);
         return Err(AppError::Msg(
             "重组后只剩一段 —— 源片段本来就够长，不需要重组".into(),
         ));
     }
-    Ok(made)
+    Ok(RegroupResult {
+        episodes: made,
+        mode,
+        fallback,
+    })
+}
+
+/// 拼一次 + 切一次。
+///
+/// 两条路径共用同一条命令，只换编码参数：
+///
+/// - `Copy`：`-c copy`，一步完成，不重编码
+/// - `Reencode`：`libx264` + `-force_key_frames` 强制切点在关键帧
+///
+/// **`-segment_start_number 1` 不能省。** ffmpeg 的 segment 复用器
+/// 序号默认从 **0** 开始，切出来是「第00集、第01集…」——
+/// 用户看到「第00集」直接懵了，而且集数也比实际多一个。
+fn run_segment(
+    ffmpeg: &Path,
+    list: &Path,
+    pattern: &Path,
+    secs: i64,
+    mode: RegroupMode,
+) -> std::result::Result<(), String> {
+    let secs_s = secs.to_string();
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args([
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+    ])
+    .arg(list);
+
+    match mode {
+        RegroupMode::Copy => {
+            cmd.args(["-c", "copy"]);
+        }
+        RegroupMode::Reencode => {
+            // **切点用 force_key_frames 钉在整秒上。**
+            //
+            // segment 复用器的边界是「距上一个关键帧≥N 秒」，不强制插 I 帧的话
+            // 实际切点会漂到下一个天然关键帧（实测漂 0.05~3.3 秒）。
+            // 重编码时我们有这个能力，就用上。
+            cmd.args([
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-pix_fmt", "yuv420p",
+            ])
+            .args([
+                "-force_key_frames",
+                &format!("expr:gte(t,n_forced*{secs})"),
+            ])
+            .args(["-c:a", "aac", "-b:a", "192k"]);
+        }
+    }
+
+    cmd.args(["-f", "segment", "-segment_time", &secs_s])
+        .args(["-segment_start_number", "1", "-reset_timestamps", "1"])
+        .arg(pattern);
+
+    let out = crate::proc::no_window(&mut cmd)
+        .output()
+        .map_err(|e| format!("启动 ffmpeg 拼接/分段失败：{e}"))?;
+
+    if !out.status.success() {
+        let tail = String::from_utf8_lossy(&out.stderr);
+        let tail: String = tail.chars().rev().take(800).collect::<String>().chars().rev().collect();
+        return Err(format!(
+            "{}切段失败：{} —— 源片段本身可能坏了，或者编码参数差得太远",
+            mode.label(),
+            tail.trim()
+        ));
+    }
+    Ok(())
 }
 
 /// 改剧名那一步的产物：新的剧名和简介。
@@ -595,17 +1055,25 @@ pub fn start_pipeline(
                 .get(&drama.name)
                 .map(|n| safe_drama_name(&n.title))
                 .unwrap_or_else(|| safe_drama_name(&drama.name));
-            // 重组产物也在**这部剧自己的二创目录**下，不落到全局输出根
-            let drama_base = Path::new(&drama.dir).join(OUTPUT_DIR_NAME);
-            match regroup_drama(&opt.ffmpeg, drama, &drama_base, &target, opt.target_ms) {
-                Ok(made) => {
-                    let after = made.len();
-                    drama.episodes = made;
+            // 重组产物直接落在剧目录下（`<剧目录>/<新剧名>/重组/`），
+            // 和后面去重/切片用同一个目录，不落全局输出根。
+            let drama_base = Path::new(&drama.dir);
+            match regroup_drama(&opt.ffmpeg, drama, drama_base, &target, opt.target_ms) {
+                Ok(res) => {
+                    let after = res.episodes.len();
+                    drama.episodes = res.episodes;
                     drama.episode_count = after as i64;
+                    // 降级要写出来：重编码比流复制慢十几倍，用户看到「怎么这么慢」
+                    // 时能在日志里找到原因
+                    let how = match (&res.fallback, res.mode) {
+                        (Some(why), _) => format!("{}（{why}）", res.mode.label()),
+                        (None, m) => m.label().to_string(),
+                    };
                     regroup_notes.push(format!(
-                        "「{}」重组：{before} 段 → {after} 集（每集约 {} 秒）",
+                        "「{}」重组：{before} 段 → {after} 集（每集约 {} 秒，{}，临时视频跑完自动清理）",
                         drama.name,
-                        opt.target_ms / 1000
+                        opt.target_ms / 1000,
+                        how
                     ));
                 }
                 Err(e) => {
@@ -665,7 +1133,8 @@ pub fn start_pipeline(
             }
             None => crate::db::create_project(conn, &display_name, &drama.dir)?,
         };
-        let drama_out = Path::new(&drama.dir).join(OUTPUT_DIR_NAME).join(&safe);
+        // 产出直接是 `<剧目录>/<新剧名>/`，和源片平级 —— 不再套一层 `二创`。
+        let drama_out = Path::new(&drama.dir).join(&safe);
         let drama_id = crate::db::add_pipeline_drama(
             conn,
             run_id,
@@ -677,14 +1146,18 @@ pub fn start_pipeline(
         )?;
         drama_ids.push(drama_id);
 
-        // 把新剧名 / 新简介写进导出目录。
+        // 产出目录**总是先建出来**，并且总要写一份 `剧名.txt`。
         //
-        // 封面那一步会读 `剧名.txt`（画在封面上的是新剧名），
-        // 用户也能直接打开看改成了什么。放在这里写是因为**目录刚定下来**，
-        // 而新名字在排任务之前就已经拿到了。
-        if let Some(n) = new_name {
-            if std::fs::create_dir_all(&drama_out).is_ok() {
-                let _ = std::fs::write(drama_out.join("剧名.txt"), &n.title);
+        // 不是为了好看：新结构下产出目录和源片平级，扫描源目录时靠
+        // `is_marked_output`（有剧名.txt、且没有平铺视频）来认它。
+        // 以前只有 AI 改名时才写这个文件 —— 不改名的那次跑完，产出目录
+        // 没有标记，下次扫描会把去重片/切片当成源片再加工一遍。
+        if std::fs::create_dir_all(&drama_out).is_ok() {
+            let title = new_name
+                .map(|n| n.title.clone())
+                .unwrap_or_else(|| display_name.clone());
+            let _ = std::fs::write(drama_out.join("剧名.txt"), title);
+            if let Some(n) = new_name {
                 let _ = std::fs::write(drama_out.join("详细简介.txt"), &n.synopsis);
             }
         }
@@ -1701,20 +2174,19 @@ fn build_drama(dir: &Path, videos: &[PathBuf]) -> AppResult<SourceDrama> {
     })
 }
 
-/// 产出的约定：**每部剧自己的目录下面叫 `二创`**。
+/// 产出的约定：**直接放在每部剧自己的目录下**。
 ///
 /// ```text
 /// 下载/<剧名>/
 ///     第01集.mp4 …
-///     二创/                 ← 固定名字（扫描时整棵跳过）
-///         <AI剧名>/
-///             去重/ quzimu/ qiepian/ …
+///     <AI剧名>/              ← 产出（和源片平级）
+///         去重/ quzimu/ qiepian/ …
 /// ```
 ///
-/// 传进来的 `root` 是整个下载根；这里返回 `<root>/二创` 只作为运行记录里的
+/// 传进来的 `root` 是整个下载根；这里原样返回，只作为运行记录里的
 /// 「约定位置」，真正每部剧的目录由 `start_pipeline` 按剧目录算。
-pub fn default_out_dir(root: &Path, suffix: &str) -> PathBuf {
-    root.join(suffix)
+pub fn default_out_dir(root: &Path) -> PathBuf {
+    root.to_path_buf()
 }
 
 #[cfg(test)]
@@ -2010,14 +2482,14 @@ mod tests {
         assert_eq!(scan.dramas[0].name, "都市爽剧");
     }
 
-    /// 产出的约定位置：**下载根下的 `二创`**（每部剧真正用的是自己的 `二创/`）。
+    /// 产出的约定位置：**源目录本身**，每部剧的产出在自己的剧目录下。
     ///
-    /// 运行记录里存的是这个「约定根」，`PipelineDrama.out_dir` 才是
-    /// 每部剧具体的 `<剧目录>/二创/<AI剧名>`。
+    /// 运行记录里存的是源目录这个「约定根」，`PipelineDrama.out_dir` 才是
+    /// 每部剧具体的 `<剧目录>/<AI剧名>`。
     #[test]
-    fn default_out_dir_is_the_output_name_under_the_root() {
-        let got = default_out_dir(Path::new("G:/10.12"), OUTPUT_DIR_NAME);
-        assert_eq!(got, PathBuf::from("G:/10.12/二创"));
+    fn default_out_dir_is_the_source_root() {
+        let got = default_out_dir(Path::new("G:/10.12"));
+        assert_eq!(got, PathBuf::from("G:/10.12"));
     }
 
     /// **扫描必须跳过产出目录。**
@@ -2039,23 +2511,40 @@ mod tests {
         assert_eq!(scan.dramas[0].episode_count, 2, "只该看到源片那 2 集");
     }
 
-    /// 新结构：产出在**每部剧自己的 `二创/`** 里，固定名要直接跳过。
+    /// 新结构：产出直接是 `<剧目录>/<AI剧名>/`（和源片平级），没有 `二创` 这层。
     #[test]
-    fn scanning_skips_the_per_drama_output_folder() {
+    fn scanning_skips_the_flat_per_drama_output_folder() {
         let t = TempTree::new("skipout2");
         t.file("某剧/剧名.txt", "某剧".as_bytes());
         t.file("某剧/第01集.mp4", b"x");
         t.file("某剧/第02集.mp4", b"y");
-        // 产出：`<剧目录>/二创/<AI剧名>/…`
-        t.file("某剧/二创/新剧名/剧名.txt", "新剧名".as_bytes());
-        t.file("某剧/二创/新剧名/去重/第01集_去重.mp4", b"z");
-        t.file("某剧/二创/新剧名/quzimu/第01集_quzimu.mp4", b"w");
+        // 产出：`<剧目录>/<AI剧名>/…`
+        t.file("某剧/新剧名/剧名.txt", "新剧名".as_bytes());
+        t.file("某剧/新剧名/去重/第01集_去重.mp4", b"z");
+        t.file("某剧/新剧名/quzimu/第01集_quzimu.mp4", b"w");
 
         let scan = scan_source(t.path()).unwrap();
         assert_eq!(scan.dramas.len(), 1);
         assert_eq!(
             scan.dramas[0].episode_count, 2,
-            "二创里的产出不能算成源片"
+            "产出不能算成源片"
+        );
+    }
+
+    /// 老结构（`<剧目录>/二创/<AI剧名>/`）仍然要跳过 —— 用户盘上还有旧目录。
+    #[test]
+    fn scanning_still_skips_legacy_erchuang_folders() {
+        let t = TempTree::new("skipout3");
+        t.file("某剧/剧名.txt", "某剧".as_bytes());
+        t.file("某剧/第01集.mp4", b"x");
+        t.file("某剧/二创/新剧名/剧名.txt", "新剧名".as_bytes());
+        t.file("某剧/二创/新剧名/去重/第01集_去重.mp4", b"z");
+
+        let scan = scan_source(t.path()).unwrap();
+        assert_eq!(scan.dramas.len(), 1);
+        assert_eq!(
+            scan.dramas[0].episode_count, 1,
+            "老二创目录里的产出不能算成源片"
         );
     }
 
@@ -2213,13 +2702,14 @@ mod tests {
             .collect();
         assert_eq!(kinds_of_a, vec!["dedup", "dedup", "slice", "slice"]);
 
-        // payload 里的输出目录要落在这次运行的导出目录下
+        // payload 里的输出目录要直接落在源剧目录下（不再套「二创」）
         let payload: serde_json::Value = serde_json::from_str(&jobs[0].payload).unwrap();
+        let out_dir = payload["outDir"].as_str().unwrap();
         assert!(
-            payload["outDir"].as_str().unwrap().contains("二创"),
-            "{}",
-            jobs[0].payload
+            !out_dir.contains("二创"),
+            "产出不该再套一层「二创」：{out_dir}"
         );
+        assert!(out_dir.contains("剧A"), "产出该落在剧目录下：{out_dir}");
 
         // 一部剧一个工程，素材不混在一起
         let projects = crate::db::list_projects(&conn).unwrap();
@@ -2392,6 +2882,13 @@ mod tests {
         // 目录真的建了，新剧名和新简介也写进去了
         let dir = std::path::PathBuf::from(&dramas[0].out_dir);
         assert!(dir.is_dir(), "导出目录该已经建好：{}", dir.display());
+        // **产出目录和源剧目录平级**，中间没有 `二创` 那层
+        assert_eq!(
+            dir.parent(),
+            Some(src.as_path()),
+            "产出应该直接放在剧目录下：{}",
+            dir.display()
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("剧名.txt")).unwrap().trim(),
             "白毛狼引桑蚕守家园"
@@ -2428,16 +2925,15 @@ mod tests {
                 "任务参数里该有新剧名的路径：{}",
                 j.payload
             );
-            // **源剧名出现在路径里是正常的** —— 产出目录的新结构是：
+            // **源剧名出现在路径里是正常的** —— 去掉「二创」层后的产出结构是：
             //
-            //     <源剧目录>\二创\<AI 剧名>\<步骤>
+            //     <源剧目录>/<AI 剧名>/<步骤>
             //      ↑ 源剧名在这里
             //
-            // 旧结构是 `<输出根>\<AI 剧名>`，那时才该断言「不含源剧名」。
-            // 这条断言跟着结构变，别在不该拦的地方拦。
+            // 中间不该再出现「二创」。这条断言跟着结构变，别在不该拦的地方拦。
             assert!(
-                j.payload.contains("二创"),
-                "产出该落在二创目录下：{}",
+                !j.payload.contains("二创"),
+                "产出不该再套一层「二创」：{}",
                 j.payload
             );
         }
@@ -2727,6 +3223,154 @@ mod tests {
         );
     }
 
+    /// 源片参数不一致时，**必须直接重编码**，不能先试 `-c copy`。
+    ///
+    /// 真实事故：一部剧 15 集里 1920 / 1882 / 1880 / HEVC 1254×720 混着，
+    /// `-c copy` 拼完退出码 0、“成功”切出 21 集，其中一整集 173 个包
+    /// 一帧都解不出来。去重时才报“源文件坏了” —— 冤枉了源文件。
+    #[test]
+    fn regroup_reencodes_when_sources_disagree() {
+        let Some(ffmpeg) = env_path("DRAMADIST_TEST_FFMPEG") else {
+            eprintln!("跳过：需要 DRAMADIST_TEST_FFMPEG");
+            return;
+        };
+        let Some(ffprobe) = env_path("DRAMADIST_TEST_FFPROBE") else {
+            eprintln!("跳过：需要 DRAMADIST_TEST_FFPROBE");
+            return;
+        };
+
+        let t = TempTree::new("regroup_mixed");
+        let src = t.path().join("混参数剧");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // 前两段 160×120，第三段 176×144 —— 宽高都不同
+        let mut episodes = Vec::new();
+        for (i, size) in [(1, "160x120"), (2, "160x120"), (3, "176x144")] {
+            let p = src.join(format!("{i:02}.mp4"));
+            let status = crate::proc::no_window(
+                std::process::Command::new(&ffmpeg).args([
+                    "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", &format!("testsrc=size={size}:rate=10"),
+                    "-t", "6", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-pix_fmt", "yuv420p",
+                ]),
+            )
+            .arg(&p)
+            .status()
+            .expect("无法启动 ffmpeg");
+            assert!(status.success(), "生成测试素材失败");
+            episodes.push(SourceEpisode {
+                path: p.to_string_lossy().to_string(),
+                file_name: format!("{i:02}.mp4"),
+                episode: Some(i),
+                size_bytes: std::fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0),
+            });
+        }
+
+        let drama = SourceDrama {
+            name: "混参数剧".into(),
+            dir: src.to_string_lossy().to_string(),
+            episode_count: 3,
+            episodes,
+            synopsis: String::new(),
+            synopsis_path: String::new(),
+            cover: String::new(),
+            warnings: Vec::new(),
+        };
+
+        let out_root = t.path().join("out");
+        let res = regroup_drama(&ffmpeg, &drama, &out_root, "混参数剧", 10_000)
+            .expect("重组失败");
+
+        assert_eq!(
+            res.mode,
+            RegroupMode::Reencode,
+            "分辨率不一致必须直接重编码，不能走流复制"
+        );
+        // 降级原因要说清楚是哪一段不一样 —— 用户看到「慢」能查到为什么
+        let why = res.fallback.expect("降级必须有原因");
+        assert!(
+            why.contains("第 3 段") || why.contains("第3段"),
+            "降级原因该指出是哪一段不一致：{why}"
+        );
+
+        // 重编码出来的段必须全部能解码
+        for ep in &res.episodes {
+            let c = check_segment(&ffmpeg, std::path::Path::new(&ep.path));
+            assert!(
+                c.is_ok(),
+                "{} 重编码后仍不可用：帧数 {}，首包关键帧 {}，缺帧 {}，DTS 倒退 {}",
+                c.file, c.frames, c.starts_on_keyframe, c.missing_frames, c.broken_dts
+            );
+        }
+
+        // 直接验一下：重编码后每段尺寸应该统一（不再一集一个尺寸）
+        let mut sizes: Vec<(i64, i64)> = res
+            .episodes
+            .iter()
+            .filter_map(|e| crate::media::probe(&ffprobe, std::path::Path::new(&e.path)).ok())
+            .map(|p| (p.width, p.height))
+            .collect();
+        sizes.sort();
+        sizes.dedup();
+        assert!(
+            sizes.len() <= 2,
+            "重编码后各段尺寸应该基本统一，实际：{sizes:?}"
+        );
+    }
+
+    /// 体检必须能抓出「能打开但解不出画面」的空壳段。
+    ///
+    /// 这正是事故里那个第10集：173 个包、`profile=unknown`、一帧都解不出来，
+    /// 但 ffmpeg 退出码是 0。只看退出码的路子在这里会放过去。
+    #[test]
+    fn check_segment_rejects_undecodable_segment() {
+        let Some(ffmpeg) = env_path("DRAMADIST_TEST_FFMPEG") else {
+            eprintln!("跳过：需要 DRAMADIST_TEST_FFMPEG");
+            return;
+        };
+        let Some(ffprobe) = env_path("DRAMADIST_TEST_FFPROBE") else {
+            eprintln!("跳过：需要 DRAMADIST_TEST_FFPROBE");
+            return;
+        };
+
+        let t = TempTree::new("seg_check");
+        // 造一个坏文件：把一段正常 mp4 的头部砍掉，剩下一堆无头码流
+        let good = t.path().join("good.mp4");
+        make_video(&ffmpeg, &good, 3);
+        let raw = std::fs::read(&good).unwrap();
+        let broken = t.path().join("第01集.mp4");
+        std::fs::write(&broken, &raw[raw.len() / 2..]).unwrap();
+
+        let c = check_segment(&ffmpeg, &broken);
+        assert!(
+            !c.is_ok(),
+            "砍掉头部的文件必须被判为不可用，实际：帧数 {}，首包关键帧 {}",
+            c.frames,
+            c.starts_on_keyframe
+        );
+
+        // 正常文件必须判为可用 —— 别把好段误杀
+        let ok = check_segment(&ffmpeg, &good);
+        assert!(
+            ok.is_ok(),
+            "正常文件该通过体检：帧数 {}，首包关键帧 {}，缺帧 {}，DTS 倒退 {}",
+            ok.frames,
+            ok.starts_on_keyframe,
+            ok.missing_frames,
+            ok.broken_dts
+        );
+        assert!(ok.frames > 0);
+        assert!(ok.starts_on_keyframe, "正常 mp4 的首个视频包应该是关键帧");
+
+        // ffprobe 能确认这个坏文件真的解不出东西
+        let probe = crate::media::probe(&ffprobe, &broken);
+        assert!(
+            probe.is_err() || probe.as_ref().map(|p| p.width).unwrap_or(0) == 0,
+            "这个构造的坏文件应该探不出有效尺寸"
+        );
+    }
+
     /// 整剧重组：碎片按顺序拼成长片，再按目标时长切回「集」。
     ///
     /// 真实软件面对的是 55 个约 40 秒的碎片，得先拼成 28 个 60~90 秒的集 ——
@@ -2765,7 +3409,16 @@ mod tests {
         };
 
         let out_root = t.path().join("二创");
-        let made = regroup_drama(&ffmpeg, &drama, &out_root, "碎片剧", 20_000).expect("重组失败");
+        let res = regroup_drama(&ffmpeg, &drama, &out_root, "碎片剧", 20_000).expect("重组失败");
+        // 6 段全部参数一致 → 应该走流复制，不该降级
+        assert_eq!(
+            res.mode,
+            RegroupMode::Copy,
+            "参数一致的源片该走流复制，降级原因：{:?}",
+            res.fallback
+        );
+        assert!(res.fallback.is_none(), "没降级就不该有原因：{:?}", res.fallback);
+        let made = res.episodes;
 
         // 60 秒按 20 秒切 → 3 段（切点落在关键帧上，允许上下浮动）
         assert!(
@@ -2794,12 +3447,48 @@ mod tests {
             "第一个文件该是第01集：{:?}",
             made.iter().map(|e| &e.file_name).collect::<Vec<_>>()
         );
-        // 中间产物（拼出来的长片）要清掉，别占地方也别被当成一集
+        // 中间产物（拼出来的长片 / 拼接清单）都不能留下
         let work = out_root.join("碎片剧").join("重组");
         assert!(
             !work.join("_merged.mp4").exists(),
-            "拼出来的长片是中间产物，该删掉"
+            "拼出来的长片是中间产物，不该落盘"
         );
+        assert!(
+            !work.join("_concat.txt").exists(),
+            "拼接清单是中间产物，该删掉"
+        );
+    }
+
+    #[test]
+    fn regroup_cleanup_removes_temp_episodes_but_keeps_outputs() {
+        let t = TempTree::new("regroup_cleanup");
+        let out = t.dir("新剧名");
+        // 重组生成的临时文件
+        t.file("新剧名/重组/第01集.mp4", b"a");
+        t.file("新剧名/重组/第02集.mp4", b"bb");
+        t.file("新剧名/重组/_merged.mp4", b"ccc");
+        t.file("新剧名/重组/_concat.txt", b"file");
+        // 用户自己放进来的文件不能动
+        t.file("新剧名/重组/说明.txt", b"keep");
+        // 成品不能动
+        t.file("新剧名/去重/剧-第01集_去重.mp4", b"final");
+
+        let (n, bytes) = cleanup_regroup(&out);
+        assert_eq!(n, 4, "只该删重组生成的 4 个文件");
+        assert_eq!(bytes, 1 + 2 + 3 + 4);
+        assert!(out.join("重组").is_dir(), "还有用户文件时目录要留着");
+        assert!(out.join("重组/说明.txt").is_file());
+        assert!(out.join("去重/剧-第01集_去重.mp4").is_file());
+
+        // 目录空了就连目录一起删
+        let t2 = TempTree::new("regroup_cleanup_empty");
+        t2.file("剧/重组/第01集.mp4", b"x");
+        let (n, _) = cleanup_regroup(&t2.path().join("剧"));
+        assert_eq!(n, 1);
+        assert!(!t2.path().join("剧/重组").exists());
+
+        // 空 out_dir 不能当成当前目录
+        assert_eq!(cleanup_regroup(Path::new("")), (0, 0));
     }
 
     #[test]

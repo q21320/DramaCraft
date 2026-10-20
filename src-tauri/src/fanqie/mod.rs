@@ -184,32 +184,56 @@ struct RawItem {
     copyright: String,
 }
 
-/// 统一的「取数据 + 查错误码」。两个接口外壳形状一致。
+/// 番茄的接口会偶发 `HTTP 200 + 0 字节`：同一条请求连发，约一半是空包。
+/// 这是服务端/CDN 瞬时丢 body，不是参数或鉴权问题，空包退避重试即可。
+/// 不重试的话列表页、筛选面板会随机报「EOF while parsing a value」。
+const EMPTY_BODY_RETRIES: usize = 5;
+
+/// 统一的「取数据 + 查错误码」。列表 / 筛选 / 详情 / 播放共用一个外壳。
 async fn fetch<T: DeserializeOwned>(req: reqwest::RequestBuilder) -> AppResult<T> {
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| AppError::Msg(format!("请求番茄接口失败：{e}")))?;
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| AppError::Msg(format!("读取番茄接口响应失败：{e}")))?;
-    if !status.is_success() {
-        return Err(AppError::Msg(format!("番茄接口返回 HTTP {status}")));
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        // body 是内存里的 json，可以安全重放；流式 body 本项目用不到。
+        let this = req
+            .try_clone()
+            .ok_or_else(|| AppError::Msg("番茄接口请求无法重放".into()))?;
+        let resp = this
+            .send()
+            .await
+            .map_err(|e| AppError::Msg(format!("请求番茄接口失败：{e}")))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AppError::Msg(format!("读取番茄接口响应失败：{e}")))?;
+        if !status.is_success() {
+            return Err(AppError::Msg(format!("番茄接口返回 HTTP {status}")));
+        }
+        if text.trim().is_empty() {
+            if attempt >= EMPTY_BODY_RETRIES {
+                return Err(AppError::Msg(format!(
+                    "番茄接口连续 {EMPTY_BODY_RETRIES} 次返回空响应，稍后再试"
+                )));
+            }
+            // 空包是瞬时的，隔一小会儿再要基本就有。
+            tokio::time::sleep(Duration::from_millis(150 * attempt as u64)).await;
+            continue;
+        }
+        let env: Envelope<T> = serde_json::from_str(&text)
+            .map_err(|e| AppError::Msg(format!("番茄接口数据解析失败：{e}")))?;
+        if env.code != 0 {
+            let detail = if env.message.trim().is_empty() {
+                format!("code {}", env.code)
+            } else {
+                format!("{}（code {}）", env.message.trim(), env.code)
+            };
+            return Err(AppError::Msg(format!("番茄接口报错：{detail}")));
+        }
+        return env
+            .data
+            .ok_or_else(|| AppError::Msg("番茄接口没有返回数据".into()));
     }
-    let env: Envelope<T> = serde_json::from_str(&text)
-        .map_err(|e| AppError::Msg(format!("番茄接口数据解析失败：{e}")))?;
-    if env.code != 0 {
-        let detail = if env.message.trim().is_empty() {
-            format!("code {}", env.code)
-        } else {
-            format!("{}（code {}）", env.message.trim(), env.code)
-        };
-        return Err(AppError::Msg(format!("番茄接口报错：{detail}")));
-    }
-    env.data
-        .ok_or_else(|| AppError::Msg("番茄接口没有返回数据".into()))
 }
 
 /// 把原始条目压成前端能直接用的稳定形状。
@@ -1096,7 +1120,7 @@ fn codec_rank(codec: &str) -> u8 {
     }
 }
 
-/// 清晰度偏好：默认 480p —— 竖屏短剧够清楚，文件也只有十几 MB。
+/// 没点名清晰度时的偏好：默认 480p —— 竖屏短剧够清楚，文件也只有十几 MB。
 fn definition_rank(definition: &str) -> u8 {
     match definition.to_ascii_lowercase().as_str() {
         "480p" => 0,
@@ -1108,21 +1132,48 @@ fn definition_rank(definition: &str) -> u8 {
     }
 }
 
-/// 按「编码可用性 → 清晰度偏好」排序，返回依次尝试的流下标。
+/// 点名了清晰度却拿不到时的兜底：**越高清越先**。
+///
+/// 用户点名 1080p 是奔着画质来的，缺档时退到 720p 可以接受，
+/// 悄悄落成 480p 就是另一回事了。
+fn high_first_rank(definition: &str) -> u8 {
+    match definition.to_ascii_lowercase().as_str() {
+        "1080p" => 0,
+        "720p" => 1,
+        "540p" => 2,
+        "480p" => 3,
+        "360p" => 4,
+        _ => 5,
+    }
+}
+
+/// 按「想要的清晰度 → 编码可用性」排序，返回依次尝试的流下标。
+///
+/// 两种模式：
+/// - **点名了清晰度**（下载走这条）：清晰度优先于编码。要 1080p 就给 1080p，
+///   哪怕它是只能碰运气的 bytevc2 —— 解不开 [`prepare_video`] 会换下一条，
+///   大不了多试一次；反过来按编码排，点名的 1080p 会被挤到 480p 后面。
+/// - **没点名**（在线播放走这条）：编码可用性优先，清晰度按「480p 最省」排。
 fn pick_model_streams(streams: &[ModelStream], preferred: Option<&str>) -> Vec<usize> {
     let mut order: Vec<usize> = (0..streams.len()).collect();
-    order.sort_by_key(|&i| {
-        let s = &streams[i];
-        let wanted = preferred
-            .map(|p| s.definition.eq_ignore_ascii_case(p))
-            .unwrap_or(false);
-        let def = if wanted {
-            0
-        } else {
-            1 + definition_rank(&s.definition)
-        };
-        (codec_rank(&s.codec), def)
-    });
+    match preferred {
+        Some(p) => {
+            order.sort_by_key(|&i| {
+                let s = &streams[i];
+                (
+                    !s.definition.eq_ignore_ascii_case(p),
+                    high_first_rank(&s.definition),
+                    codec_rank(&s.codec),
+                )
+            });
+        }
+        None => {
+            order.sort_by_key(|&i| {
+                let s = &streams[i];
+                (codec_rank(&s.codec), definition_rank(&s.definition))
+            });
+        }
+    }
     order
 }
 
@@ -1330,6 +1381,67 @@ async fn playable(
         Ok(Err(e)) => Err(e.to_string()),
         // 校验任务自己挂了（比如线程池关闭）不该连累下载，当作可用
         Err(_) => Ok(()),
+    }
+}
+
+/// `"1080p"` → 1080；认不出返回 0（不参与清晰度判断）。
+fn quality_height(quality: &str) -> i64 {
+    quality
+        .trim()
+        .trim_end_matches(['p', 'P'])
+        .parse::<i64>()
+        .unwrap_or(0)
+}
+
+/// 磁盘上已有的一集还能不能用。
+///
+/// **只做 ffprobe，不解码。**
+///
+/// 完整解码一集 1080p 要 2~3 秒（HEVC）；重新点下载时「已存在」的集
+/// 可能有十几集，全解开一遍就是几十秒 —— 用户看到的就是「下载很久，
+/// 其实一集都没下」。新文件在 [`decrypt_part`] 里已经完整解码校验过，
+/// 这里判「容器能读、有时长、有画面、清晰度够」已经能抓住截断/坏容器。
+///
+/// 量不出来（没 ffprobe / 探测异常）时按可用算，沿用原来的
+/// 「能读就跳过」—— 不能因为量不出分辨率把整批下载拖死。
+enum ExistingFile {
+    Usable,
+    /// 清晰度不够（换档重下时，旧集不能算「已存在」）
+    LowQuality,
+    /// 文件坏了，删掉重下
+    Broken(String),
+}
+
+async fn existing_file_state(
+    file: &std::path::Path,
+    ffprobe: Option<&std::path::Path>,
+    quality: Option<&str>,
+) -> ExistingFile {
+    if !is_nonempty(file) {
+        return ExistingFile::Broken("文件是空的".into());
+    }
+    let Some(ff) = ffprobe else {
+        return ExistingFile::Usable;
+    };
+    let path = file.to_path_buf();
+    let ff = ff.to_path_buf();
+    match tauri::async_runtime::spawn_blocking(move || crate::media::probe(&ff, &path)).await {
+        Ok(Ok(p)) => {
+            // 容器能读但没时长 / 没画幅 = 截断或坏文件，当下游去重只会报
+            // "Conversion failed"，不如在这里删掉重下。
+            if p.duration_ms <= 0 || p.width <= 0 || p.height <= 0 {
+                return ExistingFile::Broken("探不到时长或画面尺寸".into());
+            }
+            let want = quality.map(quality_height).unwrap_or(0);
+            if want > 0 && p.width.min(p.height) * 100 < want * 95 {
+                ExistingFile::LowQuality
+            } else {
+                ExistingFile::Usable
+            }
+        }
+        Ok(Err(e)) => ExistingFile::Broken(e.to_string()),
+        // 校验任务自己挂了（比如线程池关闭）不该连累下载，当作可用
+        Err(_) => ExistingFile::Usable,
     }
 }
 
@@ -1548,7 +1660,7 @@ pub fn safe_file_name(raw: &str) -> String {
     }
 }
 
-/// 数一个剧目录里平铺的 mp4（`二创/` 里的产出不算）。
+/// 数一个剧目录里平铺的 mp4（子目录里的产出不算）。
 pub fn count_episodes(dir: &Path) -> i64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -1685,6 +1797,7 @@ impl DownloadTracker {
             s.failed = self.failed_base;
             s.message = message.to_string();
             s.error.clear();
+            s.inflight.clear();
         })
     }
 
@@ -1711,6 +1824,23 @@ impl DownloadTracker {
             s.failed = self.failed_base + failed;
             s.message = message.to_string();
         });
+    }
+
+    /// 某集开始下载：记进「正在下载」列表。
+    ///
+    /// 并发数大于 1 时，面板上只显示最后一条 message，看着像只有一集在跑；
+    /// 把并行的几集都摆出来，用户才知道没卡住。
+    pub fn episode_started(&self, label: &str) {
+        self.update(|s| {
+            if !s.inflight.iter().any(|a| a == label) {
+                s.inflight.push(label.to_string());
+            }
+        });
+    }
+
+    /// 某集结束（完成 / 跳过 / 失败）：从列表里拿掉。
+    pub fn episode_finished(&self, label: &str) {
+        self.update(|s| s.inflight.retain(|a| a != label));
     }
 }
 
@@ -1840,7 +1970,7 @@ async fn save_cover(
 ///     poster.jpg     ← 封面（pipeline 认 poster / 封面）
 ///     第01集.mp4
 ///     第02集.mp4
-///     二创/          ← 流水线产出（每部剧自己的）
+///     <AI剧名>/      ← 流水线跑出来的产出（和源片平级，下载阶段还没有）
 /// ```
 ///
 /// 每完成一集发一条 `fanqie:download`，前端用它显示进度。
@@ -1850,6 +1980,9 @@ async fn save_cover(
 ///
 /// `tracker`：批次下载时带上，进度会写进后端状态并发给前端；
 /// 单独下一部（旧命令）传 `None`，事件照样发，只是不落盘。
+/// `quality`：点名的清晰度（如 `"1080p"`）。点名后**清晰度优先于编码**，
+/// 平台缺档时按高清往下退；已存在但分辨率不够的旧集会自动删掉重下。
+/// `ffprobe`：只用来量已存在文件的分辨率，没有不影响下载。
 /// `concurrency`：同时下载几集（1~6）。吃紧时降到 2 能明显减少
 /// 「流被削断 / 限流」的失败；网络好时 5 能快一些。
 pub async fn download_series(
@@ -1858,6 +1991,7 @@ pub async fn download_series(
     out_root: &std::path::Path,
     quality: Option<&str>,
     ffmpeg: Option<PathBuf>,
+    ffprobe: Option<PathBuf>,
     copy_video: bool,
     tracker: Option<&DownloadTracker>,
     concurrency: usize,
@@ -1881,8 +2015,6 @@ pub async fn download_series(
     });
     let dir = out_root.join(&title);
     std::fs::create_dir_all(&dir)?;
-    // 产出目录先建出来：用户一眼就能看到「源片 + 二创」的结构
-    std::fs::create_dir_all(dir.join(crate::pipeline::OUTPUT_DIR_NAME))?;
 
     // 素材包里先有剧名、简介、封面：流水线靠 `intro.txt` 拿剧情、
     // 靠 `poster.jpg` 做新封面。先写这两个文件，中途断了也不至于空白。
@@ -1982,6 +2114,7 @@ pub async fn download_series(
         let dir = dir.clone();
         let quality = quality.map(str::to_string);
         let ffmpeg = ffmpeg.clone();
+        let ffprobe = ffprobe.clone();
         let sem = sem.clone();
         let done_downloaded = done_downloaded.clone();
         let done_skipped = done_skipped.clone();
@@ -2049,35 +2182,65 @@ pub async fn download_series(
             let ep_name = format!("第{index:02}集.mp4");
             let ep_label = format!("第 {index} 集");
 
+            // 并发数大于 1 时，面板只显示最后一条 message，看着像只有一集在跑。
+            // 把这一集挂进 active，前端就能把并行的那几集都列出来。
+            let active_label = format!("第{index}集");
+            if let Some(t) = &tracker {
+                t.episode_started(&active_label);
+            }
+            let started = std::time::Instant::now();
+
             if is_nonempty(&file) {
-                // **已存在也要验一遍能不能播。**
+                // **已存在也要验一遍。**
                 //
                 // 以前只判「文件非空」：下载没下全的坏文件会一直命中「跳过」，
                 // 重下多少次都修不好 —— 用户只能在去重那一步看到「Conversion failed」。
-                // 验不过就删掉，这趟当成缺集重新下。
-                match playable(&file, ffmpeg.as_deref()).await {
-                    Ok(()) => {
+                // 现在用 ffprobe 核对：容器能读、有时长、有画幅、清晰度够。
+                //
+                // **不再完整解码。** 1080p HEVC 解一集要 2~3 秒，重新点下载时
+                // 已存在的可能有十几集，全解一遍就是几十秒 —— 用户看到的是
+                // 「下载很久，其实一集都没下」。新文件在 `decrypt_part` 里
+                // 已经完整解码校验过了。
+                match existing_file_state(&file, ffprobe.as_deref(), quality.as_deref()).await {
+                    ExistingFile::LowQuality => {
+                        let _ = std::fs::remove_file(&file);
+                        log_download(
+                            &app,
+                            "info",
+                            &format!(
+                                "{ep_name} 清晰度低于 {}，删掉重下（进度 {}/{total}）",
+                                quality.as_deref().unwrap_or_default(),
+                                progress()
+                            ),
+                            "",
+                        );
+                    }
+                    ExistingFile::Usable => {
                         done_skipped.fetch_add(1, Ordering::Relaxed);
                         let message = format!("第 {index} 集已存在，跳过");
                         log_download(
                             &app,
                             "info",
                             &format!(
-                                "{ep_name} 已存在且能播，跳过（进度 {}/{total}，{}）",
+                                "{ep_name} 已存在且可用，跳过（进度 {}/{total}，{}，核对 {:.1}s）",
                                 progress(),
-                                size_label(&file)
+                                size_label(&file),
+                                started.elapsed().as_secs_f64()
                             ),
                             &file.to_string_lossy(),
                         );
                         emit(&message);
+                        if let Some(t) = &tracker {
+                            t.episode_finished(&active_label);
+                        }
                         return (index, None);
                     }
-                    Err(why) => {
+                    ExistingFile::Broken(why) => {
                         let _ = std::fs::remove_file(&file);
                         log_download(
                             &app,
                             "warn",
-                            &format!("{ep_name} 本地文件播不了（{why}），当成没下载，重新下"),
+                            &format!("{ep_name} 本地文件不能用（{why}），当成没下载，重新下"),
                             "",
                         );
                     }
@@ -2137,19 +2300,26 @@ pub async fn download_series(
                     &app,
                     "ok",
                     &format!(
-                        "{ep_name} 下载完成（进度 {}/{total}，{}）",
+                        "{ep_name} 下载完成（进度 {}/{total}，{}，用时 {:.1}s）",
                         progress(),
-                        size_label(&file)
+                        size_label(&file),
+                        started.elapsed().as_secs_f64()
                     ),
                     &file.to_string_lossy(),
                 );
                 emit(&message);
+                if let Some(t) = &tracker {
+                    t.episode_finished(&active_label);
+                }
                 (index, None)
             } else {
                 done_failed.fetch_add(1, Ordering::Relaxed);
                 let message = format!("第 {index} 集：{last_error}");
                 log_download(&app, "error", &format!("{ep_name} 下载失败：{last_error}"), "");
                 emit(&message);
+                if let Some(t) = &tracker {
+                    t.episode_finished(&active_label);
+                }
                 (index, Some(message))
             }
         });
@@ -2723,15 +2893,46 @@ mod tests {
     }
 
     #[test]
-    fn stream_order_prefers_decodable_codec_over_definition() {
+    fn stream_order_prefers_decodable_codec_when_quality_is_open() {
         let streams = model_streams(&stream_json_video_list());
         let order = pick_model_streams(&streams, None);
-        // 360p 的 bytevc1 排在 480p 的 bytevc2 前面
+        // 没点名清晰度（在线播放）：360p 的 bytevc1 排在 480p 的 bytevc2 前面
         assert_eq!(order, vec![1, 0]);
 
         let order = pick_model_streams(&streams, Some("480p"));
-        // 用户点名 480p 也不会选 bytevc2，编码可用性优先
-        assert_eq!(order, vec![1, 0]);
+        // 点名了（下载）：480p 的 bytevc2 也要排第一 —— 解不开不过是多试一条，
+        // 按编码优先会把点名的清晰度直接让给 360p。
+        assert_eq!(order, vec![0, 1]);
+
+        let order = pick_model_streams(&streams, Some("1080p"));
+        // 平台没这档：退到最高的 480p，而不是最低的 360p
+        assert_eq!(order, vec![0, 1]);
+    }
+
+    #[test]
+    fn named_quality_wins_over_codec_and_falls_back_high_first() {
+        let model = serde_json::json!({
+            "video_duration": 66.0,
+            "video_list": [
+                {
+                    "main_url": "https://cdn/a-480.mp4",
+                    "video_meta": {"definition": "480p", "codec_type": "bytevc1"}
+                },
+                {
+                    "main_url": "https://cdn/a-1080.mp4",
+                    "video_meta": {"definition": "1080p", "codec_type": "bytevc2"}
+                },
+                {
+                    "main_url": "https://cdn/a-720.mp4",
+                    "video_meta": {"definition": "720p", "codec_type": "bytevc1"}
+                }
+            ]
+        });
+        let streams = model_streams(&model);
+        // 点名 1080p：即使它是 bytevc2，也排在能直解的 720p 前面
+        assert_eq!(pick_model_streams(&streams, Some("1080p")), vec![1, 2, 0]);
+        // 未点名：仍然按编码可用性走，同编码内仍是「480p 最省」
+        assert_eq!(pick_model_streams(&streams, None), vec![0, 2, 1]);
     }
 
     #[test]

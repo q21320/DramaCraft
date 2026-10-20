@@ -171,6 +171,7 @@ pub fn run() {
                 });
 
             let bundled_dirs: Vec<PathBuf> = bundled
+                .clone()
                 .map(|root| {
                     let root = strip_extended_prefix(root);
                     [tools::BUNDLED_DIR, tools::ASR_RUNTIME_DIR]
@@ -183,6 +184,11 @@ pub fn run() {
 
             for dir in &bundled_dirs {
                 eprintln!("DramaDist: 内置运行时目录 {}", dir.display());
+            }
+            // 资源根目录也登记一下：ASR 的模型在 `asr_runtime/<平台>/models/` 下，
+            // 不登记的话只有开发时（有 CARGO_MANIFEST_DIR）能找到。
+            if let Some(root) = &bundled {
+                tools::set_resources_root(strip_extended_prefix(root.clone()));
             }
             tools::set_bundled_dirs(bundled_dirs);
 

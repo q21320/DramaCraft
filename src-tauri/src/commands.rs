@@ -1498,15 +1498,15 @@ pub async fn desubtitle_media(
             ffprobe,
             python,
             worker_script(&app, "ocr_worker.py"),
-            // **取去重产物，不是原片。**
+            // **取原片，不是去重产物。**
             //
-            // 分镜证明是拿去**证明这条片子**的 —— 它该展示的是**实际发布
-            // 出去的那个画面**，不是源片。用源片的话，证明里的画面和发出去
-            // 的画面对不上（去重改过裁切、变速、调色，可能还有片头标识）。
+            // 真实软件的日志：「AI去字幕（开拍 · 原视频第1～第4集）」——
+            // 去字幕这一环吃的是原视频。去重产物已经过裁切、缩放、扫光，
+            // 字幕位置和盖块尺寸都得按它重算，扫出来的坐标回不到原片上；
+            // 而去字幕产物是给「证明」链用的，证明就该回到原始素材。
             //
-            // `media_source_path` 自己处理优先级：去重产物存在就用它，
-            // 没有（没跑去重）才退回原片。
-            PathBuf::from(db::media_source_path(&conn, media_id)?),
+            // 以前这里走 `media_source_path`（优先去重产物），是反的。
+            PathBuf::from(db::media_original_path(&conn, media_id)?),
             media,
             out,
         )
@@ -2269,16 +2269,16 @@ pub fn pipeline_scan(root: String) -> AppResult<SourceScan> {
     pipeline::scan_source(Path::new(root))
 }
 
-/// 导出目录的约定位置：**源目录下的 `二创`**。
+/// 导出目录的约定位置：**就是源目录本身**。
 ///
-/// 真正落盘是每部剧自己的 `<剧目录>/二创/<AI剧名>/`；
+/// 真正落盘是每部剧自己的 `<剧目录>/<AI剧名>/`；
 /// 这个命令只给界面显示一个约定根。
 #[tauri::command]
 pub fn pipeline_default_out_dir(root: String) -> AppResult<String> {
     if root.trim().is_empty() {
         return Err(AppError::Msg("请先选择源目录".into()));
     }
-    Ok(pipeline::default_out_dir(Path::new(root.trim()), "二创")
+    Ok(pipeline::default_out_dir(Path::new(root.trim()))
         .to_string_lossy()
         .to_string())
 }
@@ -2383,7 +2383,7 @@ pub async fn pipeline_start(
     }
 
     let out_root = if out_dir.trim().is_empty() {
-        pipeline::default_out_dir(&root_path, "二创")
+        pipeline::default_out_dir(&root_path)
     } else {
         PathBuf::from(out_dir.trim())
     };
@@ -2462,7 +2462,7 @@ pub async fn pipeline_start(
                         Ok((new_title, new_synopsis)) => {
                             // **每次跑都新建一个剧目录，旧的不动。**
                             //
-                            // 用户要的：AI 起了新剧名，就在「二创」下**新建**一个
+                            // 用户要的：AI 起了新剧名，就在剧目录下**新建**一个
                             // 以新剧名命名的文件夹，**保留之前生成的，不覆盖任何东西**。
                             //
                             // 之前我做反了 —— 把上一次的目录改名成新剧名，
@@ -2883,11 +2883,19 @@ pub async fn dedup_media(
     // 一部剧里每集共享一套强度。0 表示用当前时间（每次都不一样）。
     seed: u64,
 ) -> AppResult<DedupReport> {
-    let (ffmpeg, ffprobe, media) = {
+    let (ffmpeg, ffprobe, python, worker, media) = {
         let configured = lock_tools(&state)?.clone();
         let ffmpeg = tools::require(&configured.ffmpeg, "ffmpeg")?;
-        // ffprobe 不是去重的必需品（只用来对尺寸/校验规范），按可选工具拿
-        let ffprobe_tool = tools::resolve(&configured.ffprobe, "ffprobe");
+        // 24/25 的 Lab/DCT 逐帧后处理要 python + ffprobe；两者都在安装包里。
+        // 不再是「可选工具」—— 默认开就必须真的能跑。
+        let python = tools::require(&configured.python, "python")?;
+        let ffprobe = tools::require(&configured.ffprobe, "ffprobe")?;
+        let worker = tools::resources_root()
+            .map(|root| root.join("advanced_noise_worker.py"))
+            .filter(|p| p.is_file())
+            .ok_or_else(|| {
+                AppError::Msg("找不到 advanced_noise_worker.py（安装包不完整？）".into())
+            })?;
         let conn = lock_db(&state)?;
         let mut media = db::get_media(&conn, media_id)?;
         // **处理前先对一遍文件。**
@@ -2895,17 +2903,15 @@ pub async fn dedup_media(
         // 文件可能被重下过：上次那条流坏了、换了一条流重下，宽高和时长都会变，
         // 而库里存的还是导入时的旧值。拿旧宽高当裁切目标，滤镜会报
         // "Invalid too big or non positive size" —— 用户只看到一集莫名失败。
-        if let Some(ffprobe_tool) = ffprobe_tool.as_deref() {
-            if Path::new(&media.path).is_file() {
-                if let Ok(fresh) = media::probe(ffprobe_tool, Path::new(&media.path)) {
-                    if !fresh.matches(&media) {
-                        db::update_media_probe(&conn, media.id, &fresh)?;
-                        media = db::get_media(&conn, media.id)?;
-                    }
+        if ffprobe.is_file() && Path::new(&media.path).is_file() {
+            if let Ok(fresh) = media::probe(&ffprobe, Path::new(&media.path)) {
+                if !fresh.matches(&media) {
+                    db::update_media_probe(&conn, media.id, &fresh)?;
+                    media = db::get_media(&conn, media.id)?;
                 }
             }
         }
-        (ffmpeg, configured.ffprobe, media)
+        (ffmpeg, ffprobe, python, worker, media)
     };
 
     let input = PathBuf::from(&media.path);
@@ -2943,6 +2949,10 @@ pub async fn dedup_media(
     };
     let mut opts = transform::preset_for(level, media_id as usize, &strengths);
     opts.header_label = header_label;
+    // 规范 26：默认两轮。第 1 轮全量（含变速/变调/音频），
+    // 第 2 轮只重摇画面 —— 时长不变、音频不重压。
+    // **不做手动开关**：去重只要效果好，时间慢一点可以接受。
+    opts.rounds = transform::DEFAULT_ROUNDS;
     // 先把「改了什么」记下来 —— opts 马上要 move 进闭包
     let changes = transform::describe(&opts);
 
@@ -2953,9 +2963,20 @@ pub async fn dedup_media(
     };
 
     let id = media.id;
+    let rounds = opts.rounds;
     let path_for_task = out.clone();
+    let ffprobe_for_task = ffprobe.clone();
     let size = tauri::async_runtime::spawn_blocking(move || {
-        transform::apply(&ffmpeg, &input, &path_for_task, &opts, target)
+        transform::apply_rounds(
+            &ffmpeg,
+            &python,
+            &worker,
+            &ffprobe_for_task,
+            &input,
+            &path_for_task,
+            &opts,
+            target,
+        )
     })
     .await
     .map_err(|e| AppError::Msg(format!("去重线程异常终止：{e}")))??;
@@ -2966,8 +2987,8 @@ pub async fn dedup_media(
         db::set_media_processed(&conn, id, &out.to_string_lossy())?;
     }
 
-    let spec_problems = if Path::new(&ffprobe).is_file() {
-        let problems = transform::check_spec(Path::new(&ffprobe), &out);
+    let spec_problems = if ffprobe.is_file() {
+        let problems = transform::check_spec(&ffprobe, &out);
         if problems.is_empty() {
             Vec::new()
         } else {
@@ -2980,11 +3001,25 @@ pub async fn dedup_media(
         Vec::new()
     };
 
+    // 报告里要有**实际**分辨率：滤镜算错了、源尺寸变了，这里能直接看出来。
+    // 时长也带上 —— 多轮重摇如果偷偷改了速度，这里能一眼看出来
+    let (out_width, out_height, out_duration) = if ffprobe.is_file() {
+        media::probe(&ffprobe, &out)
+            .map(|p| (p.width, p.height, p.duration_ms))
+            .unwrap_or((0, 0, 0))
+    } else {
+        (0, 0, 0)
+    };
+
     Ok(DedupReport {
         media_id: id,
         out_path: out.to_string_lossy().to_string(),
         size_bytes: size,
+        width: out_width,
+        height: out_height,
         changes,
+        rounds,
+        duration_ms: out_duration,
         spec_problems,
     })
 }
@@ -4238,7 +4273,7 @@ pub fn fanqie_download_root(state: tauri::State<'_, AppState>) -> AppResult<Stri
 ///         intro.txt
 ///         poster.jpg
 ///         第01集.mp4 …
-///         二创/          ← 流水线产出（每部剧自己的）
+///         <AI剧名>/      ← 流水线产出（和源片平级）
 /// ```
 ///
 /// 只接受绝对路径 —— 相对路径会跟着程序启动目录跑，用户根本找不到。
@@ -4352,9 +4387,14 @@ pub async fn fanqie_download_series(
     // 划一条线：这批下载日志要跟随后那次流水线运行一起显示。
     // 只是记账，写不进去不该让下载本身失败。
     let _ = remember_download_log_mark(&state);
-    let ffmpeg = {
-        let configured = lock_tools(&state)?.ffmpeg.clone();
-        tools::resolve(&configured, "ffmpeg")
+    // ffprobe 只用来量已存在旧集的分辨率：点名 1080p 时，
+    // 以前按 480p 下过的文件不能算「已存在」直接跳过。
+    let (ffmpeg, ffprobe) = {
+        let t = lock_tools(&state)?;
+        (
+            tools::resolve(&t.ffmpeg, "ffmpeg"),
+            tools::resolve(&t.ffprobe, "ffprobe"),
+        )
     };
     let copy_video = !transcode.unwrap_or(false);
     let concurrency = download_concurrency(&state);
@@ -4364,6 +4404,7 @@ pub async fn fanqie_download_series(
         &root,
         quality.as_deref(),
         ffmpeg,
+        ffprobe,
         copy_video,
         // 单部命令没有批次状态可写；事件仍会以完整状态的形式发出
         None,
@@ -4408,9 +4449,12 @@ pub async fn fanqie_download_batch(
 
     // 一整批只划一条线：这批下载日志要跟随后那次流水线运行一起显示。
     let _ = remember_download_log_mark(&state);
-    let ffmpeg = {
-        let configured = lock_tools(&state)?.ffmpeg.clone();
-        tools::resolve(&configured, "ffmpeg")
+    let (ffmpeg, ffprobe) = {
+        let t = lock_tools(&state)?;
+        (
+            tools::resolve(&t.ffmpeg, "ffmpeg"),
+            tools::resolve(&t.ffprobe, "ffprobe"),
+        )
     };
     let copy_video = !transcode.unwrap_or(false);
     let concurrency = download_concurrency(&state);
@@ -4491,6 +4535,7 @@ pub async fn fanqie_download_batch(
             &root,
             quality.as_deref(),
             ffmpeg.clone(),
+            ffprobe.clone(),
             copy_video,
             Some(&tracker),
             concurrency,

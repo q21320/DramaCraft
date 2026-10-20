@@ -28,16 +28,122 @@ pub const BUNDLED_DIR: &str = "bin";
 /// 内置 ASR 运行时所在的子目录名（嵌入式 Python + faster-whisper + 模型）
 pub const ASR_RUNTIME_DIR: &str = "asr_runtime";
 
+/// 各平台二进制各自的子目录名：`resources/bin/<这里>/ffmpeg`。
+///
+/// Windows 版直接放在 `bin/` 根下（历史布局，安装包已经这样发了，不动它），
+/// 其他平台按名字分开放，这样 macOS / Linux 的二进制能和 Windows 的 `.exe`
+/// 并存：仓库同时服务多端时，`bin/` 里只放本机能跑的那几个是做不到的。
+pub fn platform_tag() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        // 只按操作系统分，不按 CPU 分：同一份 `bin/macos/` 给 Apple Silicon 用，
+        // CPU 后缀那条路留作以后真要分开发布时的扩展点。
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unknown"
+    }
+}
+
 static BUNDLED_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
 /// 启动时登记内置目录（可以有多个：bin 放 ffmpeg，asr_runtime 放 python）。
+///
+/// 面板上的「内置」标注以 `bin` / `asr_runtime` 两个根目录为界，下面这些
+/// 平台子目录都算内置 —— 界面看起来是一条路，文件在路上放哪儿随便。
+///
+/// - `bin/<非 windows 平台>/`：macOS / Linux 的 ffmpeg、ffprobe
+/// - `asr_runtime/<非 windows 平台>/bin/`：嵌入式 Python（python-build-standalone
+///   的 install_only 布局：`python/bin/python`、`lib/python3.x/site-packages`）
+///
+/// **Windows 一个子目录都不展开**：它那套运行时就在 `asr_runtime\python.exe`
+/// 和 `bin\ffmpeg.exe` 根下，查找顺序与旧版完全一致。
+///
 /// 进程生命周期内只设一次，之后所有解析都能看到它们。
 pub fn set_bundled_dirs(dirs: Vec<PathBuf>) {
-    let _ = BUNDLED_DIRS.set(dirs);
+    let tag = platform_tag();
+    let mut expanded = Vec::new();
+    for dir in dirs {
+        if tag == "windows" {
+            expanded.push(dir);
+            continue;
+        }
+        let name = dir.file_name().and_then(|n| n.to_str());
+        if name == Some(BUNDLED_DIR) {
+            let platform_dir = dir.join(tag);
+            if platform_dir.is_dir() {
+                expanded.push(platform_dir);
+            }
+        }
+        if name == Some(ASR_RUNTIME_DIR) {
+            let platform_dir = dir.join(tag);
+            // python-build-standalone：解释器在 <平台>/bin/python
+            let platform_bin = platform_dir.join("bin");
+            if platform_bin.is_dir() {
+                expanded.push(platform_bin);
+            }
+            if platform_dir.is_dir() {
+                expanded.push(platform_dir);
+            }
+        }
+        expanded.push(dir);
+    }
+    let _ = BUNDLED_DIRS.set(expanded);
 }
 
 pub fn bundled_dirs() -> &'static [PathBuf] {
     BUNDLED_DIRS.get().map(|v| v.as_slice()).unwrap_or(&[])
+}
+
+/// 资源根目录：开发时就是源码里的 `resources/`，打包后在启动阶段登记。
+///
+/// 存的是 `bin` / `asr_runtime` 的**父目录**，只为了在运行时能反推出
+/// `resources/asr_runtime/<平台>/models/` 这类没被登记成"内置工具目录"的位置。
+static RESOURCES_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// 启动时由 `lib.rs` 调一次。
+pub fn set_resources_root(root: PathBuf) {
+    let _ = RESOURCES_ROOT.set(root);
+}
+
+/// 资源根目录（可能为 None：测试进程里没登记、也没有源码目录时）。
+pub fn resources_root() -> Option<PathBuf> {
+    if let Some(root) = RESOURCES_ROOT.get() {
+        return Some(root.clone());
+    }
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+    dev.is_dir().then_some(dev)
+}
+
+/// 资源目录下本平台内置运行时的路径。
+///
+/// 返回 `(ffmpeg/ffprobe 所在目录, asr_runtime 的平台目录)`：
+/// - Windows：`bin/` 与 `asr_runtime/` 本身（根下就是 exe）
+/// - 其他平台：`bin/<平台>/`、`asr_runtime/<平台>/`（解释器在 `<平台>/bin/python`）
+pub fn bundled_paths(resources: &Path) -> (PathBuf, PathBuf) {
+    let bin = resources.join(BUNDLED_DIR);
+    let runtime = resources.join(ASR_RUNTIME_DIR);
+    let tag = platform_tag();
+    if tag == "windows" {
+        (bin, runtime)
+    } else {
+        (bin.join(tag), runtime.join(tag))
+    }
+}
+
+/// 在资源目录里找内置 Python：`<运行时平台目录>/bin/python`（python-build-standalone 的
+/// install_only 布局），找不到再看平台目录本身（解释器直接放在那儿的情况）。
+pub fn bundled_python(resources: &Path) -> Option<PathBuf> {
+    let (_, runtime) = bundled_paths(resources);
+    binary_in(&runtime.join("bin"), "python").or_else(|| binary_in(&runtime, "python"))
+}
+
+/// 在资源目录里找内置 ffmpeg / ffprobe。
+pub fn bundled_ffmpeg(resources: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
+    let (bin, _) = bundled_paths(resources);
+    (binary_in(&bin, "ffmpeg"), binary_in(&bin, "ffprobe"))
 }
 
 /// 某个工具是否来自任一内置目录（界面上如实标注"内置"）
@@ -251,18 +357,23 @@ mod tests {
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::fs::write(builtin.join("ffmpeg.exe"), b"builtin").unwrap();
         std::fs::write(elsewhere.join("ffmpeg.exe"), b"path").unwrap();
+        // 非 Windows 上 `ffmpeg.exe` 不是可执行文件，同一组用例按平台用对应文件名
+        let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+        std::fs::write(builtin.join(exe), b"builtin").unwrap();
+        std::fs::write(elsewhere.join(exe), b"path").unwrap();
 
         // 内置目录排在前面，就应当拿到内置那份
         let got = resolve_from(&[builtin.clone(), elsewhere.clone()], "ffmpeg").unwrap();
-        assert_eq!(got, builtin.join("ffmpeg.exe"));
+        assert_eq!(got, builtin.join(exe));
 
         // 内置目录里没有时才轮到后面的
         let got = resolve_from(&[builtin.clone(), elsewhere.clone()], "ffprobe");
         assert!(got.is_none(), "两边都没有就不该编出一个路径");
 
-        std::fs::write(builtin.join("ffprobe.exe"), b"builtin").unwrap();
+        let probe = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+        std::fs::write(builtin.join(probe), b"builtin").unwrap();
         let got = resolve_from(&[builtin.clone(), elsewhere], "ffprobe").unwrap();
-        assert_eq!(got, builtin.join("ffprobe.exe"));
+        assert_eq!(got, builtin.join(probe));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -275,8 +386,14 @@ mod tests {
         std::fs::write(dir.join("tool.exe"), b"x").unwrap();
         std::fs::write(dir.join("plain"), b"x").unwrap();
 
-        assert!(binary_in(&dir, "tool").is_some(), "应当能找到 tool.exe");
+        // 无后缀的文件各平台都认（macOS / Linux 的可执行文件就长这样）
         assert_eq!(binary_in(&dir, "plain"), Some(dir.join("plain")));
+        // `.exe` 只有 Windows 会去试 —— 其他平台上它是个普通文件，不该被当成命令
+        if cfg!(windows) {
+            assert_eq!(binary_in(&dir, "tool"), Some(dir.join("tool.exe")));
+        } else {
+            assert!(binary_in(&dir, "tool").is_none());
+        }
         assert!(binary_in(&dir, "missing").is_none());
         // 目录名不该被当成可执行文件
         assert!(binary_in(&dir, "sub").is_none());
@@ -298,19 +415,15 @@ mod tests {
         let second = root.join("asr_runtime");
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
-        std::fs::write(first.join("ffmpeg.exe"), b"x").unwrap();
-        std::fs::write(second.join("python.exe"), b"x").unwrap();
+        let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+        std::fs::write(first.join(exe), b"x").unwrap();
+        const PY: &str = if cfg!(windows) { "python.exe" } else { "python" };
+        std::fs::write(second.join(PY), b"x").unwrap();
 
         // 两个目录各有各的工具，合起来都能找到
         let dirs = vec![first.clone(), second.clone()];
-        assert_eq!(
-            resolve_from(&dirs, "ffmpeg"),
-            Some(first.join("ffmpeg.exe"))
-        );
-        assert_eq!(
-            resolve_from(&dirs, "python"),
-            Some(second.join("python.exe"))
-        );
+        assert_eq!(resolve_from(&dirs, "ffmpeg"), Some(first.join(exe)));
+        assert_eq!(resolve_from(&dirs, "python"), Some(second.join(PY)));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -319,17 +432,48 @@ mod tests {
     ///
     /// 两件事合在一个测试里：`set_bundled_dirs` 是**进程级一次性**的，
     /// 拆成两个测试会互相抢注册，跑的顺序一变就假失败。
+    ///
+    /// 布局：
+    /// - Windows：`bin/ffmpeg.exe`、`asr_runtime/python.exe`（根下）
+    /// - macOS / Linux：`bin/<平台>/ffmpeg`、`asr_runtime/<平台>/bin/python`
+    ///
+    /// 断言用「解析结果 = 找到的那个文件」，不写死后缀，也不写死子目录层级，
+    /// 否则非 Windows 平台上 `bin/` 根下的 `*.exe` 会让测试"假装通过"。
     #[test]
     fn end_to_end_bundled_runtimes_are_found_and_runnable() {
         let resources = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
         let bin = resources.join(BUNDLED_DIR);
         let runtime = resources.join(ASR_RUNTIME_DIR);
+        let tag = platform_tag();
+        // 本平台二进制所在目录；Windows 上就是 bin 根下
+        let bin_dir = if tag == "windows" {
+            bin.clone()
+        } else {
+            bin.join(tag)
+        };
+        // 与 set_bundled_dirs 保持同一套候选
+        let runtime_dir = if tag == "windows" {
+            runtime.clone()
+        } else {
+            runtime.join(tag)
+        };
+        let runtime_bin = if tag == "windows" {
+            runtime.clone()
+        } else {
+            runtime_dir.join("bin")
+        };
+
+        let bundled_ffmpeg = binary_in(&bin_dir, "ffmpeg");
+        let bundled_ffprobe = binary_in(&bin_dir, "ffprobe");
+        let bundled_python = binary_in(&runtime_bin, "python")
+            .or_else(|| binary_in(&runtime_dir, "python"));
 
         let mut dirs: Vec<PathBuf> = Vec::new();
-        if bin.join("ffmpeg.exe").is_file() {
+        // 登记的是资源根下的两个目录（真实调用点也这么传），子目录由 set_bundled_dirs 展开
+        if bundled_ffmpeg.is_some() || bundled_ffprobe.is_some() {
             dirs.push(bin.clone());
         }
-        if runtime.join("python.exe").is_file() {
+        if bundled_python.is_some() {
             dirs.push(runtime.clone());
         }
         if dirs.is_empty() {
@@ -339,35 +483,35 @@ mod tests {
         set_bundled_dirs(dirs);
 
         // --- ffmpeg ---
-        if bin.join("ffmpeg.exe").is_file() {
+        if let (Some(ffmpeg), Some(ffprobe)) = (bundled_ffmpeg, bundled_ffprobe) {
             // 关键：设置里什么都没配（空字符串），也应当解析到内置那份
-            let ffmpeg = resolve("", "ffmpeg").expect("没解析到内置 ffmpeg");
-            assert_eq!(ffmpeg, bin.join("ffmpeg.exe"));
-            assert!(is_bundled(&ffmpeg), "应当被标记为内置");
+            let got = resolve("", "ffmpeg").expect("没解析到内置 ffmpeg");
+            assert_eq!(got, ffmpeg, "内置 ffmpeg 应当优先于 PATH");
+            assert!(is_bundled(&got), "应当被标记为内置");
 
-            let ffprobe = resolve("", "ffprobe").expect("没解析到内置 ffprobe");
-            assert_eq!(ffprobe, bin.join("ffprobe.exe"));
+            let got = resolve("", "ffprobe").expect("没解析到内置 ffprobe");
+            assert_eq!(got, ffprobe);
 
             // 光有文件不算数，真的跑得起来才算
             let report = probe_tool("ffmpeg", &ffmpeg);
             assert!(report.available, "内置 ffmpeg 跑不起来：{}", report.detail);
             assert!(report.version.starts_with("ffmpeg version"), "{}", report.version);
-            assert!(report.bundled);
+            assert!(report.bundled, "应当被标记为内置：{}", report.path);
         }
 
         // --- 内置 ASR 运行时 ---
-        if runtime.join("python.exe").is_file() {
+        if let Some(python) = bundled_python {
             // 用户没配 Python 时，应当解析到内置的那一份
-            let python = resolve("", "python").expect("没解析到内置 python");
-            assert_eq!(python, runtime.join("python.exe"));
-            assert!(is_bundled(&python));
+            let got = resolve("", "python").expect("没解析到内置 python");
+            assert_eq!(got, python);
+            assert!(is_bundled(&got), "内置 python 应当被标记为内置：{}", got.display());
 
             let report = probe_tool("python", &python);
             assert!(report.available, "内置 python 跑不起来：{}", report.detail);
             assert!(report.bundled);
 
             // 模型也应当随运行时一起在
-            let model = runtime.join("models").join("tiny").join("model.bin");
+            let model = runtime_dir.join("models").join("tiny").join("model.bin");
             assert!(model.is_file(), "内置模型缺失：{}", model.display());
         }
 

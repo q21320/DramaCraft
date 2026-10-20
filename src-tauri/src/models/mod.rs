@@ -222,10 +222,100 @@ pub struct TransformOptions {
     /// 目标码率（bps，0 = 走 CRF）。真实软件要求成片 ≥6Mbps
     #[serde(default)]
     pub bitrate_bps: i64,
+    /// CRF 质量档（0 = 用默认 20，19~23 常用）。
+    /// 只在**没有目标码率**时生效 —— 给了码率就走受限 VBR，CRF 会被编码器忽略
+    #[serde(default)]
+    pub crf: i64,
+
+    // ---------------- 音频 / 时序 / 纹理的实质性处理 ----------------
+    //
+    // 这几项不是「调个参数」那么轻：单纯改音量对音频指纹几乎无效，
+    // 抽帧和扫光动的才是比对真正看的东西。
+
+    /// 音频变调比例（1.0 = 不变，0.99~1.01）。不改时长，只挪频谱
+    #[serde(default = "default_pitch")]
+    pub pitch: f64,
+    /// 抽帧间隔：每 N 帧丢掉 1 帧（0 = 不抽）。丢掉的帧由 fps 重采样补一帧，
+    /// 时间轴不变，但逐帧比对会对不上
+    #[serde(default)]
+    pub drop_every: u32,
+    /// 抽帧相位（0 ~ drop_every-1），让每集抽在不同位置
+    #[serde(default)]
+    pub drop_phase: u32,
+    /// 动态扫光透明度（0 = 关，0.02~0.06）。极淡的亮带横向扫过，
+    /// 改变像素级纹理
+    #[serde(default)]
+    pub sweep: f64,
+
+    /// 微旋转角度（度，-2.0~2.0，0 = 不转）。
+    ///
+    /// 旋转后会自动放大再裁回，四角不留黑边 —— 放大多少由画面比例算。
+    #[serde(default)]
+    pub rotate_deg: f64,
+    /// 四角之一的小色块透明度（0 = 关，0.01~0.05）。
+    /// 极小的半透明色块，肉眼几乎看不见，但那一块的像素值变了
+    #[serde(default)]
+    pub patch_alpha: f64,
+    /// 小色块在哪个角：0 左上、1 右上、2 左下、3 右下
+    #[serde(default)]
+    pub patch_corner: u8,
+    /// 音频整体延迟（毫秒，0~200）：开头垫一段静音
+    #[serde(default)]
+    pub audio_delay_ms: i64,
+    /// 立体声左右声道相位差（毫秒，0~3）。单声道只用第一值，不会出错
+    #[serde(default)]
+    pub stereo_phase_ms: i64,
+    /// 极低电平白噪声振幅（0 = 关，约 0.0004~0.001，≈ -68dBFS）
+    #[serde(default)]
+    pub white_noise: f64,
+    /// 16~20kHz 高频噪声振幅（0 = 关，0.001~0.006，独立于白噪）
+    #[serde(default)]
+    pub high_noise: f64,
+    /// 立体声宽度（1.0 = 不变，0.97~1.03）。只动 Side 声道，不改音调语速
+    #[serde(default = "default_stereo_width")]
+    pub stereo_width: f64,
+    /// PTS 微扰幅度（毫秒，0 = 关，2~5ms）。只落在部分帧上，远小于一帧间隔
+    #[serde(default)]
+    pub pts_jitter_ms: f64,
+    /// 每隔多少帧做一次 PTS 微扰（0 = 关，4~8）
+    #[serde(default)]
+    pub pts_jitter_every: u32,
+    /// 微扰落在间隔里的第几帧（0 ~ every-1），让每集错开
+    #[serde(default)]
+    pub pts_jitter_phase: u32,
+    /// x264 场景切换阈值（0 = 默认 40，20~60 随机）。
+    /// 它决定画面切镜头时提不提前插关键帧 —— 关键帧位置因此不是固定节奏
+    #[serde(default)]
+    pub scenecut: i64,
+    /// Lab a*/b* 通道的低强度对抗噪声 σ（0 = 关，2.0~3.0）。
+    ///
+    /// **不在 ffmpeg 滤镜链里**：需要逐帧 Python pass，只在整集去重时执行
+    #[serde(default)]
+    pub lab_noise: f64,
+    /// Y 通道 8x8 DCT 低频系数扰动幅度（0 = 关，2.5~4.0）。
+    /// 同样走逐帧 Python pass
+    #[serde(default)]
+    pub dct_noise: f64,
+    /// 去重轮数（0 = 用默认 2）。
+    ///
+    /// **只有整集去重会看它**：第 1 轮全量处理，之后每轮**只重摇画面** ——
+    /// 变速/变调/音量/音频延迟全部锁在中性值，所以时长不变、音频只压一次。
+    /// 单步工具页不传这个字段，永远只跑一轮。
+    #[serde(default)]
+    pub rounds: i64,
+}
+
+/// 变调的中性值是 1.0 —— `f64::default()` 的 0.0 会被当成「降一半调」
+fn default_pitch() -> f64 {
+    1.0
 }
 
 fn default_bframes() -> i64 {
     -1
+}
+
+fn default_stereo_width() -> f64 {
+    1.0
 }
 
 /// 画在角落的剧名角标。
@@ -278,7 +368,28 @@ impl Default for TransformOptions {
             corner_label: None,
             gop: 0,
             bframes: -1,
-            bitrate_bps: 0,        }
+            bitrate_bps: 0,
+            crf: 0,
+            pitch: 1.0,
+            drop_every: 0,
+            drop_phase: 0,
+            sweep: 0.0,
+            rotate_deg: 0.0,
+            patch_alpha: 0.0,
+            patch_corner: 0,
+            audio_delay_ms: 0,
+            stereo_phase_ms: 0,
+            white_noise: 0.0,
+            high_noise: 0.0,
+            stereo_width: 1.0,
+            pts_jitter_ms: 0.0,
+            pts_jitter_every: 0,
+            pts_jitter_phase: 0,
+            scenecut: 0,
+            lab_noise: 0.0,
+            dct_noise: 0.0,
+            rounds: 0,
+        }
     }
 }
 
@@ -914,10 +1025,24 @@ pub struct DedupReport {
     /// 去重产物。**这才是发布用的东西**，切片是它的下游。
     pub out_path: String,
     pub size_bytes: i64,
+    /// 成片实际分辨率（没配 ffprobe 时是 0）。报告要求写出实际值，
+    /// 而不是“应该缩到了 720p”
+    #[serde(default)]
+    pub width: i64,
+    #[serde(default)]
+    pub height: i64,
     /// 这一集到底改了什么 —— 给日志看的效果差异。
     /// 每片参数按序号生成、故意各不相同，列出来用户才知道这步真干了活。
     #[serde(default)]
     pub changes: String,
+    /// 实际跑了几轮画面重摇（规范 26）。
+    /// 第 1 轮含变速/变调/音频，第 2 轮起只重摇画面，**时长不变**
+    #[serde(default)]
+    pub rounds: i64,
+    /// 处理后的实际时长（毫秒，探测失败时是 0）。
+    /// 多轮处理要能看出时长有没有变，不能只看文件大小
+    #[serde(default)]
+    pub duration_ms: i64,
     /// 没达到平台规范的地方（只是提示）
     #[serde(default)]
     pub spec_problems: Vec<crate::transform::SpecProblem>,
@@ -1590,6 +1715,11 @@ pub struct FanqieDownloadState {
     pub error: String,
     /// 实际落盘的剧名（下载根里还躺着以前下的剧，流水线只该跑这几部）
     pub landed: Vec<String>,
+    /// 此刻正在下载的集（“第03集”）。
+    ///
+    /// 并发 3 时面板只显示一条 message，看起来像“一次只下了一集”——
+    /// 这个字段让前端能把并行的那几集都摆出来。
+    pub inflight: Vec<String>,
 }
 
 /// 批量下载时前端传过来的一部剧。分集列表由后端自己拉 ——

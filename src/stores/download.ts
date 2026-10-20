@@ -57,6 +57,8 @@ export const useDownloadStore = defineStore("download", {
     error: "",
     /** 实际落盘的剧名，下载完交给流水线只跑这几部 */
     landed: [] as string[],
+    /** 此刻正在下载的集：并发 3 时会同时列出三集 */
+    inflight: [] as string[],
   }),
 
   getters: {
@@ -83,6 +85,7 @@ export const useDownloadStore = defineStore("download", {
       this.root = s.root;
       this.error = s.error;
       this.landed = s.landed ?? [];
+      this.inflight = s.inflight ?? [];
     },
 
     /** 监听后端进度；重复调用无副作用。 */
@@ -222,6 +225,10 @@ export const useDownloadStore = defineStore("download", {
             episodeCount: v.episodeCount ?? 0,
           })),
           root,
+          // 锁死 1080p：平台最高档，给后期裁切/去重留余量。
+          // 平台没有 1080p 时后端按高清逐档退（720 → 540 …），不会悄悄落成 480p；
+          // 目录里以前按低清下过的集会被验出分辨率不够，自动删掉重下。
+          "1080p",
         );
 
         // 以后端状态为准：事件可能错过最后一两条

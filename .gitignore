@@ -23,3 +23,8 @@ src-tauri/resources/asr_runtime/
 
 # LaMa 模型（198MB，太大不进库；下载地址见 docs/gpu-setup.md）
 models/
+
+# macOS FFmpeg / FFprobe (~130 MB, not committed).
+# Put them in src-tauri/resources/bin/macos/ ; the app treats bin/macos/ as a bundled dir.
+src-tauri/resources/bin/macos/
+src-tauri/resources/bin/macos-*/

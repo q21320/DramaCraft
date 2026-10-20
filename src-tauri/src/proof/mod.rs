@@ -490,13 +490,30 @@ pub fn save_layout(path: &Path, layout: &ProofLayout) -> AppResult<()> {
 }
 
 /// 挑一个系统里存在的中文字体，省得用户第一件事就是找字体。
+///
+/// 各平台只有一份候选表：Windows 认 `.ttf/.ttc` 的 Windows 字体目录，
+/// macOS 认系统自带的几款（`STHeiti Medium.ttc` + ffmpeg drawtext 实测中文正常）。
 pub fn guess_font() -> String {
+    #[cfg(windows)]
     const CANDIDATES: [&str; 5] = [
         "C:/Windows/Fonts/simfang.ttf",
         "C:/Windows/Fonts/simhei.ttf",
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simsun.ttc",
         "C:/Windows/Fonts/arial.ttf",
+    ];
+    #[cfg(target_os = "macos")]
+    const CANDIDATES: [&str; 4] = [
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+    ];
+    #[cfg(not(any(windows, target_os = "macos")))]
+    const CANDIDATES: [&str; 3] = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
     ];
     CANDIDATES
         .iter()

@@ -39,13 +39,35 @@ pub fn bundled_model_dir(size: &str) -> Option<PathBuf> {
             return Some(candidate);
         }
     }
+    // 非 Windows：模型在 `asr_runtime/<平台>/models/<规格>` 下（Windows 的
+    // 运行时根目录就在候选里，走上面那段就够了）
+    let tag = crate::tools::platform_tag();
+    if tag != "windows" {
+        if let Some(root) = crate::tools::resources_root() {
+            let (_, runtime) = crate::tools::bundled_paths(&root);
+            let candidate = runtime.join("models").join(size);
+            if candidate.join("model.bin").is_file() {
+                return Some(candidate);
+            }
+        }
+    }
     None
 }
 
 /// 随程序分发的模型规格列表（按名字排序）。
 pub fn bundled_model_sizes() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for dir in crate::tools::bundled_dirs() {
+    let mut roots: Vec<PathBuf> = crate::tools::bundled_dirs().to_vec();
+    // 非 Windows：模型在 `asr_runtime/<平台>/models/` 下
+    if crate::tools::platform_tag() != "windows" {
+        if let Some(root) = crate::tools::resources_root() {
+            let (_, runtime) = crate::tools::bundled_paths(&root);
+            if !roots.contains(&runtime) {
+                roots.push(runtime);
+            }
+        }
+    }
+    for dir in roots {
         let Ok(entries) = std::fs::read_dir(dir.join("models")) else {
             continue;
         };
@@ -279,14 +301,11 @@ mod tests {
 
     #[test]
     fn bundled_runtime_reports_asr_available() {
-        let python = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join("asr_runtime")
-            .join("python.exe");
-        if !python.is_file() {
+        let resources = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+        let Some(python) = crate::tools::bundled_python(&resources) else {
             eprintln!("跳过：没有内置 ASR 运行时");
             return;
-        }
+        };
         // 这一条正对着用户看到的那张截图：内置运行时必须报告"可用"，
         // 而不是"该 Python 里没有安装 faster-whisper"。
         let s = status(&python.to_string_lossy());
@@ -316,10 +335,23 @@ mod tests {
         // 素材是纯音调，所以期望"成功但无文本" —— 验证的是模型能加载、能推理、
         // 协议能往返，而不是识别准确率。
         let resources = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-        let python = resources.join("asr_runtime").join("python.exe");
-        let model = resources.join("asr_runtime").join("models").join("tiny");
-        let ffmpeg = resources.join("bin").join("ffmpeg.exe");
-        if !python.is_file() || !model.join("model.bin").is_file() || !ffmpeg.is_file() {
+        let (_, runtime) = crate::tools::bundled_paths(&resources);
+        let python = match crate::tools::bundled_python(&resources) {
+            Some(p) => p,
+            None => {
+                eprintln!("跳过：内置运行时或模型不完整");
+                return;
+            }
+        };
+        let model = runtime.join("models").join("tiny");
+        let ffmpeg = match crate::tools::bundled_ffmpeg(&resources).0 {
+            Some(p) => p,
+            None => {
+                eprintln!("跳过：内置运行时或模型不完整");
+                return;
+            }
+        };
+        if !model.join("model.bin").is_file() {
             eprintln!("跳过：内置运行时或模型不完整");
             return;
         }

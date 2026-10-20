@@ -766,8 +766,21 @@ pub async fn execute(app: &AppHandle, job: &Job) -> AppResult<String> {
             };
             // 把「改了什么」写出来 —— 用户抱怨过「看不到去重效果差异日志」。
             // 每片参数按序号生成、故意各不相同，不列出来就只是一句"完成了"。
+            let res = if report.width > 0 && report.height > 0 {
+                format!("{}×{}", report.width, report.height)
+            } else {
+                "分辨率未知".to_string()
+            };
+            // 时长要写出来：多轮处理最担心的就是时长被叠加的变速压短
+            let dur = if report.duration_ms > 0 {
+                format!("{:.1}s", report.duration_ms as f64 / 1000.0)
+            } else {
+                "时长未知".to_string()
+            };
             Ok(format!(
-                "去重完成（{mb:.1} MB）｜改了：{}｜{spec}",
+                "去重完成（{}轮｜{mb:.1} MB｜{res}｜{dur}）→ {}｜改了：{}｜{spec}",
+                report.rounds.max(1),
+                report.out_path,
                 report.changes
             ))
         }
@@ -1029,7 +1042,46 @@ fn job_concurrency() -> i64 {
 fn concurrency_for(kind: &str) -> i64 {
     match kind {
         "desubtitle" => 2,
+        // 去重现在有两遍编码：主链路一遍，Lab/DCT 逐帧 pass 再一遍，
+        // 每路都要吃满编码线程。3~4 路同跑会互相抢核，反而更慢。
+        "dedup" => job_concurrency().min(2),
         _ => job_concurrency(),
+    }
+}
+
+/// 一部剧的任务全部处置完后，删掉整剧重组的临时视频。
+///
+/// 重组产物只是「去重 / 去字幕」的输入；成品在 `去重/` 和 `quzimu/` 里。
+/// 不清理的话，一部剧会多出一整套和源片等大的 `重组/第NN集.mp4`。
+///
+/// **必须等 pending / running 都归零** —— 提前删会让还在跑的任务
+/// 直接报「原片不在了」。失败时后面的任务已被撤掉，同样可以清。
+fn cleanup_regroup_if_settled(
+    conn: &rusqlite::Connection,
+    drama_id: i64,
+    run_id: Option<i64>,
+) {
+    let settled = db::drama_job_state(conn, drama_id)
+        .map(|(pending, _, _)| pending == 0)
+        .unwrap_or(false);
+    if !settled {
+        return;
+    }
+    let Ok(Some(d)) = db::get_pipeline_drama(conn, drama_id) else {
+        return;
+    };
+    let (n, bytes) = crate::pipeline::cleanup_regroup(std::path::Path::new(&d.out_dir));
+    if n > 0 {
+        let _ = db::append_log(
+            conn,
+            run_id,
+            Some(drama_id),
+            "info",
+            &format!(
+                "已清理整剧重组临时视频 {n} 个（{:.0} MB）",
+                bytes as f64 / 1048576.0
+            ),
+        );
     }
 }
 
@@ -1332,6 +1384,12 @@ async fn run_inner(app: &AppHandle, limit: i64) -> AppResult<QueueReport> {
                         }
                     }
                 }
+                // **这部剧的所有任务都处置完了 —— 重组的临时视频可以删了。**
+                //
+                // 成功、失败都清：失败时后面的任务已经被撤掉，留着也没人再用。
+                // 但必须等 pending / running 都归零 —— 去重和去字幕读的都是
+                // 重组产物，提前删会让还在跑的任务直接报「原片不在了」。
+                cleanup_regroup_if_settled(&conn, drama_id, run_id);
             }
         }
 
@@ -1571,6 +1629,47 @@ mod tests {
         assert_eq!(human_size(2048), "2.0 KB");
         assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
         assert_eq!(human_size(300 * 1024 * 1024), "300 MB");
+    }
+
+    #[test]
+    fn regroup_temp_files_are_cleaned_only_after_jobs_settle() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate_for_tests(&conn).unwrap();
+
+        let out = std::env::temp_dir().join("dramadist_queue_regroup_cleanup");
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(out.join("重组")).unwrap();
+        std::fs::write(out.join("重组/第01集.mp4"), b"x").unwrap();
+
+        let run = crate::db::create_pipeline_run(&conn, "src", "out", &[]).unwrap();
+        let drama = crate::db::add_pipeline_drama(
+            &conn,
+            run,
+            "某剧",
+            "src",
+            &out.to_string_lossy(),
+            1,
+            None,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO job(kind, payload, status, message, attempts, created_at, updated_at, pipeline_drama_id)
+             VALUES('dedup', '{}', 'running', '', 0, '', '', ?1)",
+            rusqlite::params![drama],
+        )
+        .unwrap();
+        let job_id = conn.last_insert_rowid();
+
+        // 还有任务在跑：一个字节都不能删
+        cleanup_regroup_if_settled(&conn, drama, Some(run));
+        assert!(out.join("重组/第01集.mp4").is_file());
+
+        // 任务处置完：临时视频删掉
+        crate::db::finish_job(&conn, job_id, crate::db::JOB_DONE, "ok").unwrap();
+        cleanup_regroup_if_settled(&conn, drama, Some(run));
+        assert!(!out.join("重组").exists());
+
+        let _ = std::fs::remove_dir_all(&out);
     }
 }
 #[cfg(test)]

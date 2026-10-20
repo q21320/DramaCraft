@@ -242,6 +242,15 @@ export interface DedupReport {
   mediaId: number;
   outPath: string;
   sizeBytes: number;
+  /** 成片实际分辨率；没配 ffprobe 时是 0 */
+  width: number;
+  height: number;
+  /** 这一集到底改了什么（日志用） */
+  changes: string;
+  /** 实际跑了几轮画面重摇（规范 26） */
+  rounds: number;
+  /** 处理后的实际时长（毫秒，探测失败时是 0） */
+  durationMs: number;
   /** 没达到平台规范的地方（只是提示，不是失败） */
   specProblems: { file: string; problems: string[] }[];
 }
@@ -988,6 +997,8 @@ export interface FanqieDownloadState {
   error: string;
   /** 实际落盘的剧名，下载完交给流水线只跑这几部 */
   landed: string[];
+  /** 此刻正在下载的集（如「第03集」）：并发时会同时有好几个 */
+  inflight: string[];
 }
 
 /** 批量下载时交给后端的一部剧。分集列表由后端自己拉。 */

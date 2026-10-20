@@ -38,7 +38,13 @@
     "targets": ["nsis"],
     "publisher": "DramaDist",
     "category": "Video",
-    "resources": ["resources/*", "resources/bin/*", "resources/asr_runtime/**/*"],
+    "resources": [
+      "resources/*",
+      "resources/bin/*",
+      "resources/bin/*/*",
+      "resources/asr_runtime/**/*",
+      "resources/asr_runtime/*"
+    ],
     "shortDescription": "短剧切片分发工作台",
     "longDescription": "DramaDist 是一款纯本地的短剧素材处理与分发工具：导入长剧素材，自动切片、生成字幕轴、导出成片。",
     "icon": [

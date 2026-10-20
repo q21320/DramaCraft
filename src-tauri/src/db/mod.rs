@@ -651,6 +651,24 @@ pub fn media_source_path(conn: &Connection, media_id: i64) -> AppResult<String> 
     }
 }
 
+/// 去字幕该读哪个文件：**原片**，不管有没有去重产物。
+///
+/// 真实软件的日志写的是「AI去字幕（开拍 · 原视频第1～第4集）」——
+/// 这一环吃的是原视频，不是去重产物。去重产物已经过裁切、缩放、扫光，
+/// 字幕的位置和盖块尺寸都得按它重算；而去字幕产物又是给「证明」链用的，
+/// 证明本来就该回到原始素材。
+///
+/// 注意和 [`media_source_path`] 的区别：那个是**切片/分镜**用的，
+/// 优先取去重产物（发布画面）；去字幕必须从这里取原片。
+pub fn media_original_path(conn: &Connection, media_id: i64) -> AppResult<String> {
+    let raw: String = conn.query_row(
+        "SELECT path FROM media WHERE id = ?1",
+        params![media_id],
+        |row| row.get(0),
+    )?;
+    Ok(raw)
+}
+
 pub fn remove_media(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute("DELETE FROM cue WHERE media_id = ?1", params![id])?;
     conn.execute("DELETE FROM segment WHERE media_id = ?1", params![id])?;
@@ -1098,6 +1116,18 @@ pub fn list_pipeline_dramas(conn: &Connection, run_id: i64) -> AppResult<Vec<Pip
         out.push(item?);
     }
     Ok(out)
+}
+
+/// 取一条剧目进度记录。收尾时要拿它的 `out_dir` 去清理重组临时视频。
+pub fn get_pipeline_drama(conn: &Connection, id: i64) -> AppResult<Option<PipelineDrama>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {DRAMA_COLUMNS} FROM pipeline_drama WHERE id = ?1"
+    ))?;
+    let mut rows = stmt.query(params![id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row_to_pipeline_drama(row)?)),
+        None => Ok(None),
+    }
 }
 
 pub fn get_pipeline_run(conn: &Connection, id: i64) -> AppResult<Option<PipelineRun>> {
@@ -2249,6 +2279,49 @@ mod tests {
 
         delete_project(&conn, p.id).unwrap();
         assert_eq!(list_media(&conn, p.id).unwrap().len(), 0);
+    }
+
+    /// **去字幕读原片，切片读去重产物。**
+    ///
+    /// 用户明确纠正过：「去字幕需要用原视频」。参考软件的日志也是
+    /// 「AI去字幕（开拍 · 原视频第1～第4集）」—— 去重产物被裁切/缩放/扫光过，
+    /// 字幕位置和盖块尺寸都得按它重算，所以这一环必须回到原片。
+    #[test]
+    fn desubtitle_reads_the_original_while_slicing_prefers_the_processed_file() {
+        let conn = mem();
+        let project = create_project(&conn, "p", "").unwrap();
+        let probe = MediaProbe {
+            duration_ms: 60_000,
+            width: 1080,
+            height: 1920,
+            has_audio: true,
+            size_bytes: 1,
+            format_name: "mp4".into(),
+        };
+
+        let dir = std::env::temp_dir().join("dramadist_desubtitle_source");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("第01集.mp4");
+        let processed = dir.join("第01集_t.mp4");
+        std::fs::write(&raw, b"r").unwrap();
+        std::fs::write(&processed, b"p").unwrap();
+
+        let m = add_media(&conn, project.id, &raw.to_string_lossy(), "第01集.mp4", &probe).unwrap();
+        set_media_processed(&conn, m.id, &processed.to_string_lossy()).unwrap();
+
+        assert_eq!(
+            media_original_path(&conn, m.id).unwrap(),
+            raw.to_string_lossy().to_string(),
+            "去字幕必须读原片"
+        );
+        assert_eq!(
+            media_source_path(&conn, m.id).unwrap(),
+            processed.to_string_lossy().to_string(),
+            "切片/分镜仍然优先读去重产物"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 文件被重下过（换了清晰度/换了流）：宽高和时长要能改，其他字段别动。

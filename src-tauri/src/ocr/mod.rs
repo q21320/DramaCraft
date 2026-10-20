@@ -643,14 +643,11 @@ mod tests {
     /// 内置运行时里的 OCR 能不能用 —— 正对"要不要自己装 Python"这个问题。
     #[test]
     fn bundled_runtime_reports_ocr_available() {
-        let python = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join("asr_runtime")
-            .join("python.exe");
-        if !python.is_file() {
+        let resources = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+        let Some(python) = crate::tools::bundled_python(&resources) else {
             eprintln!("跳过：没有内置运行时");
             return;
-        }
+        };
         let s = status(&python.to_string_lossy());
         assert!(s.available, "内置运行时应当报告 OCR 可用：{}", s.detail);
     }
@@ -660,19 +657,31 @@ mod tests {
     #[test]
     fn end_to_end_bundled_runtime_reads_chinese() {
         let resources = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-        let python = resources.join("asr_runtime").join("python.exe");
-        let ffmpeg = resources.join("bin").join("ffmpeg.exe");
-        if !python.is_file() || !ffmpeg.is_file() {
+        let (Some(python), Some(ffmpeg)) = (
+            crate::tools::bundled_python(&resources),
+            crate::tools::bundled_ffmpeg(&resources).0,
+        ) else {
             eprintln!("跳过：内置运行时或 ffmpeg 不在");
             return;
-        }
-        let font = Path::new("C:/Windows/Fonts/simhei.ttf");
-        if !font.is_file() {
-            eprintln!("跳过：本机没有黑体");
+        };
+        // 字体：Windows 上是黑体，macOS 上是系统自带的中文黑体系
+        let font = [
+            "C:/Windows/Fonts/simhei.ttf",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file());
+        let Some(font) = font else {
+            eprintln!("跳过：本机没有中文黑体");
             return;
-        }
+        };
 
         let worker = resources.join("ocr_worker.py");
+        // 输出目录放在系统临时目录的独立子目录里：不写在 resources/ 下面，
+        // 免得测试产物混进随程序分发的运行时。
         let dir = std::env::temp_dir().join("dramadist_ocr_bundled_e2e");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
